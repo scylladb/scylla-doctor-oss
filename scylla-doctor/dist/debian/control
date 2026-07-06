@@ -1,0 +1,9 @@
+Package: scylla-doctor
+Section: debug
+Priority: optional
+Architecture: all
+Depends: scylla-enterprise-python3 | scylla-python3 | python3
+Maintainer: Vlad Zolotarov <vladz@scylladb.com>
+Description: Tool to collect debug information
+ Collects debug information required for troubleshooting
+ issues with a Scylla database.

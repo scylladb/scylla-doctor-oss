@@ -1,0 +1,20 @@
+FROM scylladb/scylla:2025.4.3
+
+USER root
+
+RUN microdnf -y update
+RUN microdnf -y install python3-pip pciutils
+
+# Install system tools that are very much expected to be found on each Scylla node
+RUN microdnf -y install ethtool iptables iproute net-tools gcc python3-devel which
+
+COPY ./tests/requirements.txt /doctor/tests/requirements.txt
+
+# this installs additional python dependencies.
+# However, since, actually, OS-provided version of the pip is used (for example,
+# it's python3.6 for scylla-enterprise:2021.1.5 instead of python3.8)
+# So keep it in mind if you encounter some weird dependencies clashes
+RUN pip3 install -t /tmp/site-packages -r /doctor/tests/requirements.txt
+ENV PYTHONPATH=/tmp/site-packages
+
+COPY . /doctor

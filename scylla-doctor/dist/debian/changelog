@@ -1,0 +1,5 @@
+scylla-doctor (1.0) stable; urgency=medium
+
+  * Initial release.
+
+ -- Vladislav Zolotarov <vladz@scylladb.com> Thu, Jun 6 2024 00:00:00 +0000

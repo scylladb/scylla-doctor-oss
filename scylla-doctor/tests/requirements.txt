@@ -1,0 +1,7 @@
+pytest
+allure-pytest
+execnet
+flake8
+pytest-cov
+mypy<1.19.0
+types-PyYAML

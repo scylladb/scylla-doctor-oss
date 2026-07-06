@@ -1,0 +1,65 @@
+name: Run tests for Scylla Doctor
+
+on:
+  pull_request:
+    paths:
+      - 'scylla-doctor/**'
+      - '.github/workflows/**'
+  push:
+    branches: [ master ]
+    paths:
+      - '.github/workflows/**'
+      - 'scylla-doctor/**'
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  all:
+    if: github.repository_owner == 'scylladb'
+    runs-on:
+      - self-hosted
+    container:
+      # Is kept at old Scylla version because of https://github.com/scylladb/scylla-enterprise/issues/5665
+      image: scylladb/scylla:2025.4.3
+      options: --privileged --cap-add=NET_ADMIN --user root
+      env:
+        PYTHONPATH: /tmp/site-packages
+    steps:
+      - name: install OS-level dependencies
+        run: |
+          microdnf -y update
+          microdnf -y install python3-pip
+          microdnf -y install ethtool iptables iproute net-tools gcc python3-devel which nc tar git pciutils
+
+      - name: Checkout sources
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: install test dependencies
+        working-directory: scylla-doctor
+        run: |
+          pip3 install -t /tmp/site-packages -r tests/requirements.txt
+
+      - name: Lint
+        working-directory: scylla-doctor
+        run: |
+          python3 -m flake8
+          python3 -m mypy .
+
+      - name: Launch Scylla
+        run: |
+          ip link add name bond0 type bond
+          /docker-entrypoint.py --smp 1 --listen-address 127.0.0.1 &> ./scylla-log.txt &
+          sleep 10
+          while ! nc -vz 127.0.0.1 9042
+          do
+            sleep 10
+          done
+          
+      - name: Generate a version file
+        working-directory: scylla-doctor
+        run: make version
+      - name: Test
+        working-directory: scylla-doctor
+        run: python3 -m pytest --cov=. -vv

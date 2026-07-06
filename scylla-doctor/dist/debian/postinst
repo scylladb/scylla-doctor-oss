@@ -1,0 +1,6 @@
+#!/bin/sh
+
+set -e
+
+ln -s -f /opt/scylladb/bin/scylla_doctor.pyz /usr/bin/scylla-doctor
+

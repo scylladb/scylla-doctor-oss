@@ -1,0 +1,160 @@
+v1.0:
+* Initial release.
+
+v1.1:
+* Fix CPUSetCollector that was getting stuck if perftune.py execution was failing.
+* New ClientConnectionCollector and DriverVersionAnalyzer added.
+
+v1.2:
+* Added new Collectors:
+  * GossipInfoCollector
+  * TokenMetadataHostsMappingCollector
+  * RaftGroup0Collector
+  * SystemPeersLocalCollector
+  * SystemClusterStatusCollector
+* Added new TopologyConsistencyAnalyzer.
+* Fixes:
+  * SD fails to collect info using CQL on hosts that have different values for broadcast_rpc_address and rpc_address: GH12.
+
+v1.3:
+* Added Collectors:
+  * SystemConfigCollector: collects Scylla actual (in-memory) configuration state.
+  * InfrastructureProviderCollector: collect CPU platform where possible.
+
+* Added Analyzers:
+  * CloudCPUPlatformAnalyzer: verifies that the CPU platform is as expected.
+  * ScyllaConfigurationConsistencyAnalyzer: verifies a consistency of a persisted and actual (in-memory) Scylla
+    configuration. Fixes GH18 and GH55.
+  * RaftEnablementAnalyzer: verifies that Raft is properly enabled. Fixes GH29.
+
+* Fixes:
+  * NICCollector fails where there are bond interfaces in the system: GH20.
+  * PerftuneAnalyzer: reduce false-alarming: related to GH7.
+  * RaftGroup0Collector and TopologyConsistencyAnalyzer is not applicable to non-Raft cluster: GH19.
+  * Add AWS i4i and Azure Lsv3 instances to supported instances list.
+  * HypervisorTypeCollector: ignore non-zero exit code of systemd-detect-virt on non-VM hosts: GH47.
+  * NodeInstanceTypeAnalyzer: fix Azure instance names: GH25.
+
+v1.4:
+* Fixes:
+  * NodeInstanceTypeAnalyzer: add i3.large to the list of supported instance types: GH65
+  * SwapAnalyzer: make ram_swap_ratio a floating point value: GH64
+  * Analyzers: make sure error messages printing bad and expected sizes print them as differently looking values: GH66
+
+v1.5:
+* Added Collectors:
+  * NTP status collector by @vreniers in https://github.com/scylladb/scylla-doctor/pull/88.
+  * ScyllaConfigurationFileNoParsingCollector by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/92:
+    needed for ScyllaConfigurationFileFormatAnalyzer.
+
+* Added Analyzers:
+  * NTP status analyzer by @vreniers in https://github.com/scylladb/scylla-doctor/pull/88.
+  * ScyllaConfigurationFileFormatAnalyzer by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/92:
+    validate 'restriction mode' configuration values format in scylla.yaml.
+
+* Fixes:
+  * scylla-doctor: README.md: add a note about variables expansion in configuration files by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/74.
+  * scylla-doctor: ScyllaConfigurationConsistencyAnalyzer: use safe dict dereferencing by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/75.
+  * scylla-doctor-cluster: error when no .vitals.json files are detected by @vreniers in https://github.com/scylladb/scylla-doctor/pull/79.
+  * scylla-doctor: ScyllaConfigurationConsistencyAnalyzer: ignore keys that are not present in system.config by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/85.
+  * scylla-doctor-cluster/README.md: add missing quoting in the 'mask' example by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/90.
+  * ScyllaConfigurationConsistencyAnalyzer: correctly handle 'restriction mode' values by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/92.
+  * scylla-doctor: bump up minimum recommendations for sstable format and scylla versions by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/96.
+  * scylla-doctor-cluster: Configuration: missing exception variable by @vreniers in https://github.com/scylladb/scylla-doctor/pull/97.
+  * scylla-doctor: ScyllaSSTablesAnalyzer: Detect unrecommended format by @vreniers in https://github.com/scylladb/scylla-doctor/pull/99.
+  * scylla-doctor-cluster: print number of vitals files by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/102.
+  * scylla-doctor: ClockSourceAnalyzer: add 'hyperv_clocksource_tsc_page' to recommended sources by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/103.
+
+v1.6:
+* Fixes:
+  * scylla-doctor: test/requirements.txt: add two modules required for U24.04 based images by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/113
+  * scylla-doctor: CPUSetCollector: skip the collector if '--cpuset' is not set in CPUSET by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/119
+  * OSSupportAnalyzer: Add support for newer editions by @vreniers in https://github.com/scylladb/scylla-doctor/pull/122
+  * scylla-doctor: Makefile: add support for Podman by @vreniers in https://github.com/scylladb/scylla-doctor/pull/127
+  * scylla-doctor: skip tests on the basis of docker or podman environment by @vreniers in https://github.com/scylladb/scylla-doctor/pull/128
+  * scylla-doctor: read_cql_table automatically map column values to column names by @vreniers in https://github.com/scylladb/scylla-doctor/pull/124
+  * scylla-doctor: use the location of Scylla binaries from the configuration by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/134
+  * scylla-doctor: increase query execution timeout to 300 seconds as a temporary workaround for issue #135 by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/138
+  * scylla-doctor: Don't intercept exceptions by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/139
+
+* Refactoring:
+  * [scylla-doctor] move utils, cloud providers and collectors to their own modules by @tarzanek in https://github.com/scylladb/scylla-doctor/pull/86
+  * [scylla-doctor] print out collectors from new file too in help by @tarzanek in https://github.com/scylladb/scylla-doctor/pull/121
+
+v1.7:
+* Enhancements:
+  * Consistent topology checks by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/145
+  * utils.py: add SSL support for cqlsh commands by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/154
+  * utils.py: enhance cqlsh SSL handling with fallback mechanism by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/157
+  * Add raft topology debug rest collection by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/167
+  * Mask collector with node specific data from diff by @vladzcloudius in https://github.com/scylladb/scylla-doctor/pull/177
+  * Executor.cqlsh: TimeoutException handling and retries by @vreniers in https://github.com/scylladb/scylla-doctor/pull/169
+
+v1.8:
+* Enhancements:
+  * NodeInstanceTypeAnalyzer: Update GCP and AWS instances in #188
+  * PendingMaintenanceEvent: added collection and analyzer in #190
+  * utils.py: CloudProviderAE: read metadata without loading as json in #192
+  * Auto detect rest api support and refactor of SKIPPED dependency status handling in #191
+  * Tighten collector exceptions handling in #200
+  * Move read scylla rest api to a collector base class in #201
+  * Read Scylla configuration from memory where possible in #210
+  * Scylla doctor collect cfstats, compression info and used disk space in #213
+
+v1.9:
+* Fixes:
+  * Improve robustness and correctness of maintenance events collection #215
+  * Add AWS IMDSv2 support #217
+
+v1.10:
+* Enhancements:
+  * Added a new GossipInfoConsistencyAnalyzer by @vladzcloudius in #220 and #222:
+    * Verifies that GossipInfo content has TOKENS and CDC_GENERATION_ID application states when Topology Over Raft is
+      not supported.
+* Fixes:
+  * Multiple minor fixes related to execution on root-less systems in #218
+  * Fix gossip info collector to allow missing gossiper application states in #219 and #220
+  * Improve the Cloud Provider metadata read requests timeout configuration in #220
+  * PerftuneSystemConfigurationCollector: don't error out if can't read some sysfs files in #221
+
+v1.11
+* Enhancements:
+  * Collect information needed for debugging interrupts related issues in #223
+  * Improvements in PerftuneAnalyzer and PerftuneSystemConfigurationCollector in #225
+  * Add DisabledCompactionAnalyzer to verify compaction strategy for all tables in #226
+  * Add Rocky linux to supported matrix in #227
+  * Update supported versions for Debian and CentOS in #229
+  * Improve system config collector robustness in #231
+  * DisabledCompactionAnalyzer: allow skipping tables in #232
+  * Improve GossipInfo in #233
+  * Make SDVersion print the version of the currently running scylla-doctor in #233
+
+v1.11.1
+* Fixes:
+* GossipInfoCollector: ensure collector's data is sorted by hosts addresses #235
+
+v1.12
+* Fixes:
+  * Normalize client_encryption_options.enabled values to boolean in ScyllaConfigurationConsistencyAnalyzer #240
+  * Makefile: update targets that use a LICENSE file by @vladzcloudius in #252
+  * ScyllaSystemConfigurationFilesCollector: store all parsed files content at the VERBOSE level by @vladzcloudius in #253
+  * Fix scylla configuration consistency analyzer skipping by @vladzcloudius in #254
+* Enhancements:
+  * PerftuneAnalyzer: add support for skipping specific files and sysctl parameters in configuration checks by @vladzcloudius in #237
+  * scylla-doctor/README.md: add detailed reference for Collectors and Analyzers by @vladzcloudius in #238
+  * Scylla Doctor and Scylla Doctor Cluster go AGPL: add AGPL-3.0-only license and copyright notices to source files by @vladzcloudius in #241
+  * Add workflow to trigger scylla-doctor repo updates via Jenkins by @yaronkaikov in #244
+  * Add new Collectors: LargePartitionsCellsRowsCollector, RolePermissionsCollector and more by @vladzcloudius in #243
+  * scylla-doctor: enhance ScyllaSSTablesAnalyzer to auto-detect recommended SSTable format from system.config by @vladzcloudius in #246
+  * ci: pin GitHub Actions to commit SHAs by @roydahan in #247
+  * Update ComputerArchitectureAnalyzer to include 'aarch64' as a supported architecture by @vladzcloudius in #240
+  * Add 'arch_sys_counter' to preferred clock sources in ClockSourceAnalyzer and update documentation by @vladzcloudius in #240
+  * Enhance CPUInstructionSetAnalyzer to support architecture checks by @vladzcloudius in #240
+  * Enhance NICsAnalyzer to allow skipping speed checks by @vladzcloudius in #240
+  * Add support for 'ScyllaDB Python Driver' in driver names mapping and update tests by @vladzcloudius in #240
+  * Update NodeInstanceTypeAnalyzer to include i8g/i8ge AWS instance types and adjust documentation by @vladzcloudius in #240
+  * Update NIC type mappings to include new AWS instance types i4i, i7i, i7ie, i8g, and i8ge by @vladzcloudius in #240
+  * Enhance ScyllaConfigurationConsistencyAnalyzer to normalize boolean values for additional keys by @vladzcloudius in #240
+  * Add STCSInSchemaAnalyzer and ScyllaKeyspacesReplicationAnalyzer by @vladzcloudius in #250
+
+
