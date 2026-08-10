@@ -19,6 +19,8 @@
 Scylla Doctor for Scylla Cluster
 """
 
+from __future__ import annotations
+
 import argparse
 import ast
 import enum
@@ -29,15 +31,19 @@ import numbers
 import os
 import sys
 import zipfile
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from deepdiff import DeepDiff
 
 from collections.abc import Iterable
 
+if TYPE_CHECKING:
+    import scylla_doctor
+
 
 class ConfigurationError(Exception):
     pass
+
 
 class DoctorClusterOutputFormat(enum.Enum):
     TXT = "txt"
@@ -315,16 +321,22 @@ def check_vitals(node, vitals, base_node, base_vitals, config: Configuration, fa
 
 
 def run_doctor(config: Configuration,
+               vitals: Optional[dict] = None,
                vitals_file: Optional[str] = None,
-               additional_args: Optional[List[str]] = None) -> "scylla_doctor.Doctor":
+               additional_args: Optional[List[str]] = None) -> scylla_doctor.Doctor:
     """
     Run a Scylla Doctor instance with a given configuration.
     :param config: Configuration object with configuration file, command line options and environment variables
+    :param vitals: Optional already-decoded, in-memory vitals to analyze. When provided, analyzers run against
+                   these vitals directly and no file is read (avoids re-parsing the vitals file).
     :param vitals_file: Optional Vitals file that should be loaded and analyzed
     :param additional_args: Optional additional Scylla Doctor parameters
     :return: Doctor class object with the result of the Scylla Doctor execution
     """
     import scylla_doctor
+
+    if vitals is not None and vitals_file:
+        raise ValueError("run_doctor() accepts either in-memory 'vitals' or a 'vitals_file', not both.")
 
     if additional_args is None:
         additional_args = []
@@ -344,19 +356,22 @@ def run_doctor(config: Configuration,
 
     doctor_env = scylla_doctor.DoctorEnvironment(doctor_args)
     doctor = scylla_doctor.Doctor(doctor_env)
-    doctor.run()
+    if vitals is not None:
+        doctor.analyze_vitals(vitals)
+    else:
+        doctor.run()
 
     return doctor
 
 
-def analyze_file(file, node, config: Configuration, failures, warnings):
+def analyze_vitals(node, vitals, config: Configuration, failures, warnings):
     """
-    Run scylla doctor analyzers against vitals file. Look for failures and warnings
+    Run scylla doctor analyzers against already-decoded, in-memory vitals. Look for failures and warnings
     """
     import scylla_doctor
     from analyzers_base import AnalyzerStatus
 
-    doctor = run_doctor(config=config, vitals_file=file)
+    doctor = run_doctor(config=config, vitals=vitals)
     with io.StringIO() as f:
         doctor.print_results(format=scylla_doctor.DoctorOutputFormat.JSON, file=f)
         analyzers = json.loads(f.getvalue())
@@ -396,7 +411,7 @@ def analyze_cluster(config: Configuration):
     for file in files:
         node = os.path.basename(file).split('.vitals.json')[0]
 
-        # search vitals for failed collectors and inconsistencies
+        # decode the node's vitals once and reuse them for both analysis and cross-node diffing
         with open(file, 'r') as vitals_file:
             vitals = {}
             for k, v in json.load(vitals_file).items():
@@ -405,11 +420,13 @@ def analyze_cluster(config: Configuration):
                     extra_mask = config.collector_options(k).get('mask')
                 vitals[k] = CollectorResult.decode(v, extra_mask=extra_mask)
 
-            if not base_vitals:
-                base_node, base_vitals = node, vitals
-            check_vitals(node, vitals, base_node, base_vitals, config, failures, inconsistencies)
+        # Run analyzers first: they need the full, unstripped vitals. check_vitals() strips
+        # results in-place for diffing, so it must run afterwards to avoid losing data.
+        analyze_vitals(node, vitals, config, failures, warnings)
 
-        analyze_file(file, node, config, failures, warnings)
+        if not base_vitals:
+            base_node, base_vitals = node, vitals
+        check_vitals(node, vitals, base_node, base_vitals, config, failures, inconsistencies)
 
     return files, failures, warnings, inconsistencies
 
@@ -491,4 +508,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -26,12 +26,11 @@ import re
 import socket
 import ssl
 import urllib
-import zipfile
 
 from typing import Any, Dict, List, Set, Tuple, Optional, Iterable
 
 from analyzers_base import Analyzer, AnalyzerStatus
-from common import GossipInfoInvariantValues, HumanBytesUnitFormat
+from common import GossipInfoInvariantValues, HumanBytesUnitFormat, ConfigParameter
 from common import DictView, NodePlatform, AbortedException
 
 
@@ -749,17 +748,33 @@ class DriverVersionAnalyzer(Analyzer):
     def __key_latest_version(self) -> str:
         return "latest_version"
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'minimum_version': ConfigParameter(
+                default='{}',
+                description='JSON map of driver type to minimum allowed version (e.g. {"Java": "3.14.0"}).',
+            ),
+            'latest_version': ConfigParameter(
+                default='{}',
+                description='JSON map of driver type to latest available version.',
+            ),
+            'driver_api_endpoint': ConfigParameter(
+                default='https://cfqlgypqmoofu6wdoojklzdzhe0lqqso.lambda-url.us-east-2.on.aws/search',
+                description='URL used to look up driver versions when minimum_version/latest_version are unset.',
+            ),
+        }
+
     @property
     def __api_endpoint(self) -> str:
-        return self.config.get('driver_api_endpoint',
-                               'https://cfqlgypqmoofu6wdoojklzdzhe0lqqso.lambda-url.us-east-2.on.aws/search')
+        return self._get_config_value('driver_api_endpoint')
 
     def __init_config_required_version(self, version_type: str) -> Dict[str, str]:
         """
         :param version_type: Either minimum or latest version.
         :return: Loads input minimum or latest driver version from the config and sanitizes the versions.
         """
-        config_required_version = json.loads(self.config.get(version_type, "{}"))
+        config_required_version = json.loads(self._get_config_value(version_type))
 
         # Strip version 'v' prefix if it occurs in the driver version
         for driver, driver_version in config_required_version.items():
@@ -1078,13 +1093,28 @@ class NICsAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__collector_nics, self.__collector_provider}
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'speed': ConfigParameter(
+                default='10000',
+                param_type=int,
+                unit='Mbps',
+                description='Suggested minimum NIC speed.',
+            ),
+            'skip_nic_speed_check': ConfigParameter(
+                default_description='true on AWS/GCP, false otherwise when unset',
+                description='Skip NIC speed threshold check.',
+            ),
+        }
+
     def _analyze(self, vitals: DictView) -> None:
         """
         Check that there is a NIC with a speed over recommended threshold.
         For AWS, check that VPC support and enhanced networking is enabled.
         """
         provider = vitals[self.__collector_provider].data['provider']
-        skip_nic_speed_check = self.config.get('skip_nic_speed_check')
+        skip_nic_speed_check = self._get_config_value('skip_nic_speed_check')
         # Let's not check NIC speed on AWS and GCP by default since they don't expose NIC's link speed via
         # 'ethtool <nic>'.
         if skip_nic_speed_check is None and provider in {"AWS", "GCP"}:
@@ -1095,7 +1125,7 @@ class NICsAnalyzer(Analyzer):
         if not skip_nic_speed_check:
             nics = vitals[self.__collector_nics].data['nics']
 
-            suggested_speed = int(self.config.get('speed', 10000))  # 10 Gbps is the minimum speed suggested
+            suggested_speed = self._get_config_value('speed')
             suggested_nic_count = len([nic for nic, nic_data in nics.items()
                                        if nic_data['speed'] and nic_data['speed'] >= suggested_speed])
 
@@ -1331,6 +1361,61 @@ class NTPServicesAnalyzer(Analyzer):
             self.message = "NTP setup was not done"
 
 
+class ChronyStatusAnalyzer(Analyzer):
+    @property
+    def name(self) -> str:
+        return "Chrony Status Analyzer"
+
+    @property
+    def __collector(self) -> str:
+        return "ChronyStatusCollector"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__collector}
+
+    def _analyze(self, vitals: DictView) -> None:
+        """
+        Check that chrony leap status from chronyc tracking is synchronized.
+        """
+        chrony_synchronized = vitals[self.__collector].data.get('chrony_synchronized', False)
+
+        if not chrony_synchronized:
+            self.status = AnalyzerStatus.FAILED
+            self.message = "The system clock is not chrony synchronized."
+            return
+
+        self.status = AnalyzerStatus.PASSED
+        self.message = "The system clock is chrony synchronized."
+
+
+class ChronyServicesAnalyzer(Analyzer):
+    @property
+    def name(self) -> str:
+        return "Chrony Services Setup"
+
+    @property
+    def __collector(self) -> str:
+        return "ChronyServicesCollector"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__collector}
+
+    def _analyze(self, vitals: DictView) -> None:
+        """
+        Check that at least one chrony-related service is enabled.
+        """
+        chrony_services = vitals[self.__collector].data['services']
+        active_services = [service for service in chrony_services if chrony_services[service]['active'] is True]
+        if len(active_services) > 0:
+            self.status = AnalyzerStatus.PASSED
+            self.message = "Chrony setup was done"
+        else:
+            self.status = AnalyzerStatus.FAILED
+            self.message = "Chrony setup was not done"
+
+
 class ComputerArchitectureAnalyzer(Analyzer):
     @property
     def name(self) -> str:
@@ -1448,6 +1533,21 @@ class PerftuneAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__collector}
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'skip_files': ConfigParameter(
+                default='',
+                comma_separated=True,
+                description='Comma-separated file paths to skip in perftune file value checks.',
+            ),
+            'skip_sysctls': ConfigParameter(
+                default='',
+                comma_separated=True,
+                description='Comma-separated sysctl names to skip in perftune sysctl checks.',
+            ),
+        }
+
     def __compare_str_or_int16_list(self, a: str, b: str) -> bool:
         """
         Compare two strings, which can be either plain strings or lists of hex values (e.g. "ff", "0a,ff,00").
@@ -1535,8 +1635,8 @@ class PerftuneAnalyzer(Analyzer):
                 # lowercase the first word
                 status_list.append((" ".join([split_message[0].lower()] + split_message[1:]), status))
 
-        skip_files: Set[str] = self._parse_comma_separated_config('skip_files')
-        skip_sysctls: Set[str] = self._parse_comma_separated_config('skip_sysctls')
+        skip_files: Set[str] = self._get_config_value('skip_files')
+        skip_sysctls: Set[str] = self._get_config_value('skip_sysctls')
 
         inconsistency_status: List[Tuple[str, AnalyzerStatus]] = []
 
@@ -1716,6 +1816,41 @@ class RAIDSetupAnalyzer(Analyzer):
         self.status = AnalyzerStatus.PASSED
 
 
+class UnusedNVMeDevicesAnalyzer(Analyzer):
+    @property
+    def name(self) -> str:
+        return "Unused NVMe devices"
+
+    @property
+    def __collector(self) -> str:
+        return "NVMeDevicesCollector"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__collector}
+
+    def _analyze(self, vitals: DictView) -> None:
+        """
+        Warn if there are NVMe devices that are not mounted and not used by an active SW RAID.
+        """
+        data = vitals[self.__collector].data
+        nvme_devices = data['nvme_devices']
+        unused_devices = data['unused_nvme_devices']
+
+        if not nvme_devices:
+            self.status = AnalyzerStatus.PASSED
+            self.message = "No NVMe devices detected"
+            return
+
+        if unused_devices:
+            self.status = AnalyzerStatus.WARNING
+            self.message = f"Unused NVMe device(s) detected: {', '.join(unused_devices)}"
+            return
+
+        self.status = AnalyzerStatus.PASSED
+        self.message = f"All {len(nvme_devices)} NVMe device(s) are in use"
+
+
 class RAMAnalyzer(Analyzer):
     @property
     def name(self) -> str:
@@ -1733,15 +1868,44 @@ class RAMAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__collector_ram, self.__collector_cpu}
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'ram_minimum_total': ConfigParameter(
+                default='4194304',
+                param_type=int,
+                unit='KB',
+                description='Minimum recommended total RAM size.',
+            ),
+            'ram_minimum_per_lcore': ConfigParameter(
+                default='524288',
+                param_type=int,
+                unit='KB',
+                description='Minimum recommended RAM per logical core.',
+            ),
+            'ram_recommended_total': ConfigParameter(
+                default='16777216',
+                param_type=int,
+                unit='KB',
+                description='Recommended total RAM size.',
+            ),
+            'ram_recommended_per_lcore': ConfigParameter(
+                default='4194304',
+                param_type=int,
+                unit='KB',
+                description='Recommended RAM per logical core.',
+            ),
+        }
+
     def _analyze(self, vitals: DictView) -> None:
         """
         Check that available RAM is greater than recommended (or at least, minimal required),
         both total and per logical core.
         """
-        ram_minimum_total = int(self.config.get('ram_minimum_total', 4194304))  # 4 gb
-        ram_minimum_per_lcore = int(self.config.get('ram_minimum_per_lcore', 524288))  # 0.5 gb
-        ram_recommended_total = int(self.config.get('ram_recommended_total', 16777216))  # 16 gb
-        ram_recommended_per_lcore = int(self.config.get('ram_recommended_per_lcore', 4194304))  # 4 gb
+        ram_minimum_total = self._get_config_value('ram_minimum_total')
+        ram_minimum_per_lcore = self._get_config_value('ram_minimum_per_lcore')
+        ram_recommended_total = self._get_config_value('ram_recommended_total')
+        ram_recommended_per_lcore = self._get_config_value('ram_recommended_per_lcore')
 
         if any([ram_minimum_total > ram_recommended_total,
                 ram_minimum_per_lcore > ram_recommended_per_lcore]):
@@ -2281,12 +2445,21 @@ class ScyllaInternodeCompressionAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__collector}
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'recommended_compression': ConfigParameter(
+                default='all',
+                description='Recommended internode compression setting.',
+            ),
+        }
+
     def _analyze(self, vitals: DictView) -> None:
         """
         Check that internode compression is fully enabled.
         """
 
-        recommended_compression = self.config.get("recommended_compression", "all")
+        recommended_compression = self._get_config_value("recommended_compression")
 
         compression = vitals[self.__collector].data.get("internode_compression", "none")
         if compression != recommended_compression:
@@ -2507,6 +2680,31 @@ class ScyllaServicesAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__collector_services, self.__collector_storage_configuration, self.__scylla_version_collector}
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'skip_autostarts_check': ConfigParameter(
+                default='',
+                comma_separated=True,
+                description='Comma-separated services to skip in enabled/auto-start checks.',
+            ),
+            'disable_autostarts': ConfigParameter(
+                default='',
+                comma_separated=True,
+                description='Comma-separated services that must not be enabled/auto-started.',
+            ),
+            'skip_active_check': ConfigParameter(
+                default='',
+                comma_separated=True,
+                description='Comma-separated services to skip in active-service checks.',
+            ),
+            'disable_active': ConfigParameter(
+                default='',
+                comma_separated=True,
+                description='Comma-separated services that must be inactive.',
+            ),
+        }
+
     def __all_dirs_have_discard_opt(self, vitals: DictView) -> bool:
         """
         Check if all Scylla directories are mounted with a 'discard' option
@@ -2547,10 +2745,10 @@ class ScyllaServicesAnalyzer(Analyzer):
         """
         Check that all scylla-related services are active and enabled.
         """
-        skip_autostart_check = self._parse_comma_separated_config("skip_autostarts_check")
-        autostart_disabled_services = self._parse_comma_separated_config("disable_autostarts")
-        skip_active_check = self._parse_comma_separated_config("skip_active_check")
-        disabled_services = self._parse_comma_separated_config("disable_active")
+        skip_autostart_check = self._get_config_value("skip_autostarts_check")
+        autostart_disabled_services = self._get_config_value("disable_autostarts")
+        skip_active_check = self._get_config_value("skip_active_check")
+        disabled_services = self._get_config_value("disable_active")
         services_info = vitals[self.__collector_services].data
 
         fails = []
@@ -2636,6 +2834,15 @@ class ScyllaSnitchAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__collector_config, self.__collector_provider}
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'check_provider_snitch': ConfigParameter(
+                default_description='unset (provider snitch check enabled)',
+                description='Verify provider-specific snitch on AWS/GCP. Set to no/0/false/off to disable.',
+            ),
+        }
+
     def _analyze(self, vitals: DictView) -> None:
         """
         Check that scylla snitch is set to recommended value (gcp or aws specific ones, if applicable).
@@ -2647,7 +2854,9 @@ class ScyllaSnitchAnalyzer(Analyzer):
             return
 
         provider = vitals[self.__collector_provider].data['provider']
-        skip_check_provider = self.config.get('check_provider_snitch', '').lower() in self.config_run_skip_values
+        skip_check_provider = (
+            (self._get_config_value('check_provider_snitch') or '').lower() in self.config_run_skip_values
+        )
         if not provider or skip_check_provider:
             if snitch != self.__default_recommended_snitch:
                 self.status = AnalyzerStatus.WARNING
@@ -2687,13 +2896,23 @@ class ScyllaSSTablesAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__sstables_collector, self.__system_config_collector}
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'recommended_format': ConfigParameter(
+                default_description='system.config sstable_format, then me when unset',
+                description='Expected SSTable format. Overrides auto-detected sstable_format when set.',
+            ),
+        }
+
     def _analyze(self, vitals: DictView) -> None:
         """
         Check that sstables are stored in recommended format
         """
         scylla_config = vitals[self.__system_config_collector].data
-        sstable_format = (
-            self.config.get("recommended_format", scylla_config.get('sstable_format', {}).get('value', 'me')))
+        sstable_format = self._get_config_value(
+            "recommended_format",
+            fallback=scylla_config.get('sstable_format', {}).get('value', 'me'))
         sstables = list(self.__sstables_files(vitals))
         if len(sstables) == 0:
             self.status = AnalyzerStatus.PASSED
@@ -2729,6 +2948,15 @@ class CloudCPUPlatformAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__infrastructure_provider_collector}
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'expected_cpu_platform': ConfigParameter(
+                default_description='unset (analyzer skipped)',
+                description='Expected CPU platform name (e.g. Intel Ice Lake).',
+            ),
+        }
+
     def _analyze(self, vitals: DictView) -> None:
         """
         Check the VM has the requested CPU Platform.
@@ -2736,7 +2964,7 @@ class CloudCPUPlatformAnalyzer(Analyzer):
         dynamic CPU Platform (currently only GCP supports it) the result is going to be
         'SKIPPED'.
         """
-        expected_cpu_platform = self.config.get("expected_cpu_platform")
+        expected_cpu_platform = self._get_config_value("expected_cpu_platform")
         current_cpu_platform = None
         infra_provider_info = vitals[self.__infrastructure_provider_collector].data
         if infra_provider_info['provider']:
@@ -2766,13 +2994,26 @@ class ScyllaSupportAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__collector}
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'oss_minimum_version': ConfigParameter(
+                default='6.1',
+                description='Minimum supported OSS Scylla version.',
+            ),
+            'enterprise_minimum_version': ConfigParameter(
+                default='2024.1',
+                description='Minimum supported Enterprise Scylla version.',
+            ),
+        }
+
     def _analyze(self, vitals: DictView) -> None:
         """
         Check that Scylla version has not reached EOL yet.
         """
         minimum_version = {
-            'oss': self.config.get('oss_minimum_version', '6.1'),
-            'enterprise': self.config.get('enterprise_minimum_version', '2024.1')
+            'oss': self._get_config_value('oss_minimum_version'),
+            'enterprise': self._get_config_value('enterprise_minimum_version')
         }
         current_edition = vitals[self.__collector].data['edition']
         current_version = vitals[self.__collector].data['version']
@@ -2850,6 +3091,19 @@ class ScyllaUpdateAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__collector}
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'oss_latest_version': ConfigParameter(
+                default_description='fetched from repositories.scylladb.com when unset',
+                description='OSS version treated as latest.',
+            ),
+            'enterprise_latest_version': ConfigParameter(
+                default_description='fetched from repositories.scylladb.com when unset',
+                description='Enterprise version treated as latest.',
+            ),
+        }
+
     def _analyze(self, vitals: DictView) -> None:
         """
         Check that scylla is upgraded to latest version, that' known to be stable.
@@ -2857,9 +3111,9 @@ class ScyllaUpdateAnalyzer(Analyzer):
         current_version = vitals[self.__collector].data['version']
         current_edition = vitals[self.__collector].data['edition']
         if current_edition == "enterprise":
-            latest_version = self.config.get('enterprise_latest_version')
+            latest_version = self._get_config_value('enterprise_latest_version')
         else:
-            latest_version = self.config.get('oss_latest_version')
+            latest_version = self._get_config_value('oss_latest_version')
 
         if not latest_version:
             scylla_url_version = "https://repositories.scylladb.com/scylla/check_version"
@@ -2987,11 +3241,21 @@ class StorageRAMRatioAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__collector_ram, self.__collector_storage}
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'ratio': ConfigParameter(
+                default='105',
+                param_type=int,
+                description='Maximum recommended storage-to-RAM ratio.',
+            ),
+        }
+
     def _analyze(self, vitals: DictView) -> None:
         """
         Check that Storage/RAM ratio is lower than recommended value.
         """
-        recommended_ratio = int(self.config.get('ratio', 105))
+        recommended_ratio = self._get_config_value('ratio')
         total_storage = sum([dir_stats['storage_size_kb'] for dir_stats
                              in vitals[self.__collector_storage].data['data_file_directories'].values()])
         total_ram = vitals[self.__collector_ram].data['total']
@@ -3027,12 +3291,28 @@ class SwapAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__collector_swap, self.__collector_ram}
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'swap_minimum_total': ConfigParameter(
+                default='16777216',
+                param_type=int,
+                unit='KB',
+                description='Minimum swap partition size.',
+            ),
+            'ram_swap_ratio': ConfigParameter(
+                default='3',
+                param_type=float,
+                description='Recommended RAM-to-swap ratio used to compute suggested swap size.',
+            ),
+        }
+
     def _analyze(self, vitals: DictView) -> None:
         """
         Check that sufficient amount of swap is configured.
         """
-        swap_minimum = int(self.config.get('swap_minimum_total', 16777216))
-        recommended_ratio = float(self.config.get('ram_swap_ratio', 3))
+        swap_minimum = self._get_config_value('swap_minimum_total')
+        recommended_ratio = self._get_config_value('ram_swap_ratio')
         suggested_swap = min(swap_minimum, vitals[self.__collector_ram].data['total'] / recommended_ratio)
         detected_swap = vitals[self.__collector_swap].data['total']
 
@@ -3079,47 +3359,6 @@ class XFSAnalyzer(Analyzer):
                     return
         self.status = AnalyzerStatus.PASSED
         self.message = "XFS setup was done"
-
-
-class SDVersionAnalyzer(Analyzer):
-    @property
-    def name(self) -> str:
-        return "SD version"
-
-    @property
-    def __collector_sdversion(self) -> str:
-        return "SDVersionCollector"
-
-    @property
-    def depends_on(self) -> Set[str]:
-        return {self.__collector_sdversion}
-
-    def _analyze(self, vitals: DictView) -> None:
-        """
-        Check that versions of collected data and this analyzer match.
-        """
-        script_path = os.path.dirname(__file__)
-        verfile = 'version'
-        buildversion = os.path.join(script_path, verfile)
-        if zipfile.is_zipfile(script_path):
-            with zipfile.ZipFile(script_path, 'r') as archive:
-                gitversion = archive.read(verfile).decode().strip()
-        elif os.path.isfile(buildversion):
-            with open(buildversion) as f:
-                gitversion = f.readline().strip()
-        else:
-            self.status = AnalyzerStatus.FAILED
-            self.message = "Cannot find version file, did you run 'make version' ?"
-            return
-
-        collected_version = vitals[self.__collector_sdversion].data['version']
-
-        if gitversion is not None and collected_version == gitversion:
-            self.status = AnalyzerStatus.PASSED
-            self.message = "Versions of collected data and analyzer match."
-        else:
-            self.status = AnalyzerStatus.FAILED
-            self.message = f"Version mismatch: collected: {collected_version} analyzer: {gitversion}"
 
 
 class ScyllaConfigurationFileFormatAnalyzer(Analyzer):
@@ -3212,6 +3451,21 @@ class ScyllaConfigurationConsistencyAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__scylla_yaml_collector, self.__scylla_config_collector}
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'skip_source_validation_keys': ConfigParameter(
+                default='',
+                comma_separated=True,
+                description='Comma-separated system.config keys excluded from source consistency checks.',
+            ),
+            'skip_persisted_validation_keys': ConfigParameter(
+                default='',
+                comma_separated=True,
+                description='Comma-separated system.config keys excluded from value consistency checks.',
+            ),
+        }
+
     def __validate_config_source(self, vitals: DictView) -> Tuple[List[str], Set[str]]:
         """
         Check that every key that is not present in scylla.yaml has a 'default' or 'internal' as a source and every one
@@ -3220,7 +3474,7 @@ class ScyllaConfigurationConsistencyAnalyzer(Analyzer):
         :return: Tuple of (sorted list of keys with an incorrect source, user-configured skip keys).
         """
 
-        user_skip_keys: Set[str] = self._parse_comma_separated_config("skip_source_validation_keys")
+        user_skip_keys: Set[str] = self._get_config_value("skip_source_validation_keys")
 
         scylla_yaml_dict = vitals[self.__scylla_yaml_collector].data['pure_scylla_yaml']
         scylla_config_sources_dict = {key: value['source'] for
@@ -3266,7 +3520,7 @@ class ScyllaConfigurationConsistencyAnalyzer(Analyzer):
         :return: Tuple of (sorted list of keys with differing values, user-configured skip keys).
         """
 
-        user_skip_keys: Set[str] = self._parse_comma_separated_config("skip_persisted_validation_keys")
+        user_skip_keys: Set[str] = self._get_config_value("skip_persisted_validation_keys")
 
         scylla_yaml_dict = copy.deepcopy(vitals[self.__scylla_yaml_collector].data['pure_scylla_yaml'])
         scylla_config_values_dict = {key: copy.deepcopy(value['value']) for
@@ -3412,7 +3666,7 @@ class RaftTopologyRPCStatusAnalyzer(Analyzer):
 
 class DisabledCompactionAnalyzer(Analyzer):
     """
-    Verify that not-Null compaction strategy is defined and enabled for every table.
+    Verify that not-Null compaction strategy is defined and enabled for every table or view.
     """
     @property
     def name(self) -> str:
@@ -3425,6 +3679,16 @@ class DisabledCompactionAnalyzer(Analyzer):
     @property
     def depends_on(self) -> Set[str]:
         return {self.__tables_schema_collector}
+
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'ignored_tables': ConfigParameter(
+                default='',
+                comma_separated=True,
+                description='Comma-separated keyspace.table (or view) names to ignore.',
+            ),
+        }
 
     def _analyze(self, vitals: DictView) -> None:
         # Example entry in the ScyllaClusterTablesDescriptionCollector data:
@@ -3458,7 +3722,7 @@ class DisabledCompactionAnalyzer(Analyzer):
         # enabled by default.
         #
         schema = vitals[self.__tables_schema_collector].data
-        ignored_tables = self._parse_comma_separated_config("ignored_tables")
+        ignored_tables = self._get_config_value("ignored_tables")
 
         # Workaround for https://scylladb.atlassian.net/browse/SCYLLADB-1372
         ignored_tables.add("system.hints")
@@ -3476,10 +3740,10 @@ class DisabledCompactionAnalyzer(Analyzer):
 
         if null_compaction_strategy_tables:
             self.status = AnalyzerStatus.FAILED
-            self.message = f"Tables {', '.join(null_compaction_strategy_tables)} have compactions disabled."
+            self.message = f"Tables/views {', '.join(null_compaction_strategy_tables)} have compactions disabled."
         else:
             self.status = AnalyzerStatus.PASSED
-            self.message = "All tables have compactions enabled."
+            self.message = "All tables and views have compactions enabled."
             if ignored_tables:
                 self.message += f" Ignored tables: {', '.join(sorted(ignored_tables))}"
 
@@ -3520,11 +3784,11 @@ class BrokenRolePermissionsAnalyzer(Analyzer):
 
 class STCSInSchemaAnalyzer(Analyzer):
     """
-    Verify that tables don't use STCS
+    Verify that tables and views don't use STCS
     """
     @property
     def name(self) -> str:
-        return "Verify that tables don't use STCS"
+        return "Verify that tables and views don't use STCS"
 
     @property
     def __tables_schema_description_collector(self) -> str:
@@ -3545,7 +3809,195 @@ class STCSInSchemaAnalyzer(Analyzer):
 
         if errors:
             self.status = AnalyzerStatus.FAILED
-            self.message = "Tables that use STCS: " + ", ".join(errors)
+            self.message = "Tables/views that use STCS: " + ", ".join(errors)
         else:
             self.status = AnalyzerStatus.PASSED
-            self.message = "There are no tables that use STCS."
+            self.message = "There are no tables or views that use STCS."
+
+
+class ZstdCompressionLevelAnalyzer(Analyzer):
+    """
+    Verify that ZSTD compression levels are not higher than recommended.
+
+    Inspects per-table and per-view compression in ``system_schema.tables``/
+    ``system_schema.views`` and the in-memory server default from ``SystemConfigCollector``
+    (``sstable_compression_user_table_options``). Only ``ZstdCompressor`` and
+    ``ZstdWithDictsCompressor`` are considered; other compressors and
+    non-numeric levels are skipped. Emits ``WARNING`` when any parseable ZSTD
+    level exceeds ``max_recommended_level`` (higher levels may use more CPU),
+    otherwise ``PASSED``.
+    """
+    __ZSTD_DEFAULT_LEVEL = 3
+    __ZSTD_COMPRESSORS = frozenset({'ZstdCompressor', 'ZstdWithDictsCompressor'})
+
+    @property
+    def name(self) -> str:
+        return "ZSTD compression level analysis"
+
+    @property
+    def __tables_schema_collector(self) -> str:
+        return "ScyllaClusterTablesDescriptionCollector"
+
+    @property
+    def __system_config_collector(self) -> str:
+        return "SystemConfigCollector"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__tables_schema_collector, self.__system_config_collector}
+
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'max_recommended_level': ConfigParameter(
+                default='4',
+                param_type=int,
+                description='Maximum recommended ZSTD compression level (levels above may use more CPU).',
+            ),
+            'ignored_tables': ConfigParameter(
+                default='',
+                comma_separated=True,
+                description='Comma-separated keyspace.table (or view) names to ignore in schema checks.',
+            ),
+        }
+
+    @classmethod
+    def __is_zstd_compressor(cls, compressor: str) -> bool:
+        """
+        Return True when ``compressor`` is a ZSTD compressor.
+
+        Matches both short names and FQCNs (e.g.
+        ``org.apache.cassandra.io.compress.ZstdCompressor``). Only
+        ``ZstdCompressor`` and ``ZstdWithDictsCompressor`` qualify.
+        """
+        return compressor.rsplit('.', 1)[-1] in cls.__ZSTD_COMPRESSORS
+
+    @classmethod
+    def __parse_compression_level(cls, compression_config: Dict[str, Any]) -> Optional[int]:
+        """
+        Extract the ZSTD ``compression_level`` from a compression config.
+
+        Falls back to :data:`__ZSTD_DEFAULT_LEVEL` when the key is absent.
+
+        :returns: the level as an ``int``, or ``None`` when the value is not
+            parseable as an integer (non-numeric levels are skipped, not
+            flagged).
+        """
+        level = compression_config.get('compression_level', cls.__ZSTD_DEFAULT_LEVEL)
+        try:
+            return int(level)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def __parse_table_compression(raw_compression: str) -> Dict[str, Any]:
+        """
+        Parse a table ``compression`` value from CQL ``system_schema.tables``.
+
+        The schema column stores a Python-literal dict string, e.g.
+        ``"{'sstable_compression': 'org.apache.cassandra.io.compress.ZstdCompressor',
+        'chunk_length_in_kb': '4', 'compression_level': '3'}"``, so
+        :func:`ast.literal_eval` is used (not JSON).
+
+        :returns: the parsed dict, or an empty dict when the value is empty or
+            cannot be parsed. Never raises: ``ValueError`` / ``SyntaxError``
+            from :func:`ast.literal_eval` are swallowed and treated as "no
+            compression config".
+        """
+        if not raw_compression:
+            return {}
+        try:
+            parsed = ast.literal_eval(raw_compression)
+        except (ValueError, SyntaxError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def __check_schema_tables(self, vitals: DictView, max_level: int,
+                              ignored_tables: Set[str]) -> List[str]:
+        """
+        Scan per-table schema for ZSTD tables above ``max_level``.
+
+        :param vitals: collected vitals; reads the tables-description collector.
+        :param max_level: recommended maximum ZSTD compression level.
+        :param ignored_tables: ``keyspace.table`` names to skip.
+        :returns: list of ``"ks.table (level N)"`` strings for tables whose
+            parseable ZSTD level exceeds ``max_level`` (empty when none).
+        """
+        high_level_tables: List[str] = []
+        schema = vitals[self.__tables_schema_collector].data
+        for ks, tables_data in schema.items():
+            for table, table_schema in tables_data.items():
+                if f"{ks}.{table}" in ignored_tables:
+                    continue
+                compression_config = self.__parse_table_compression(table_schema.get("compression", ""))
+                compressor = compression_config.get("sstable_compression", "")
+                if not self.__is_zstd_compressor(str(compressor)):
+                    continue
+                level = self.__parse_compression_level(compression_config)
+                if level is not None and level > max_level:
+                    high_level_tables.append(f"{ks}.{table} (level {level})")
+        return high_level_tables
+
+    def __check_system_config(self, vitals: DictView, max_level: int) -> Optional[str]:
+        """
+        Check the in-memory server-global ZSTD default from ``system.config``.
+
+        Reads ``sstable_compression_user_table_options`` via
+        ``SystemConfigCollector`` (effective runtime config, not on-disk yaml).
+
+        :param vitals: collected vitals.
+        :param max_level: recommended maximum ZSTD compression level.
+        :returns: a warning string when the parseable global ZSTD level exceeds
+            ``max_level``; ``None`` when the option is absent, not a dict, not a
+            ZSTD compressor, non-numeric, or at/below ``max_level``.
+        """
+        config_entry = vitals[self.__system_config_collector].data.get(
+            "sstable_compression_user_table_options")
+        compression_options = config_entry.get("value") if config_entry else None
+        if not compression_options or not isinstance(compression_options, dict):
+            return None
+
+        compressor = compression_options.get("sstable_compression", "")
+        if not self.__is_zstd_compressor(str(compressor)):
+            return None
+
+        level = self.__parse_compression_level(compression_options)
+        if level is not None and level > max_level:
+            return (f"system.config sstable_compression_user_table_options compression level is {level} "
+                    f"(above {max_level}; may use more CPU)")
+        return None
+
+    def _analyze(self, vitals: DictView) -> None:
+        """
+        Warn when ZSTD compression levels exceed the recommended maximum.
+
+        Sets ``status`` to ``WARNING`` (with the offending tables and/or the
+        in-memory ``system.config`` default listed in ``message``) when any
+        parseable ZSTD level is above ``max_recommended_level``; otherwise
+        ``PASSED``. Tables in ``ignored_tables`` are excluded and reported in
+        the message.
+        """
+        max_level = self._get_config_value("max_recommended_level")
+        ignored_tables = self._get_config_value("ignored_tables")
+
+        high_level_tables = self.__check_schema_tables(vitals, max_level, ignored_tables)
+        system_config_warning = self.__check_system_config(vitals, max_level)
+
+        message_parts: List[str] = []
+        if high_level_tables:
+            message_parts.append(
+                f"Tables with ZSTD compression level above {max_level} "
+                f"(may use more CPU; confirm this is intended): {', '.join(high_level_tables)}")
+        if system_config_warning:
+            message_parts.append(system_config_warning)
+
+        if message_parts:
+            self.status = AnalyzerStatus.WARNING
+            self.message = '. '.join(message_parts) + '.'
+            if ignored_tables and high_level_tables:
+                self.message += f" Ignored tables: {', '.join(sorted(ignored_tables))}."
+        else:
+            self.status = AnalyzerStatus.PASSED
+            self.message = f"All ZSTD compression levels are at or below {max_level}."
+            if ignored_tables:
+                self.message += f" Ignored tables: {', '.join(sorted(ignored_tables))}."

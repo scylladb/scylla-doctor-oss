@@ -555,6 +555,34 @@ def test_NTPServicesAnalyzer():
     ])
 
 
+def test_ChronyStatusAnalyzer():
+    analyzer = analyzers.ChronyStatusAnalyzer({})
+    analyzer.analyze({})
+    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
+                           "Required ChronyStatusCollector results not found")
+
+    check_analyzer(analyzer, "ChronyStatusCollector", [
+        ({'chrony_synchronized': False},
+         AnalyzerResult(AnalyzerStatus.FAILED, "The system clock is not chrony synchronized.")),
+        ({'chrony_synchronized': True},
+         AnalyzerResult(AnalyzerStatus.PASSED, "The system clock is chrony synchronized.")),
+    ])
+
+
+def test_ChronyServicesAnalyzer():
+    analyzer = analyzers.ChronyServicesAnalyzer({})
+    analyzer.analyze({})
+    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
+                           "Required ChronyServicesCollector results not found")
+
+    check_analyzer(analyzer, "ChronyServicesCollector", [
+        ({'services': {'chronyd': {'active': False}, 'chrony': {'active': False}}},
+         AnalyzerResult(AnalyzerStatus.FAILED, "was not done")),
+        ({'services': {'chronyd': {'active': True}, 'chrony': {'active': False}}},
+         AnalyzerResult(AnalyzerStatus.PASSED, "was done")),
+    ])
+
+
 def test_OSSupportAnalyzer():
     analyzer = analyzers.OSSupportAnalyzer({})
     analyzer.analyze({})
@@ -1130,6 +1158,28 @@ def test_RAIDSetupAnalyzer():
         ({'/proc/mdstat': ["md1: active raid1 nvme0n1p6", "md1 : active raid4 nvme0n1p6"]},
          AnalyzerResult(AnalyzerStatus.WARNING, "Funny RAID")),
     ], initial_vitals=vitals)
+
+
+def test_UnusedNVMeDevicesAnalyzer():
+    analyzer = analyzers.UnusedNVMeDevicesAnalyzer({})
+    analyzer.analyze({})
+    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
+                           "Required NVMeDevicesCollector results not found")
+
+    check_analyzer(analyzer, "NVMeDevicesCollector", [
+        ({'nvme_devices': [], 'used_nvme_devices': [], 'unused_nvme_devices': []},
+         AnalyzerResult(AnalyzerStatus.PASSED, "No NVMe devices detected")),
+        ({'nvme_devices': ['nvme0n1'], 'used_nvme_devices': ['nvme0n1'], 'unused_nvme_devices': []},
+         AnalyzerResult(AnalyzerStatus.PASSED, "All 1 NVMe device(s) are in use")),
+        ({'nvme_devices': ['nvme0n1', 'nvme1n1'],
+          'used_nvme_devices': ['nvme0n1'],
+          'unused_nvme_devices': ['nvme1n1']},
+         AnalyzerResult(AnalyzerStatus.WARNING, "Unused NVMe device(s) detected: nvme1n1")),
+        ({'nvme_devices': ['nvme0n1', 'nvme1n1', 'nvme2n1'],
+          'used_nvme_devices': ['nvme0n1'],
+          'unused_nvme_devices': ['nvme1n1', 'nvme2n1']},
+         AnalyzerResult(AnalyzerStatus.WARNING, "Unused NVMe device(s) detected: nvme1n1, nvme2n1")),
+    ])
 
 
 def test_AssignedNICsAnalyzer():
@@ -3048,7 +3098,7 @@ def test_DisabledCompactionAnalyzer():
         # All tables have compactions enabled
         (
             {"ks1": {"t1": {"compaction": "{'class': 'IncrementalCompactionStrategy', 'enabled': 'true'}"}}},
-            AnalyzerResult(AnalyzerStatus.PASSED, "All tables have compactions enabled"),
+            AnalyzerResult(AnalyzerStatus.PASSED, "All tables and views have compactions enabled"),
         ),
         # Table using NullCompactionStrategy
         (
@@ -3079,6 +3129,12 @@ def test_DisabledCompactionAnalyzer():
         (
             {"ks1": {"t1": {"compaction": "{'class': ''}"}}},
             AnalyzerResult(AnalyzerStatus.FAILED, "ks1:t1"),
+        ),
+        # View with compaction explicitly disabled is flagged like a table
+        (
+            {"ks1": {"mv": {"table_kind": "view",
+                            "compaction": "{'class': 'IncrementalCompactionStrategy', 'enabled': 'false'}"}}},
+            AnalyzerResult(AnalyzerStatus.FAILED, "ks1:mv"),
         ),
     ])
 
@@ -3112,7 +3168,7 @@ def _make_disabled_compaction_analyzer(ignored_tables_list: List[str] | None) ->
 
 
 def _make_disabled_compaction_analyzer_success_message(ignored_tables_list: List[str] | None = None) -> str:
-    msg = "All tables have compactions enabled."
+    msg = "All tables and views have compactions enabled."
     if ignored_tables_list is None:
         ignored_tables_list = []
 
@@ -3329,11 +3385,11 @@ def _make_stcs_vitals(schema: dict) -> dict:
 
 
 def _stcs_error_message(tables: List[str]) -> str:
-    return "Tables that use STCS: " + ", ".join(tables)
+    return "Tables/views that use STCS: " + ", ".join(tables)
 
 
 def _stcs_success_message() -> str:
-    return "There are no tables that use STCS."
+    return "There are no tables or views that use STCS."
 
 
 def test_STCSInSchemaAnalyzer_no_collector():
@@ -3396,6 +3452,18 @@ def test_STCSInSchemaAnalyzer_system_tables_included():
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, _stcs_error_message(["system.local"]))
 
 
+def test_STCSInSchemaAnalyzer_stcs_view_detected():
+    """
+    A view (materialized view / index) using STCS is flagged like a table.
+    """
+    analyzer = analyzers.STCSInSchemaAnalyzer({})
+    schema = {
+        "ks1": {"mv": {"table_kind": "view", "compaction": "{'class': 'SizeTieredCompactionStrategy'}"}},
+    }
+    analyzer.analyze(_make_stcs_vitals(schema))
+    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, _stcs_error_message(["ks1.mv"]))
+
+
 def test_STCSInSchemaAnalyzer_empty_schema():
     """
     Empty schema (no tables at all) passes.
@@ -3403,6 +3471,136 @@ def test_STCSInSchemaAnalyzer_empty_schema():
     analyzer = analyzers.STCSInSchemaAnalyzer({})
     analyzer.analyze(_make_stcs_vitals({}))
     assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, _stcs_success_message())
+
+
+def _make_zstd_level_vitals(schema: dict, system_config: Optional[dict] = None) -> dict:
+    vitals = {"ScyllaClusterTablesDescriptionCollector": CollectorResult(
+        CollectorStatus.PASSED, schema, Output(), '')}
+    if system_config is not None:
+        vitals["SystemConfigCollector"] = CollectorResult(
+            CollectorStatus.PASSED, system_config, Output(), '')
+    return vitals
+
+
+def _zstd_level_success_message(max_level: int = 4) -> str:
+    return f"All ZSTD compression levels are at or below {max_level}."
+
+
+def _zstd_system_config(compression_options: dict) -> dict:
+    return {
+        "sstable_compression_user_table_options": {
+            "value": compression_options,
+            "source": "config",
+            "type": "map",
+        },
+    }
+
+
+def test_ZstdCompressionLevelAnalyzer_no_collector():
+    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    analyzer.analyze({})
+    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
+
+
+def test_ZstdCompressionLevelAnalyzer_passes_low_zstd_levels():
+    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    schema = {
+        "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '3'}"}},
+        "ks2": {"t2": {"compression": "{'sstable_compression': 'org.apache.cassandra.io.compress.ZstdWithDictsCompressor', 'compression_level': '4'}"}},  # noqa: E501
+        "ks3": {"t3": {"compression": "{'sstable_compression': 'org.apache.cassandra.io.compress.LZ4Compressor'}"}},
+    }
+    analyzer.analyze(_make_zstd_level_vitals(schema, {}))
+    assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, _zstd_level_success_message())
+
+
+def test_ZstdCompressionLevelAnalyzer_warns_on_high_schema_level():
+    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    schema = {
+        "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '6'}"}},
+    }
+    analyzer.analyze(_make_zstd_level_vitals(schema, {}))
+    assert_analyzer_result(analyzer, AnalyzerStatus.WARNING, "ks1.t1 (level 6)")
+    assert "may use more CPU; confirm this is intended" in analyzer.message
+
+
+def test_ZstdCompressionLevelAnalyzer_warns_on_high_view_level():
+    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    schema = {
+        "ks1": {"mv": {"table_kind": "view",
+                       "compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '6'}"}},
+    }
+    analyzer.analyze(_make_zstd_level_vitals(schema, {}))
+    assert_analyzer_result(analyzer, AnalyzerStatus.WARNING, "ks1.mv (level 6)")
+
+
+def test_ZstdCompressionLevelAnalyzer_warns_on_high_system_config_level():
+    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    system_config = _zstd_system_config({
+        "sstable_compression": "ZstdWithDictsCompressor",
+        "compression_level": 5,
+    })
+    analyzer.analyze(_make_zstd_level_vitals({}, system_config))
+    assert_analyzer_result(
+        analyzer, AnalyzerStatus.WARNING,
+        "system.config sstable_compression_user_table_options compression level is 5 "
+        "(above 4; may use more CPU)")
+
+
+def test_ZstdCompressionLevelAnalyzer_warns_on_schema_and_system_config():
+    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    schema = {
+        "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '5'}"}},
+    }
+    system_config = _zstd_system_config({
+        "sstable_compression": "ZstdCompressor",
+        "compression_level": 6,
+    })
+    analyzer.analyze(_make_zstd_level_vitals(schema, system_config))
+    assert_analyzer_result(analyzer, AnalyzerStatus.WARNING, "ks1.t1 (level 5)")
+    assert "may use more CPU; confirm this is intended" in analyzer.message
+    assert "compression level is 6 (above 4; may use more CPU)" in analyzer.message
+
+
+def test_ZstdCompressionLevelAnalyzer_ignored_tables():
+    analyzer = analyzers.ZstdCompressionLevelAnalyzer({'ZstdCompressionLevelAnalyzer': {'ignored_tables': 'ks1.t1'}})
+    schema = {
+        "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '6'}"}},
+        "ks2": {"t2": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '3'}"}},
+    }
+    analyzer.analyze(_make_zstd_level_vitals(schema, {}))
+    assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, _zstd_level_success_message())
+    assert "Ignored tables: ks1.t1" in analyzer.message
+
+
+def test_ZstdCompressionLevelAnalyzer_custom_max_level():
+    analyzer = analyzers.ZstdCompressionLevelAnalyzer({'ZstdCompressionLevelAnalyzer': {'max_recommended_level': '2'}})
+    schema = {
+        "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '3'}"}},
+    }
+    analyzer.analyze(_make_zstd_level_vitals(schema, {}))
+    assert_analyzer_result(analyzer, AnalyzerStatus.WARNING, "ks1.t1 (level 3)")
+
+
+def test_ZstdCompressionLevelAnalyzer_zstd_default_level_passes():
+    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    schema = {
+        "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor'}"}},
+    }
+    analyzer.analyze(_make_zstd_level_vitals(schema, {}))
+    assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, _zstd_level_success_message())
+
+
+def test_ZstdCompressionLevelAnalyzer_skips_non_numeric_level():
+    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    schema = {
+        "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': 'fast'}"}},
+    }
+    system_config = _zstd_system_config({
+        "sstable_compression": "ZstdCompressor",
+        "compression_level": "high",
+    })
+    analyzer.analyze(_make_zstd_level_vitals(schema, system_config))
+    assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, _zstd_level_success_message())
 
 
 def _make_ks_replication_vitals(schema: dict) -> dict:

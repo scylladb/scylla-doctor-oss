@@ -31,7 +31,7 @@ import zipfile
 
 from typing import Dict, Optional, Set, List, Iterable, Union, Sequence, Tuple, Generic, TypeVar
 
-from common import DictView, Paths, NodePlatform
+from common import DictView, Paths, NodePlatform, ConfigParameter
 from collectors_base import CollectorStatus, Collector, ScyllaRestApiAwareCollector
 from common import GossipInfoInvariantValues, InvalidConfigurationException
 from models.output_entry import OutputEntryType, Level
@@ -335,15 +335,40 @@ class FirewallRulesCollector(Collector):
         return
 
 
+_CLOUD_PROVIDER_API_CONFIG_PARAMETERS: Dict[str, ConfigParameter] = {
+    'timeout': ConfigParameter(
+        default='1',
+        param_type=float,
+        unit='seconds',
+        description='Cloud Provider Metadata Server API access timeout.',
+    ),
+    'retries': ConfigParameter(
+        default='0',
+        param_type=int,
+        description='Number of retries when Cloud Provider Metadata Server API access fails.',
+    ),
+    'retry_interval': ConfigParameter(
+        default='0',
+        param_type=float,
+        unit='seconds',
+        description='Delay in seconds between retries.',
+    ),
+}
+
+
 class MaintenanceEventsCollector(Collector):
     @property
     def name(self) -> str:
         return "Gather scheduled maintenance events from cloud provider"
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return dict(_CLOUD_PROVIDER_API_CONFIG_PARAMETERS)
+
     def _collect(self, vitals: DictView) -> None:
-        timeout = float(self.config.get("timeout", 1))
-        retries = int(self.config.get("retries", 0))
-        retry_interval = float(self.config.get("retry_interval", 0))
+        timeout = self._get_config_value('timeout')
+        retries = self._get_config_value('retries')
+        retry_interval = self._get_config_value('retry_interval')
         provider = InfrastructureProvider().identify(timeout=timeout,
                                                      retries=retries,
                                                      retry_interval=retry_interval)
@@ -371,6 +396,10 @@ class InfrastructureProviderCollector(Collector):
     def name(self) -> str:
         return "Detect infrastructure provider"
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return dict(_CLOUD_PROVIDER_API_CONFIG_PARAMETERS)
+
     @property
     def __collector_nics(self) -> str:
         return "NICsCollector"
@@ -380,9 +409,9 @@ class InfrastructureProviderCollector(Collector):
         return {self.__collector_nics}
 
     def _collect(self, vitals: DictView) -> None:
-        timeout = float(self.config.get("timeout", 1))
-        retries = int(self.config.get("retries", 0))
-        retry_interval = float(self.config.get("retry_interval", 0))
+        timeout = self._get_config_value('timeout')
+        retries = self._get_config_value('retries')
+        retry_interval = self._get_config_value('retry_interval')
         provider = InfrastructureProvider().identify(timeout=timeout,
                                                      retries=retries,
                                                      retry_interval=retry_interval)
@@ -465,11 +494,18 @@ class NICsCollector(Collector):
     def name(self) -> str:
         return "Gather all available NICs"
 
+    @property
+    def __default_skip_nics(self) -> Set[str]:
+        # Loopback and virtual/tunnel interfaces that do not support ethtool (e.g. exit 75 "No data available").
+        return {'lo', 'erspan0', 'gre0', 'gretap0', 'sit0', 'ip6tnl0'}
+
     def _collect(self, vitals: DictView) -> None:
         if not shutil.which('ethtool'):
             self.status = CollectorStatus.FAILED
             self._message = "'ethtool' utility is required, please install it"
             return
+
+        skip_nics = self.__default_skip_nics | self._parse_comma_separated_config('skip_nics')
 
         self._data['nics'] = dict()
         for nic_path in sorted(glob.glob("/sys/class/net/*")):
@@ -481,7 +517,7 @@ class NICsCollector(Collector):
 
             nic = nic_pathlib_path.name
 
-            if nic == "lo":
+            if nic in skip_nics:
                 continue
 
             command_i = f"ethtool -i {nic}"
@@ -612,6 +648,83 @@ class NTPServicesCollector(Collector):
         }
 
         self._output.put(OutputEntryType.VALUE, "NTP services",
+                         f"{json.dumps(self._data['services'], indent=4)}", level=Level.VERBOSE)
+
+        self.status = CollectorStatus.PASSED
+
+
+class ChronyStatusCollector(Collector):
+    @property
+    def name(self) -> str:
+        return "Chrony status collection"
+
+    @property
+    def __not_synchronized_leap_status(self) -> str:
+        # Ref https://chrony-project.org/doc/4.0/chronyc.html (tracking: Leap status)
+        return 'Not synchronised'
+
+    def _collect(self, vitals: DictView) -> None:
+        """
+        Collects whether the system clock is synchronized via chrony.
+        Sets 'chrony_synchronized' and 'leap_status' in the data collection.
+        """
+        if not shutil.which('chronyc'):
+            self.status = CollectorStatus.SKIPPED
+            self._message = "chronyc is not installed, skipping chrony status collection"
+            return
+
+        command = "chronyc tracking"
+        output = Executor.run_command(command, check=False)
+        self._output.put(OutputEntryType.STDOUT, command, output.stdout, level=Level.VERBOSE)
+
+        if output.returncode != 0:
+            self.status = CollectorStatus.SKIPPED
+            self._message = "chronyc tracking failed, chrony may not be in use"
+            return
+
+        leap_status = None
+        for line in output.stdout.splitlines():
+            match = re.match(r'^\s*Leap status\s*:\s*(.+)\s*$', line)
+            if match:
+                leap_status = match.group(1)
+                break
+
+        if leap_status is None:
+            self.status = CollectorStatus.FAILED
+            self._message = "Could not determine chrony leap status from chronyc tracking output"
+            return
+
+        self._data = {
+            'chrony_synchronized': leap_status != self.__not_synchronized_leap_status,
+            'leap_status': leap_status,
+        }
+        self.status = CollectorStatus.PASSED
+
+
+class ChronyServicesCollector(Collector):
+    @property
+    def name(self) -> str:
+        return "Chrony services collection"
+
+    @property
+    def __chrony_services(self) -> Set[str]:
+        return {
+            "chronyd",
+            "chrony",
+        }
+
+    def _collect(self, vitals: DictView) -> None:
+        service_manager = ServiceManager()
+
+        services = {service: {
+            'active': service_manager.service_active(service)
+        } for service in self.__chrony_services}
+
+        self._data = {
+            'services': services
+        }
+
+        self._output.put(OutputEntryType.VALUE, "Chrony services",
                          f"{json.dumps(self._data['services'], indent=4)}", level=Level.VERBOSE)
 
         self.status = CollectorStatus.PASSED
@@ -884,7 +997,15 @@ class RAIDSetupCollector(Collector):
 
     def _collect(self, vitals: DictView) -> None:
         filename = "/proc/mdstat"
-        content = Executor.read_file_content(filename)
+
+        # /proc/mdstat is only present when the md (software RAID) kernel module is available. Its absence
+        # means software RAID is not in use on this node, which is not an error - skip instead of failing.
+        try:
+            content = Executor.read_file_content(filename)
+        except FileNotFoundError:
+            self.status = CollectorStatus.SKIPPED
+            self._message = f"{filename} is not present, software RAID is not configured"
+            return
 
         if not content:
             self.status = CollectorStatus.FAILED
@@ -902,6 +1023,99 @@ class RAIDSetupCollector(Collector):
         Exclude this Collector from drifts checking due to false alarms.
         """
         return ["/proc/mdstat"]
+
+
+class NVMeDevicesCollector(Collector):
+    _NVME_DISK_NAME_RE = re.compile(r'^nvme\d+n\d+$')
+
+    @property
+    def name(self) -> str:
+        return "NVMe devices"
+
+    @property
+    def __collector_raid(self) -> str:
+        return "RAIDSetupCollector"
+
+    @property
+    def __collector_provider(self) -> str:
+        return "InfrastructureProviderCollector"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__collector_raid, self.__collector_provider}
+
+    @classmethod
+    def _list_nvme_disks(cls) -> List[str]:
+        if not os.path.isdir('/sys/block'):
+            return []
+        return sorted(name for name in os.listdir('/sys/block') if cls._NVME_DISK_NAME_RE.match(name))
+
+    @staticmethod
+    def _block_device_basename(source: str) -> str:
+        name = os.path.basename(source)
+        nvme_namespace = re.match(r'^(nvme\d+n\d+)(?:p\d+)?$', name)
+        if nvme_namespace:
+            return nvme_namespace.group(1)
+        return re.sub(r'\d+$', '', name)
+
+    @classmethod
+    def _root_block_device_name(cls) -> Optional[str]:
+        output = Executor.run_command('findmnt -n -o SOURCE /', check=False)
+        if output.returncode != 0 or not output.stdout.strip():
+            return None
+        return cls._block_device_basename(output.stdout.strip())
+
+    def _applicable_nvme_disks(self, vitals: DictView, nvme_disks: List[str]) -> List[str]:
+        if vitals[self.__collector_provider].data.get('provider') != 'AWS':
+            return nvme_disks
+
+        root_device = self._root_block_device_name()
+        if not root_device:
+            return nvme_disks
+
+        return [disk for disk in nvme_disks if disk != root_device]
+
+    @staticmethod
+    def _active_raid_nvme_members(mdstat_content: List[str]) -> Set[str]:
+        members = set()
+        for line in mdstat_content:
+            if ' : active ' not in line:
+                continue
+            members.update(re.findall(r'(nvme\d+n\d+)', line))
+        return members
+
+    def _mounted_nvme_disks(self, nvme_disks: Set[str]) -> Optional[Set[str]]:
+        mounted = set()
+        for disk in sorted(nvme_disks):
+            command = f"lsblk -rno MOUNTPOINT /dev/{disk}"
+            output = Executor.run_command(command, check=False)
+            if output.returncode != 0:
+                self.status = CollectorStatus.FAILED
+                self._message = f"Failed to run {command}: {output.stdout.strip()}"
+                return None
+            self._output.put(OutputEntryType.STDOUT, command, output.stdout, level=Level.VERBOSE)
+            if any(line.strip() for line in output.stdout.splitlines()):
+                mounted.add(disk)
+        return mounted
+
+    def _collect(self, vitals: DictView) -> None:
+        nvme_disks = self._applicable_nvme_disks(vitals, self._list_nvme_disks())
+        mdstat_content = vitals[self.__collector_raid].data['/proc/mdstat']
+
+        nvme_disk_set = set(nvme_disks)
+        mounted = self._mounted_nvme_disks(nvme_disk_set)
+        if mounted is None:
+            return
+
+        used = mounted | self._active_raid_nvme_members(mdstat_content)
+        used &= nvme_disk_set
+
+        self._data = {
+            'nvme_devices': nvme_disks,
+            'used_nvme_devices': sorted(used),
+            'unused_nvme_devices': sorted(nvme_disk_set - used),
+        }
+        self.status = CollectorStatus.PASSED
 
 
 class RAMCollector(Collector):
@@ -1229,14 +1443,19 @@ class ScyllaClusterTablesDescriptionCollector(Collector):
 
     def _collect(self, vitals: DictView) -> None:
         try:
-            table_name = 'system_schema.tables'
-            query, rows = Executor.read_cql_table(vitals[self.__collector_config].data, table_name)
-            self._output.put(OutputEntryType.CQL, query, rows, Level.VERBOSE)
+            # Views (incl. secondary indexes) are column families too: their schema rows carry real
+            # compression/compaction config and the per-table REST endpoints serve them.
+            for table_name, name_column, kind in (('system_schema.tables', 'table_name', 'table'),
+                                                  ('system_schema.views', 'view_name', 'view')):
+                query, rows = Executor.read_cql_table(vitals[self.__collector_config].data, table_name)
+                self._output.put(OutputEntryType.CQL, query, rows, Level.VERBOSE)
 
-            for row in rows:
-                keyspace = row['keyspace_name'].strip()
-                table = row['table_name'].strip()
-                self._data.setdefault(keyspace, {})[table] = row
+                for row in rows:
+                    keyspace = row['keyspace_name'].strip()
+                    # Copy so the VERBOSE CQL dump above stays a faithful query result
+                    entry = dict(row)
+                    entry['table_kind'] = kind
+                    self._data.setdefault(keyspace, {})[row[name_column].strip()] = entry
             self.status = CollectorStatus.PASSED
         except CqlFailedException as e:
             self.status = CollectorStatus.FAILED
@@ -1479,6 +1698,15 @@ class ScyllaLogsCollector(Collector):
     def name(self) -> str:
         return "Scylla logs"
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'since_date': ConfigParameter(
+                default_description='unset (--since not used)',
+                description='Value passed to journalctl --since.',
+            ),
+        }
+
     @property
     def __collector_platform(self) -> str:
         return "NodePlatformCollector"
@@ -1493,7 +1721,7 @@ class ScyllaLogsCollector(Collector):
             self._message = "Not available for containers"
             return
 
-        since_date = self.config.get('since_date')
+        since_date = self._get_config_value('since_date')
 
         since_date_parameter = f"--since={since_date}" if since_date else ""
 
@@ -1507,6 +1735,51 @@ class ScyllaLogsCollector(Collector):
             self.status = CollectorStatus.PASSED
             self._message = f"Scylla logs gathered successfully to [{file}]"
             self._output.put(OutputEntryType.STDOUT, command, self.message, level=Level.VERBOSE)
+
+
+class ScyllaManagerAgentLogsCollector(Collector):
+    @property
+    def name(self) -> str:
+        return "Scylla Manager Agent logs"
+
+    @property
+    def __collector_platform(self) -> str:
+        return "NodePlatformCollector"
+
+    @property
+    def __service_name(self) -> str:
+        return "scylla-manager-agent"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__collector_platform}
+
+    def _collect(self, vitals: DictView) -> None:
+        if vitals[self.__collector_platform].data['platform'] == NodePlatform.CONTAINER:
+            self.status = CollectorStatus.SKIPPED
+            self._message = "Not available for containers"
+            return
+
+        # Scylla Manager Agent is optional - skip when it is not installed on this node
+        if not ServiceManager().service_exists(self.__service_name):
+            self.status = CollectorStatus.SKIPPED
+            self._message = f"{self.__service_name} service is not installed"
+            return
+
+        since_date = self.config.get('since_date')
+
+        since_date_parameter = f"--since={since_date}" if since_date else ""
+
+        file = Executor.generate_output_filename(prefix="scylla_manager_agent_logs_", extension=".txt")
+        command = f"journalctl --utc --no-pager --unit={self.__service_name} {since_date_parameter}".strip()
+        output = Executor.run_command(command, output_file=file, output_file_compression=True)
+        if not output:
+            self.status = CollectorStatus.FAILED
+            self._message = "Cannot gather Scylla Manager Agent logs"
+        else:
+            self.status = CollectorStatus.PASSED
+            self._message = "Scylla Manager Agent logs gathered successfully"
+            self._output.put(OutputEntryType.STDOUT, command, f"{self.message} to [{file}]", level=Level.VERBOSE)
 
 
 class ScyllaServicesCollector(Collector):
@@ -2197,6 +2470,121 @@ class SystemTopologyCollector(Collector):
         self._message = ". ".join(messages)
 
 
+class SystemTabletsCollector(Collector):
+    """
+    Collects tablet ownership from system.tablets.
+
+    Projects ownership-relevant columns only (not every system.tablets column):
+    table_id, last_token, keyspace_name, table_name, replicas, base_table.
+
+    Stored nested under data.tables so keyspace_name, table_name, table_id, and
+    base_table are not repeated on every tablet entry. Each table entry holds
+    those shared fields once; tablets lists only last_token and replicas.
+
+    replicas is the tablet's replica list in CQL return order - index 0 is *not*
+    guaranteed to be Scylla's current primary replica (primary selection can reshuffle it).
+    base_table is set for co-located tables, whose own tablet map is empty; ownership for
+    those must be resolved via the base table's map instead.
+    """
+
+    @property
+    def name(self) -> str:
+        return "Collects system.tablets content"
+
+    @property
+    def __collector_cql(self) -> str:
+        return "CqlshCollector"
+
+    @property
+    def __collector_scylla_config(self) -> str:
+        return "ScyllaConfigurationFileCollector"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__collector_cql, self.__collector_scylla_config}
+
+    @property
+    def __columns(self) -> List[str]:
+        # Ownership columns only — omits repair/session metadata and similar.
+        return ['table_id', 'last_token', 'keyspace_name', 'table_name', 'replicas', 'base_table']
+
+    @property
+    def mask(self) -> Sequence[Union[str, Iterable]]:
+        """
+        Exclude from cluster drift comparison. Tablet maps change under size-based
+        balancing (split/merge/migration); concurrent collection across nodes can
+        also capture different snapshots, so diffs are noisy and not meaningful.
+        """
+        return ['*']
+
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'max_rows': ConfigParameter(
+                default='-1',
+                param_type=int,
+                description='Maximum rows to collect from system.tablets. -1 means no limit. '
+                            'The tablet map scales with #tables x tablet_count and can be large '
+                            'on busy clusters; set a cap if vitals size/runtime is a concern.',
+            ),
+        }
+
+    @staticmethod
+    def __group_rows_by_table(rows: List[Dict]) -> List[Dict]:
+        """
+        Collapse flat CQL rows into per-table entries with shared characteristics once.
+        """
+        grouped: Dict[Tuple[str, str], Dict] = {}
+        for row in rows:
+            key = (row.get('keyspace_name', ''), row.get('table_name', ''))
+            entry = grouped.get(key)
+            if entry is None:
+                entry = {
+                    'keyspace_name': key[0],
+                    'table_name': key[1],
+                    'table_id': row.get('table_id', ''),
+                    'base_table': row.get('base_table', ''),
+                    'tablets': [],
+                }
+                grouped[key] = entry
+            entry['tablets'].append({
+                'last_token': row.get('last_token', ''),
+                'replicas': row.get('replicas', ''),
+            })
+
+        tables = []
+        for key in sorted(grouped):
+            entry = grouped[key]
+            entry['tablets'].sort(key=lambda t: t.get('last_token', ''))
+            tables.append(entry)
+        return tables
+
+    def _collect(self, vitals: DictView) -> None:
+        """
+        Collect tablet map from system.tablets into data.tables (nested by keyspace/table).
+        """
+        max_rows = self._get_config_value('max_rows')
+        table_name = 'system.tablets'
+        try:
+            query, rows = Executor.read_cql_table(
+                vitals[self.__collector_scylla_config].data, table_name,
+                columns=self.__columns, max_rows=max_rows)
+            self._output.put(OutputEntryType.CQL, query, rows, Level.VERBOSE)
+
+            self._data = {'tables': self.__group_rows_by_table(rows)}
+            self.status = CollectorStatus.PASSED
+            self._message = f"Collected {len(rows)} rows"
+        except CqlFailedException as e:
+            # system.tablets doesn't exist on Scylla versions predating tablets - that's not a
+            # failure, tablets simply aren't applicable to this node.
+            if "unconfigured table" in str(e):
+                self.status = CollectorStatus.SKIPPED
+                self._message = "system.tablets does not exist - tablets are not supported on this node"
+            else:
+                self.status = CollectorStatus.FAILED
+                self._message = f"{e}"
+
+
 class LargePartitionsCellsRowsCollector(Collector):
     """
     Collects the content of system.large_partitions, system.large_cells and system.large_rows tables.
@@ -2220,8 +2608,27 @@ class LargePartitionsCellsRowsCollector(Collector):
     def depends_on(self) -> Set[str]:
         return {self.__collector_cql, self.__collector_scylla_config}
 
+    @property
+    def mask(self) -> Sequence[Union[str, Iterable]]:
+        """
+        Let's exclude this collector from comparison - large partitions/cells/rows are workload- and
+        compaction-dependent, so they naturally differ between nodes of the same cluster and would only
+        add noise to drift checking.
+        """
+        return ['*']
+
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'max_rows': ConfigParameter(
+                default='-1',
+                param_type=int,
+                description='Maximum rows to collect from each large_* table. -1 means no limit.',
+            ),
+        }
+
     def _collect(self, vitals: DictView) -> None:
-        max_rows = int(self.config.get('max_rows', -1))
+        max_rows = self._get_config_value('max_rows')
         self._data = {}
         for table_name in ('system.large_partitions', 'system.large_cells', 'system.large_rows'):
             query, rows = Executor.read_cql_table(
@@ -2313,13 +2720,23 @@ class SystemConfigCollector(Collector):
         # Exclude encryption, addresses, and other unique parameters.
         return encryption_mask + addresses_mask + other_unique_parameters_mask
 
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'string_value_keys': ConfigParameter(
+                default='',
+                comma_separated=True,
+                description='Comma-separated list of system.config keys stored as plain strings (non-JSON).',
+            ),
+        }
+
     def _collect(self, vitals: DictView) -> None:
         """
         - Collects system.config parameters their values and appropriately casts them (e.g. bool, int, list).
         - Collects the source of values set for system.config parameters (e.g. default, API, etc.)
         - Collects types of values set for system.config parameters (e.g. 'string', 'int', 'restriction mode')
         """
-        string_value_keys = self._parse_comma_separated_config("string_value_keys")
+        string_value_keys = self._get_config_value('string_value_keys')
 
         # Set 'object_storage_endpoints' has a non-JSON value.
         # Ref https://scylladb.atlassian.net/browse/SCYLLADB-1658

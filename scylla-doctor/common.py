@@ -17,13 +17,16 @@
 # along with Scylla Doctor.  If not, see <http://www.gnu.org/licenses/>.
 import abc
 import configparser
+import dataclasses
 import enum
 import os
 
-from typing import Optional, Callable, Set
+from typing import Any, Dict, Optional, Callable, Set, Type
 from collections.abc import Mapping, Iterable
 
 ENCODING = "UTF-8"
+
+_CONFIG_VALUE_UNSET = object()
 
 
 # Common static functions ################################
@@ -226,6 +229,48 @@ if __name__ == '__main__':
     doctor.print_results()
 
 
+@dataclasses.dataclass(frozen=True)
+class ConfigParameter:
+    description: str
+    default: Optional[str] = None
+    default_description: Optional[str] = None
+    param_type: Type[Any] = str
+    unit: Optional[str] = None
+    comma_separated: bool = False
+
+    def display_default(self) -> str:
+        if self.default is not None:
+            value = self.default
+        elif self.default_description is not None:
+            value = self.default_description
+        else:
+            value = 'unset'
+        if self.unit and self.default is not None:
+            return f"{value} {self.unit}"
+        return value
+
+    def runtime_type_name(self) -> str:
+        if self.comma_separated:
+            return 'set[str]'
+        return self.param_type.__name__
+
+
+_RUN_CONFIG_PARAMETER = ConfigParameter(
+    default_description='unset (enabled)',
+    description='Set to no/0/false/off to disable this component.',
+)
+
+
+def _cast_config_parameter_value(raw: str, param: ConfigParameter) -> Any:
+    if param.comma_separated:
+        return {s.strip() for s in raw.split(',') if s.strip()}
+    if param.param_type is int:
+        return int(raw)
+    if param.param_type is float:
+        return float(raw)
+    return raw
+
+
 class ConfigValuesParser(abc.ABC):
     @property
     @abc.abstractmethod
@@ -234,6 +279,49 @@ class ConfigValuesParser(abc.ABC):
         Should return a DictView object with configuration values for the current class.
         """
         pass
+
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        """
+        Return component-specific configuration parameters and their defaults.
+        The universal ``run`` parameter is added automatically.
+        """
+        return {}
+
+    @property
+    def config_parameters(self) -> Dict[str, ConfigParameter]:
+        params = dict(type(self).config_parameters_definitions())
+        params.pop('run', None)
+        params['run'] = _RUN_CONFIG_PARAMETER
+        return params
+
+    def _config_raw_value(self, name: str) -> Optional[str]:
+        if name not in self.config:
+            return None
+        value = self.config[name]
+        return value if value != '' else None
+
+    def _get_config_value(self, name: str, fallback: Any = _CONFIG_VALUE_UNSET) -> Any:
+        """
+        Resolve a declared configuration parameter using its metadata default and type.
+        """
+        definitions = type(self).config_parameters_definitions()
+        if name not in definitions:
+            raise KeyError(f"Undefined config parameter '{name}' for {type(self).__name__}")
+
+        param = definitions[name]
+        raw = self._config_raw_value(name)
+        if raw is None:
+            if param.default is not None:
+                raw = param.default
+            elif fallback is not _CONFIG_VALUE_UNSET:
+                return fallback
+            elif param.comma_separated:
+                raw = ''
+            else:
+                return None
+
+        return _cast_config_parameter_value(raw, param)
 
     def _parse_comma_separated_config(self, config_key_name: str) -> Set[str]:
         """
@@ -247,4 +335,8 @@ class ConfigValuesParser(abc.ABC):
         :param config_key_name: The name of the configuration key to retrieve and process.
         :return: A set containing unique, stripped, non-empty items from the input string.
         """
+        if config_key_name in type(self).config_parameters_definitions():
+            value = self._get_config_value(config_key_name)
+            return value if value is not None else set()
+
         return {s.strip() for s in self.config.get(config_key_name, '').split(',') if s.strip()}

@@ -29,12 +29,14 @@ import configparser
 import enum
 import inspect
 import json
+import os
 import re
 import sys
+import zipfile
 
-from typing import Dict
+from typing import Dict, Optional, Union
 
-from common import DictView, Paths, AbortedException
+from common import DictView, Paths, AbortedException, ConfigParameter
 from collectors_base import CollectorStatus, CollectorResult, Collector
 from analyzers_base import AnalyzerStatus, Analyzer
 from common import read_config_file
@@ -151,17 +153,60 @@ class Doctor:
                 if self.environment.args.abort_on_first_error:
                     raise AbortedException(f'Collector {collector.id} failed')
 
-    def run_analyzers(self):
-        # Verify that vitals and SD versions match before checking anything else
-        vitals_version_verifier = self.analyzers.get('SDVersionAnalyzer')
-        vitals_version_collector = self.collectors.get('SDVersionCollector')
-        if (vitals_version_collector and vitals_version_collector.run and
-                vitals_version_verifier and vitals_version_verifier.run):
-            vitals_version_verifier.analyze(self.vitals)
-            if vitals_version_verifier.status != AnalyzerStatus.PASSED:
-                print(vitals_version_verifier.message)
-                raise Exception("Vitals version mismatch. Use a correct Scylla Doctor version.")
+    @staticmethod
+    def read_vitals_file_version(file_name: str) -> str:
+        with open(file_name, 'r') as f:
+            vitals_json = json.load(f)
 
+        if 'SDVersionCollector' not in vitals_json:
+            raise Exception("Vitals file does not contain SDVersionCollector data.")
+
+        result = CollectorResult.decode(vitals_json['SDVersionCollector'])
+        if result.status != CollectorStatus.PASSED:
+            raise Exception(f"SDVersionCollector failed in vitals file: {result.message}")
+
+        version = result.data.get('version')
+        if not version:
+            raise Exception("Vitals file does not contain a version value.")
+
+        return version
+
+    def verify_vitals_version(self) -> None:
+        if self.environment.args.ignore_vitals_version or not self.environment.args.load_vitals:
+            return
+
+        vitals_version = self.read_vitals_file_version(self.environment.args.load_vitals)
+        self._verify_vitals_version(vitals_version)
+
+    def verify_loaded_vitals_version(self, vitals: Dict[str, CollectorResult]) -> None:
+        """
+        Version check for the in-memory (analyze_vitals) path, mirroring verify_vitals_version() which
+        reads the version straight from the vitals file. 'vitals' is the full, unfiltered decoded mapping.
+        """
+        if self.environment.args.ignore_vitals_version:
+            return
+
+        version_result = vitals.get('SDVersionCollector')
+        if version_result is None:
+            raise Exception("Vitals do not contain SDVersionCollector data.")
+        if version_result.status != CollectorStatus.PASSED:
+            raise Exception(f"SDVersionCollector failed in vitals: {version_result.message}")
+        vitals_version = version_result.data.get('version')
+        if not vitals_version:
+            raise Exception("Vitals do not contain a version value.")
+
+        self._verify_vitals_version(vitals_version)
+
+    def _verify_vitals_version(self, vitals_version: str) -> None:
+        tool_version = self.read_tool_version()
+        if vitals_version == tool_version:
+            return
+
+        print(f"Version mismatch: collected: {vitals_version} analyzer: {tool_version}")
+        print("Vitals version mismatch. Use a correct Scylla Doctor version.")
+        sys.exit(1)
+
+    def run_analyzers(self):
         for analyzer in self.analyzers.values():
             analyzer.analyze(self.vitals)
             if analyzer.status == AnalyzerStatus.FAILED:
@@ -172,56 +217,140 @@ class Doctor:
         with open(file_name, 'w') as f:
             json.dump(self.vitals, f, cls=CollectorResult.Encoder)
 
+    def _should_load_collector(self, collector) -> bool:
+        # If this specific collector is known and skipped - don't load its value from Vitals
+        collector_instance = self.collectors.get(collector)
+        return not (collector_instance and not collector_instance.run)
+
     def load_vitals(self, file_name="vitals.json"):
         with open(file_name, 'r') as f:
             vitals_json = json.load(f)
             for collector, result in vitals_json.items():
-                # If this specific collector is known and skipped - don't load its value from Vitals
-                collector_instance = self.collectors.get(collector)
-                if collector_instance and not collector_instance.run:
+                if not self._should_load_collector(collector):
                     continue
 
                 self.vitals[collector] = CollectorResult.decode(result)
 
-    @property
-    def version_collector_name(self) -> str:
-        return "SDVersionCollector"
+    @staticmethod
+    def read_tool_version() -> str:
+        script_path = os.path.dirname(collectors.__file__)
+        verfile_name = 'version'
+        if zipfile.is_zipfile(script_path):
+            try:
+                with zipfile.ZipFile(script_path, 'r') as archive:
+                    return archive.read(verfile_name).decode().strip()
+            except Exception as e:
+                raise Exception(f"Failed to read version data: {e}. Please, report!")
+
+        buildversion = os.path.join(script_path, verfile_name)
+        if os.path.isfile(buildversion):
+            with open(buildversion) as f:
+                return f.readline().strip()
+
+        raise Exception("Couldn't find SD version file, did you run 'make version' ?")
+
+    def set_vitals(self, vitals: Dict[str, CollectorResult]):
+        """
+        Populate vitals from an already-decoded, in-memory mapping instead of reading them from disk.
+        Applies the same skip filtering as load_vitals. This lets callers that already hold decoded
+        vitals (e.g. the cluster runner) reuse them for analysis without re-parsing the file.
+        """
+        for collector, result in vitals.items():
+            if not self._should_load_collector(collector):
+                continue
+
+            self.vitals[collector] = result
+
+    def analyze_vitals(self, vitals: Dict[str, CollectorResult]):
+        """
+        Run analyzers against pre-loaded, in-memory vitals, skipping the collection step entirely.
+        This mirrors the load-vitals path of run(), including the vitals/tool version check.
+        """
+        self.vitals = dict()
+        self.set_vitals(vitals)
+        self.verify_loaded_vitals_version(vitals)
+        try:
+            self.run_analyzers()
+        except AbortedException as e:
+            print(f'Execution aborted: {str(e)}')
 
     @property
     def version(self) -> str:
         """
-        Scylla Doctor version is one of the Vitals, and we use it to make sure that the tool version used to collect
-        Vitals matches a version of the tool used to analyze them.
-        Hence, we have a dedicated Collector that reads a version information from a 'version' file.
-        :return: a version string
+        Return the running Scylla Doctor version from the version file.
         """
-        if self.version_collector_name not in self.collectors:
-            raise Exception(f"{self.version_collector_name} is missing. Version can't be identified!")
+        return self.read_tool_version()
 
-        version_collector = self.collectors[self.version_collector_name]
-        if version_collector.id not in self.vitals:
-            version_collector.collect(self.vitals, self.collectors)
+    def config_parameters(self, section: Optional[str] = None) -> Dict[str, Dict[str, ConfigParameter]]:
+        """
+        Return configuration parameters and defaults for collectors and analyzers.
+        :param section: Optional component class name. When set, return only that section.
+        """
+        components: Dict[str, Union[Collector, Analyzer]] = {}
 
-        if self.vitals[version_collector.id].status != CollectorStatus.PASSED:
-            raise Exception(f"Collector {version_collector.id} failed. Version can't be read. "
-                            f"Run 'make version' if a 'version' file is missing' and make sure "
-                            f"{self.version_collector_name} is not disabled.")
+        for name in sorted(self.collectors.keys()):
+            components[name] = self.collectors[name]
+        for name in sorted(self.analyzers.keys()):
+            components[name] = self.analyzers[name]
 
-        return self.vitals[version_collector.id].data['version']
+        if section is not None:
+            if section not in components:
+                raise ValueError(f"Unknown section: {section}")
+            return {section: components[section].config_parameters}
+
+        result: Dict[str, Dict[str, ConfigParameter]] = {}
+        for name, component in components.items():
+            if not type(component).config_parameters_definitions():
+                continue
+            result[name] = component.config_parameters
+        return result
+
+    def print_config_parameters(self,
+                                section: Optional[str] = None,
+                                as_json: bool = False,
+                                file=None) -> None:
+        parameters = self.config_parameters(section)
+
+        if as_json:
+            payload: Dict[str, Dict[str, Dict[str, Optional[str]]]] = {}
+            for section_name, section_params in parameters.items():
+                payload[section_name] = {}
+                for param_name, param in section_params.items():
+                    entry: Dict[str, Optional[str]] = {
+                        'description': param.description,
+                        'default': param.default,
+                        'default_description': param.default_description,
+                        'type': param.runtime_type_name(),
+                        'unit': param.unit,
+                    }
+                    payload[section_name][param_name] = entry
+            print(json.dumps(payload, indent=4), file=file)
+            return
+
+        for section_name, section_params in parameters.items():
+            print(f"[{section_name}]", file=file)
+            for param_name, param in section_params.items():
+                print(f"  {param_name} (default: {param.display_default()})", file=file)
+                print(f"    {param.description}", file=file)
+            print(file=file)
 
     def run(self):
         self.vitals = dict()
 
         try:
             if self.environment.args.version:
-                # Print a version string and exit
                 print(f"version: {self.version}")
+                sys.exit(0)
+
+            if self.environment.args.vitals_version:
+                print(f"version: {self.read_vitals_file_version(self.environment.args.vitals_version)}")
                 sys.exit(0)
 
             if not self.environment.args.load_vitals:
                 self.run_collectors()
             else:
                 self.load_vitals(self.environment.args.load_vitals)
+                self.verify_vitals_version()
 
             if self.environment.args.save_vitals:
                 self.save_vitals(self.environment.args.save_vitals)
@@ -278,7 +407,16 @@ class DoctorEnvironment:
                                    help="Give out full human-readable report, short launch log, or machine-readable analyzers output for further processing")  # noqa: E501
         self.__parser.add_argument('--print-filter', default=".*",
                                    help="Regular expression filter to apply to Collectors and Analyzers names before printing. Print only those which name matches.")  # noqa: E501
-        self.__parser.add_argument('--version', help="Print a version information", action="store_true")
+        self.__parser.add_argument('--version', help="Print Scylla Doctor version and exit", action="store_true")
+        self.__parser.add_argument('--list-parameters', nargs='?', const='', default=None, metavar='SECTION',
+                                   help="Print configuration parameters and defaults. "
+                                        "Optional SECTION limits output to one collector/analyzer.")
+        self.__parser.add_argument('--list-parameters-json', action='store_true',
+                                   help="Output --list-parameters as JSON (implies --list-parameters)")
+        self.__parser.add_argument('--vitals-version', nargs='?', default=None, const='vitals.json',
+                                   help="Print version stored in a vitals file (vitals.json by default) and exit")
+        self.__parser.add_argument('--ignore-vitals-version', help="Skip vitals version compatibility check",
+                                   action="store_true")
 
         self.__parser.epilog = "Collectors:\n"
         # Detect and collect available Collectors instances
@@ -377,6 +515,15 @@ def main():
 
     # Start Scylla Doctor
     doctor = Doctor(doctor_env)
+
+    if doctor_env.args.list_parameters is not None or doctor_env.args.list_parameters_json:
+        section = doctor_env.args.list_parameters or None
+        try:
+            doctor.print_config_parameters(section, as_json=doctor_env.args.list_parameters_json)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
 
     # Run checkups
     doctor.run()
