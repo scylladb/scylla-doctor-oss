@@ -156,5 +156,27 @@ v1.12
   * Update NIC type mappings to include new AWS instance types i4i, i7i, i7ie, i8g, and i8ge by @vladzcloudius in #240
   * Enhance ScyllaConfigurationConsistencyAnalyzer to normalize boolean values for additional keys by @vladzcloudius in #240
   * Add STCSInSchemaAnalyzer and ScyllaKeyspacesReplicationAnalyzer by @vladzcloudius in #250
+  * Add NVMeDevicesCollector and UnusedNVMeDevicesAnalyzer to warn about unused NVMe devices (field-engineering#1145)
+  * Add ChronyStatusCollector, ChronyServicesCollector, ChronyStatusAnalyzer, and ChronyServicesAnalyzer (DOCTOR-66)
+  * Improve vitals version API: exit on mismatch when loading vitals, add --vitals-version and --ignore-vitals-version, remove SDVersionAnalyzer (field-engineering#2076)
 
+v1.13
+* Fixes:
+  * scylla-doctor: exclude LargePartitionsCellsRowsCollector from drift comparison by @vreniers in https://github.com/scylladb/scylla-doctor/pull/279
 
+* Enhancements:
+  * Add AGENTS.md for AI coding agents by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/259
+  * Warn when unused NVMe devices are detected by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/262
+  * Improve vitals version API (field-engineering#2076) by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/267
+  * Add Scylla Doctor Cluster CI by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/266
+  * Add Chrony time sync collectors and analyzers (DOCTOR-66) by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/268
+  * scylla-doctor: collect Scylla Manager Agent logs by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/260
+  * Add stale PR notifier GitHub Action by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/270
+  * scylla-doctor: make NICsCollector and RAIDSetupCollector resilient to common node states by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/261
+  * Add API and CLI to list collector/analyzer config parameters by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/264
+  * Skip closed PRs in stale PR notifier by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/275
+  * scylla-doctor-cluster: reuse decoded vitals for analysis to cut memory & redundant parsing by @vreniers in https://github.com/scylladb/scylla-doctor/pull/278
+  * Fix Scylla Manager Agent log drift message by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/281
+  * DOCTOR-85: Analyze ZSTD compression levels in schema and scylla.yaml by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/277
+  * feat: add SystemTabletsCollector for tablet ownership by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/282
+  * DOCTOR-99: Include views in table description collection by @vreniers in https://github.com/scylladb/scylla-doctor/pull/284

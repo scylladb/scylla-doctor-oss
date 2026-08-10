@@ -965,6 +965,87 @@ def test_NICsCollector(doctor_factory):
     assert len([nic for nic in nics if nics[nic]['speed'] is not None]) > 0, "Speed not detected for any NIC"
 
 
+def test_NICsCollector_skips_default_virtual_nics(doctor_factory):
+    """Common virtual/tunnel NICs are skipped by default without calling ethtool."""
+    doctor = doctor_factory(collectors=[collectors.NICsCollector])
+    collector = doctor.collectors['NICsCollector']
+
+    def fake_run_command(command, check=True, **kwargs):
+        assert "erspan0" not in command
+        result = Mock()
+        if command == "ethtool -i eth0":
+            result.returncode = 0
+            result.stdout = "driver: virtio_net\n"
+        elif command == "ethtool eth0":
+            result.returncode = 0
+            result.stdout = "Speed: 10000Mb/s\n"
+        else:
+            result.returncode = 0
+            result.stdout = ""
+        return result
+
+    with patch.object(collectors.shutil, 'which', return_value="/usr/sbin/ethtool"), \
+            patch.object(collectors.glob, 'glob',
+                         return_value=["/sys/class/net/eth0", "/sys/class/net/erspan0"]), \
+            patch.object(collectors.pathlib.Path, 'is_symlink', return_value=True), \
+            patch.object(Executor, 'run_command', side_effect=fake_run_command):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED, collector.result.message
+    nics = collector.result.data['nics']
+    assert nics['eth0'] == {'driver': 'virtio_net', 'speed': 10000}
+    assert 'erspan0' not in nics
+
+
+def test_NICsCollector_skips_configured_nics(doctor_factory):
+    """Configured skip_nics extends the built-in defaults."""
+    doctor = doctor_factory(
+        collectors=[collectors.NICsCollector],
+        config_options=[('NICsCollector', 'skip_nics', 'dummy0')],
+    )
+    collector = doctor.collectors['NICsCollector']
+
+    def fake_run_command(command, check=True, **kwargs):
+        assert "dummy0" not in command
+        result = Mock()
+        result.returncode = 0
+        result.stdout = ""
+        return result
+
+    with patch.object(collectors.shutil, 'which', return_value="/usr/sbin/ethtool"), \
+            patch.object(collectors.glob, 'glob',
+                         return_value=["/sys/class/net/eth0", "/sys/class/net/dummy0"]), \
+            patch.object(collectors.pathlib.Path, 'is_symlink', return_value=True), \
+            patch.object(Executor, 'run_command', side_effect=fake_run_command):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED, collector.result.message
+    assert 'dummy0' not in collector.result.data['nics']
+
+
+def test_NICsCollector_fails_when_ethtool_errors_on_real_nic(doctor_factory):
+    """ethtool failure on a non-skipped NIC must fail the collector."""
+    doctor = doctor_factory(collectors=[collectors.NICsCollector])
+    collector = doctor.collectors['NICsCollector']
+
+    def fake_run_command(command, check=True, **kwargs):
+        if command.startswith("ethtool eth0"):
+            raise subprocess.CalledProcessError(1, command, "Device not supported\n")
+        result = Mock()
+        result.returncode = 0
+        result.stdout = "driver: virtio_net\n"
+        return result
+
+    with patch.object(collectors.shutil, 'which', return_value="/usr/sbin/ethtool"), \
+            patch.object(collectors.glob, 'glob', return_value=["/sys/class/net/eth0"]), \
+            patch.object(collectors.pathlib.Path, 'is_symlink', return_value=True), \
+            patch.object(Executor, 'run_command', side_effect=fake_run_command):
+        collector.collect({}, doctor.collectors)
+
+    assert collector.status == CollectorStatus.FAILED
+    assert "ethtool eth0" in collector.result.message
+
+
 def test_IPAddressesCollector(doctor_factory):
     doctor = doctor_factory(collectors=[collectors.IPAddressesCollector, collectors.NICsCollector])
     doctor.run()
@@ -1003,6 +1084,101 @@ def test_NTPServicesCollector(doctor_factory):
     result = doctor.vitals['NTPServicesCollector']
     assert result.status == CollectorStatus.PASSED
     assert all(['active' in result.data['services'][service] for service in result.data['services']])
+
+
+def test_ChronyStatusCollector_skipped_without_chronyc():
+    collector = collectors.ChronyStatusCollector({}, {})
+    with patch('collectors.shutil.which', return_value=None):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.SKIPPED
+    assert 'chronyc is not installed' in collector.message
+
+
+def test_ChronyStatusCollector_skipped_when_tracking_fails():
+    collector = collectors.ChronyStatusCollector({}, {})
+    with patch('collectors.shutil.which', return_value='/usr/bin/chronyc'), \
+         patch.object(Executor, 'run_command', return_value=Mock(returncode=1, stdout='506 Cannot talk to daemon\n')):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.SKIPPED
+    assert 'chronyc tracking failed' in collector.message
+
+
+def test_ChronyStatusCollector_failed_without_leap_status():
+    collector = collectors.ChronyStatusCollector({}, {})
+    with patch('collectors.shutil.which', return_value='/usr/bin/chronyc'), \
+         patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout='Reference ID    : CB00710F\n')):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.FAILED
+    assert 'leap status' in collector.message
+
+
+def test_ChronyStatusCollector_synchronized():
+    tracking_output = (
+        "Reference ID    : CB00710F (foo.example.net)\n"
+        "Stratum         : 2\n"
+        "Leap status     : Normal\n"
+    )
+    collector = collectors.ChronyStatusCollector({}, {})
+    with patch('collectors.shutil.which', return_value='/usr/bin/chronyc'), \
+         patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=tracking_output)):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data['chrony_synchronized'] is True
+    assert collector._data['leap_status'] == 'Normal'
+
+
+def test_ChronyStatusCollector_not_synchronized():
+    tracking_output = "Leap status     : Not synchronised\n"
+    collector = collectors.ChronyStatusCollector({}, {})
+    with patch('collectors.shutil.which', return_value='/usr/bin/chronyc'), \
+         patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=tracking_output)):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data['chrony_synchronized'] is False
+    assert collector._data['leap_status'] == 'Not synchronised'
+
+
+@pytest.mark.parametrize('leap_status', ['Insert second', 'Delete second'])
+def test_ChronyStatusCollector_synchronized_leap_second(leap_status):
+    tracking_output = f"Leap status     : {leap_status}\n"
+    collector = collectors.ChronyStatusCollector({}, {})
+    with patch('collectors.shutil.which', return_value='/usr/bin/chronyc'), \
+         patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=tracking_output)):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data['chrony_synchronized'] is True
+    assert collector._data['leap_status'] == leap_status
+
+
+def test_ChronyStatusCollector_unknown_leap_status_treated_as_synchronized():
+    tracking_output = "Leap status     : Future status\n"
+    collector = collectors.ChronyStatusCollector({}, {})
+    with patch('collectors.shutil.which', return_value='/usr/bin/chronyc'), \
+         patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=tracking_output)):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data['chrony_synchronized'] is True
+
+
+def test_ChronyServicesCollector():
+    collector = collectors.ChronyServicesCollector({}, {})
+    with patch('collectors.ServiceManager') as mock_sm_class:
+        mock_sm = mock_sm_class.return_value
+        mock_sm.service_active.side_effect = lambda name: name == 'chronyd'
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data['services'] == {
+        'chronyd': {'active': True},
+        'chrony': {'active': False},
+    }
 
 
 def test_OSCollector(doctor_factory):
@@ -1154,8 +1330,170 @@ def test_RAIDSetupCollector(doctor_factory):
     doctor.run()
 
     result = doctor.vitals['RAIDSetupCollector']
-    assert result.status == CollectorStatus.PASSED
-    assert '/proc/mdstat' in result.data
+    # /proc/mdstat is only present when the md kernel module is available - absence is a valid SKIPPED outcome.
+    if os.path.isfile("/proc/mdstat"):
+        assert result.status == CollectorStatus.PASSED, result.message
+        assert '/proc/mdstat' in result.data
+    else:
+        assert result.status == CollectorStatus.SKIPPED, result.message
+        assert "not present" in result.message
+
+
+def test_RAIDSetupCollector_skips_when_mdstat_absent(doctor_factory):
+    """When /proc/mdstat is missing (md module not loaded) the collector must SKIP, not crash."""
+    doctor = doctor_factory(collectors=[collectors.RAIDSetupCollector])
+    collector = doctor.collectors['RAIDSetupCollector']
+
+    with patch.object(Executor, 'read_file_content', side_effect=FileNotFoundError("/proc/mdstat")):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.SKIPPED
+    assert "not present" in collector.result.message
+
+
+def test_RAIDSetupCollector_passes_when_mdstat_present(doctor_factory):
+    doctor = doctor_factory(collectors=[collectors.RAIDSetupCollector])
+    collector = doctor.collectors['RAIDSetupCollector']
+
+    mdstat_content = ["Personalities : [raid1]\n", "md0 : active raid1 sda1[0] sdb1[1]\n"]
+    with patch.object(Executor, 'read_file_content', return_value=mdstat_content):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED, collector.result.message
+    assert collector.result.data['/proc/mdstat'] == mdstat_content
+
+
+def test_NVMeDevicesCollector():
+    mdstat = ['Personalities : [raid0] ', 'md127 : active raid0 nvme0n1[0] nvme1n1[1]']
+    vitals = {
+        'RAIDSetupCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'/proc/mdstat': mdstat},
+            Output(),
+            '',
+        ),
+        'InfrastructureProviderCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'provider': None},
+            Output(),
+            '',
+        ),
+    }
+
+    def fake_listdir(path):
+        if path == '/sys/block':
+            return ['sda', 'nvme0n1', 'nvme1n1', 'nvme2n1', 'nvme0n1p1']
+        raise AssertionError(path)
+
+    def fake_isdir(path):
+        return path == '/sys/block'
+
+    def fake_run(command, shell=True, check=False):
+        mountpoints = {
+            'lsblk -rno MOUNTPOINT /dev/nvme0n1': '',
+            'lsblk -rno MOUNTPOINT /dev/nvme1n1': '',
+            'lsblk -rno MOUNTPOINT /dev/nvme2n1': '',
+        }
+        return Mock(returncode=0, stdout=mountpoints[command])
+
+    collector = collectors.NVMeDevicesCollector({}, {})
+    with patch('collectors.os.listdir', side_effect=fake_listdir), \
+         patch('collectors.os.path.isdir', side_effect=fake_isdir), \
+         patch.object(Executor, 'run_command', side_effect=fake_run):
+        collector._collect(vitals)
+
+    assert collector.status == CollectorStatus.PASSED, collector.message
+    assert collector._data['nvme_devices'] == ['nvme0n1', 'nvme1n1', 'nvme2n1']
+    assert collector._data['used_nvme_devices'] == ['nvme0n1', 'nvme1n1']
+    assert collector._data['unused_nvme_devices'] == ['nvme2n1']
+
+
+def test_NVMeDevicesCollector_mounted_partition():
+    mdstat = ['Personalities :']
+    vitals = {
+        'RAIDSetupCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'/proc/mdstat': mdstat},
+            Output(),
+            '',
+        ),
+        'InfrastructureProviderCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'provider': None},
+            Output(),
+            '',
+        ),
+    }
+
+    def fake_listdir(path):
+        if path == '/sys/block':
+            return ['nvme0n1', 'nvme1n1']
+        raise AssertionError(path)
+
+    def fake_isdir(path):
+        return path == '/sys/block'
+
+    def fake_run(command, shell=True, check=False):
+        mountpoints = {
+            'lsblk -rno MOUNTPOINT /dev/nvme0n1': '/var/lib/scylla\n',
+            'lsblk -rno MOUNTPOINT /dev/nvme1n1': '',
+        }
+        return Mock(returncode=0, stdout=mountpoints[command])
+
+    collector = collectors.NVMeDevicesCollector({}, {})
+    with patch('collectors.os.listdir', side_effect=fake_listdir), \
+         patch('collectors.os.path.isdir', side_effect=fake_isdir), \
+         patch.object(Executor, 'run_command', side_effect=fake_run):
+        collector._collect(vitals)
+
+    assert collector.status == CollectorStatus.PASSED, collector.message
+    assert collector._data['used_nvme_devices'] == ['nvme0n1']
+    assert collector._data['unused_nvme_devices'] == ['nvme1n1']
+
+
+@pytest.mark.parametrize('root_source', ['/dev/nvme0n1p1', '/dev/nvme0n1'])
+def test_NVMeDevicesCollector_aws_root_volume_excluded(root_source):
+    mdstat = ['Personalities :']
+    vitals = {
+        'RAIDSetupCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'/proc/mdstat': mdstat},
+            Output(),
+            '',
+        ),
+        'InfrastructureProviderCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'provider': 'AWS'},
+            Output(),
+            '',
+        ),
+    }
+
+    def fake_listdir(path):
+        if path == '/sys/block':
+            return ['nvme0n1', 'nvme1n1']
+        raise AssertionError(path)
+
+    def fake_isdir(path):
+        return path == '/sys/block'
+
+    def fake_run(command, shell=True, check=False):
+        if command == 'findmnt -n -o SOURCE /':
+            return Mock(returncode=0, stdout=f'{root_source}\n')
+        mountpoints = {
+            'lsblk -rno MOUNTPOINT /dev/nvme1n1': '',
+        }
+        return Mock(returncode=0, stdout=mountpoints[command])
+
+    collector = collectors.NVMeDevicesCollector({}, {})
+    with patch('collectors.os.listdir', side_effect=fake_listdir), \
+         patch('collectors.os.path.isdir', side_effect=fake_isdir), \
+         patch.object(Executor, 'run_command', side_effect=fake_run):
+        collector._collect(vitals)
+
+    assert collector.status == CollectorStatus.PASSED, collector.message
+    assert collector._data['nvme_devices'] == ['nvme1n1']
+    assert collector._data['unused_nvme_devices'] == ['nvme1n1']
 
 
 def test_CPUSetCollector(doctor_factory, monkeypatch):
@@ -1280,7 +1618,26 @@ def test_ScyllaClusterSchemaCollector(doctor_factory, await_scylla_start):
     assert len(result.data) > 0
 
 
-def test_ScyllaClusterTablesDescriptionCollector(doctor_factory, await_scylla_start):
+@pytest.fixture
+def setup_views_cdc_keyspace():
+    # Create a keyspace with a CDC-enabled table and a materialized view
+    Executor.paths = {'scylla_directory': '/opt/scylladb'}
+    temp_ks_existed = Executor.cqlsh("CREATE KEYSPACE test_views_keyspace WITH "
+                                     "replication = {'class': 'SimpleStrategy', 'replication_factor': '1'} ",
+                                     {'rpc_address': 'localhost'}) is None
+    try:
+        assert Executor.cqlsh("CREATE TABLE test_views_keyspace.base (pk int PRIMARY KEY, v text) "
+                              "WITH cdc = {'enabled': true}", {'rpc_address': 'localhost'}) is not None
+        assert Executor.cqlsh(
+            "CREATE MATERIALIZED VIEW test_views_keyspace.mv AS SELECT * FROM test_views_keyspace.base "
+            "WHERE pk IS NOT NULL AND v IS NOT NULL PRIMARY KEY (v, pk)", {'rpc_address': 'localhost'}) is not None
+        yield
+    finally:
+        if not temp_ks_existed:
+            Executor.cqlsh("DROP KEYSPACE test_views_keyspace", {'rpc_address': 'localhost'})
+
+
+def test_ScyllaClusterTablesDescriptionCollector(doctor_factory, await_scylla_start, setup_views_cdc_keyspace):
     doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
                                         collectors.CqlshCollector,
                                         collectors.ScyllaClusterTablesDescriptionCollector])
@@ -1291,8 +1648,52 @@ def test_ScyllaClusterTablesDescriptionCollector(doctor_factory, await_scylla_st
     assert result.status == CollectorStatus.PASSED, result.message
     system_schema_tables_query = Executor.read_cql_table_command("system_schema.tables")
     assert_output_gathered(result, OutputEntryType.CQL, system_schema_tables_query)
+    system_schema_views_query = Executor.read_cql_table_command("system_schema.views")
+    assert_output_gathered(result, OutputEntryType.CQL, system_schema_views_query)
     assert len(result.data) > 1
     assert "system" in result.data
+
+    ks_data = result.data['test_views_keyspace']
+    assert ks_data['base']['table_kind'] == 'table'
+    assert ks_data['base_scylla_cdc_log']['table_kind'] == 'table'
+    assert ks_data['mv']['table_kind'] == 'view'
+
+
+def test_ScyllaClusterTablesDescriptionCollector_merges_tables_and_views(doctor_factory):
+    doctor = doctor_factory(collectors=[collectors.ScyllaClusterTablesDescriptionCollector], analyzers=())
+    collector = doctor.collectors['ScyllaClusterTablesDescriptionCollector']
+    vitals = {'ScyllaConfigurationFileCollector': CollectorResult(CollectorStatus.PASSED, {}, Output(), '')}
+
+    schema_rows = {
+        'system_schema.tables': [{'keyspace_name': 'ks', 'table_name': 'base'},
+                                 {'keyspace_name': 'ks', 'table_name': 'base_scylla_cdc_log'}],
+        'system_schema.views':  [{'keyspace_name': 'ks', 'view_name': 'mv'}],
+    }
+
+    def fake_read_cql_table(scylla_config, table_name, max_rows=-1):
+        return f'SELECT * FROM {table_name}', schema_rows[table_name]
+
+    with patch.object(Executor, 'read_cql_table', side_effect=fake_read_cql_table):
+        collector._collect(vitals)
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data['ks']['base']['table_kind'] == 'table'
+    assert collector._data['ks']['base_scylla_cdc_log']['table_kind'] == 'table'
+    assert collector._data['ks']['mv']['table_kind'] == 'view'
+
+
+def test_ScyllaClusterTablesDescriptionCollector_cql_failure(doctor_factory):
+    from utils import CqlFailedException
+
+    doctor = doctor_factory(collectors=[collectors.ScyllaClusterTablesDescriptionCollector], analyzers=())
+    collector = doctor.collectors['ScyllaClusterTablesDescriptionCollector']
+    vitals = {'ScyllaConfigurationFileCollector': CollectorResult(CollectorStatus.PASSED, {}, Output(), '')}
+
+    with patch.object(Executor, 'read_cql_table', side_effect=CqlFailedException("boom")):
+        collector._collect(vitals)
+
+    assert collector.status == CollectorStatus.FAILED
+    assert "boom" in collector._message
 
 
 def test_ScyllaVersionCollector(doctor_factory, monkeypatch):
@@ -1382,6 +1783,83 @@ def test_ScyllaLogsCollector(doctor_factory, provider_identify_shorten_timeout_o
     else:
         assert result.status == CollectorStatus.SKIPPED, result.message
         assert "Not available" in result.message
+
+
+def _make_manager_agent_logs_collector(doctor_factory) -> collectors.ScyllaManagerAgentLogsCollector:
+    """Instantiate a ScyllaManagerAgentLogsCollector without running it (no Scylla required)."""
+    doctor = doctor_factory(collectors=[collectors.ScyllaManagerAgentLogsCollector], analyzers={})
+    return doctor.collectors['ScyllaManagerAgentLogsCollector']
+
+
+def _make_node_platform_vitals(platform) -> dict:
+    return {
+        'NodePlatformCollector': CollectorResult(CollectorStatus.PASSED, {'platform': platform}, Output(), ''),
+    }
+
+
+def test_ScyllaManagerAgentLogsCollector_skips_on_container(doctor_factory):
+    collector = _make_manager_agent_logs_collector(doctor_factory)
+
+    collector._collect(_make_node_platform_vitals(collectors.NodePlatform.CONTAINER))
+
+    assert collector.status == CollectorStatus.SKIPPED
+    assert "Not available" in collector.result.message
+
+
+def test_ScyllaManagerAgentLogsCollector_skips_when_service_missing(doctor_factory):
+    collector = _make_manager_agent_logs_collector(doctor_factory)
+
+    with patch.object(collectors.ServiceManager, 'service_exists', return_value=False):
+        collector._collect(_make_node_platform_vitals(collectors.NodePlatform.VM))
+
+    assert collector.status == CollectorStatus.SKIPPED
+    assert "not installed" in collector.result.message
+
+
+def test_ScyllaManagerAgentLogsCollector_passes(doctor_factory):
+    collector = _make_manager_agent_logs_collector(doctor_factory)
+
+    with patch.object(collectors.ServiceManager, 'service_exists', return_value=True), \
+            patch.object(Executor, 'generate_output_filename', return_value="scylla_manager_agent_logs_test.txt"), \
+            patch.object(Executor, 'run_command', return_value=Mock()) as mock_run:
+        collector._collect(_make_node_platform_vitals(collectors.NodePlatform.BAREMETAL))
+
+    assert collector.status == CollectorStatus.PASSED
+    result = collector.result
+    assert result.message == "Scylla Manager Agent logs gathered successfully"
+    assert "scylla_manager_agent_logs_test.txt" not in result.message
+    assert "scylla_manager_agent_logs_test.txt" in result.output.output[0].value
+    result.strip()
+    assert result.output.output == []
+    command = mock_run.call_args.args[0]
+    assert "--unit=scylla-manager-agent" in command
+
+
+def test_ScyllaManagerAgentLogsCollector_passes_with_since_date(doctor_factory):
+    doctor = doctor_factory(collectors=[collectors.ScyllaManagerAgentLogsCollector], analyzers={},
+                            config_options=[('ScyllaManagerAgentLogsCollector', 'since_date', '2024-01-01')])
+    collector = doctor.collectors['ScyllaManagerAgentLogsCollector']
+
+    with patch.object(collectors.ServiceManager, 'service_exists', return_value=True), \
+            patch.object(Executor, 'generate_output_filename', return_value="scylla_manager_agent_logs_test.txt"), \
+            patch.object(Executor, 'run_command', return_value=Mock()) as mock_run:
+        collector._collect(_make_node_platform_vitals(collectors.NodePlatform.VM))
+
+    assert collector.status == CollectorStatus.PASSED
+    command = mock_run.call_args.args[0]
+    assert "--since=2024-01-01" in command
+
+
+def test_ScyllaManagerAgentLogsCollector_fails_when_no_output(doctor_factory):
+    collector = _make_manager_agent_logs_collector(doctor_factory)
+
+    with patch.object(collectors.ServiceManager, 'service_exists', return_value=True), \
+            patch.object(Executor, 'generate_output_filename', return_value="scylla_manager_agent_logs_test.txt"), \
+            patch.object(Executor, 'run_command', return_value=None):
+        collector._collect(_make_node_platform_vitals(collectors.NodePlatform.VM))
+
+    assert collector.status == CollectorStatus.FAILED
+    assert "Cannot gather Scylla Manager Agent logs" in collector.result.message
 
 
 def test_ScyllaServicesCollector(doctor_factory):
@@ -1493,7 +1971,7 @@ def test_RaftTopologyRPCStatusCollector(doctor_factory, await_scylla_start):
     assert result.data == "none"
 
 
-def test_ScyllaTablesCompressionInfoCollector(doctor_factory, await_scylla_start):
+def test_ScyllaTablesCompressionInfoCollector(doctor_factory, await_scylla_start, setup_views_cdc_keyspace):
     doctor = doctor_factory(collectors=[collectors.SystemConfigCollector,
                                         collectors.SystemPeersLocalCollector,
                                         collectors.ScyllaConfigurationFileCollector,
@@ -1508,9 +1986,11 @@ def test_ScyllaTablesCompressionInfoCollector(doctor_factory, await_scylla_start
     assert len(result.data) > 0
     assert 'system_traces' in result.data and 'sessions' in result.data['system_traces'] and \
            result.data['system_traces']['sessions'] >= 0.0
+    assert result.data['test_views_keyspace']['mv'] >= 0.0
+    assert result.data['test_views_keyspace']['base_scylla_cdc_log'] >= 0.0
 
 
-def test_ScyllaTablesUsedDiskCollector(doctor_factory, await_scylla_start):
+def test_ScyllaTablesUsedDiskCollector(doctor_factory, await_scylla_start, setup_views_cdc_keyspace):
     doctor = doctor_factory(collectors=[collectors.SystemConfigCollector,
                                         collectors.SystemPeersLocalCollector,
                                         collectors.ScyllaConfigurationFileCollector,
@@ -1525,6 +2005,8 @@ def test_ScyllaTablesUsedDiskCollector(doctor_factory, await_scylla_start):
     assert len(result.data) > 0
     assert 'system_traces' in result.data and 'sessions' in result.data['system_traces'] and \
            result.data['system_traces']['sessions'] >= 0
+    assert result.data['test_views_keyspace']['mv'] >= 0
+    assert result.data['test_views_keyspace']['base_scylla_cdc_log'] >= 0
 
 
 ###############################################################################
@@ -1797,6 +2279,174 @@ def test_SDVersionCollector_version_file_missing(doctor_factory, tmp_path, monke
 
 
 ###############################################################################
+# SystemTabletsCollector unit tests ###########################################
+###############################################################################
+
+def _make_system_tablets_collector(doctor_factory, config_options=()):
+    doctor = doctor_factory(collectors=[collectors.SystemTabletsCollector], analyzers=(),
+                            config_options=config_options)
+    return doctor.collectors['SystemTabletsCollector']
+
+
+def _make_system_tablets_vitals():
+    config_data = {'host': 'localhost', 'port': 9042, 'username': None, 'password': None}
+    return {
+        'ScyllaConfigurationFileCollector': CollectorResult(
+            CollectorStatus.PASSED, config_data, Output(), '',
+        ),
+        'CqlshCollector': CollectorResult(
+            CollectorStatus.PASSED, {}, Output(), '',
+        ),
+    }
+
+
+_SYSTEM_TABLETS_COLUMNS = ['table_id', 'last_token', 'keyspace_name', 'table_name', 'replicas', 'base_table']
+
+
+def test_SystemTabletsCollector_stores_nested_tables(doctor_factory):
+    """
+    Groups flat CQL rows under data.tables; shared table characteristics once;
+    tablets sorted by last_token within each table.
+    """
+    rows = [
+        {'table_id': 'bbbb', 'keyspace_name': 'ks_b', 'table_name': 't1', 'last_token': '200',
+         'replicas': '[(bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb, 1)]', 'base_table': ''},
+        {'table_id': 'aaaa', 'keyspace_name': 'ks_a', 'table_name': 't1', 'last_token': '100',
+         'replicas': '[(aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, 0)]', 'base_table': ''},
+        {'table_id': 'aaaa', 'keyspace_name': 'ks_a', 'table_name': 't1', 'last_token': '50',
+         'replicas': '[(aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, 0)]', 'base_table': ''},
+    ]
+    # last_token sort is lexicographic (CQL COPY returns strings): '100' < '50'
+    expected = {
+        'tables': [
+            {
+                'keyspace_name': 'ks_a',
+                'table_name': 't1',
+                'table_id': 'aaaa',
+                'base_table': '',
+                'tablets': [
+                    {'last_token': '100',
+                     'replicas': '[(aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, 0)]'},
+                    {'last_token': '50',
+                     'replicas': '[(aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, 0)]'},
+                ],
+            },
+            {
+                'keyspace_name': 'ks_b',
+                'table_name': 't1',
+                'table_id': 'bbbb',
+                'base_table': '',
+                'tablets': [
+                    {'last_token': '200',
+                     'replicas': '[(bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb, 1)]'},
+                ],
+            },
+        ]
+    }
+
+    seen = {}
+
+    def fake_read_cql_table(scylla_config, table_name, columns=None, max_rows=-1):
+        seen['table_name'] = table_name
+        seen['columns'] = columns
+        return ('COPY system.tablets ...', rows)
+
+    collector = _make_system_tablets_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table', side_effect=fake_read_cql_table):
+        collector._collect(_make_system_tablets_vitals())
+
+    assert seen['table_name'] == 'system.tablets'
+    assert seen['columns'] == _SYSTEM_TABLETS_COLUMNS
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data == expected
+
+
+def test_SystemTabletsCollector_empty_tablets(doctor_factory):
+    """
+    Empty system.tablets (no tablet-replicated tables) is a valid PASSED result.
+    """
+    collector = _make_system_tablets_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table', return_value=('COPY system.tablets ...', [])):
+        collector._collect(_make_system_tablets_vitals())
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data == {'tables': []}
+
+
+def test_SystemTabletsCollector_max_rows_forwarded(doctor_factory):
+    """
+    Positive max_rows config value is forwarded to read_cql_table.
+    """
+    collector = _make_system_tablets_collector(
+        doctor_factory,
+        config_options=[('SystemTabletsCollector', 'max_rows', '10')],
+    )
+    seen = {}
+
+    def fake_read_cql_table(scylla_config, table_name, columns=None, max_rows=-1):
+        seen['columns'] = columns
+        seen['max_rows'] = max_rows
+        return ('COPY system.tablets ...', [])
+
+    with patch.object(Executor, 'read_cql_table', side_effect=fake_read_cql_table):
+        collector._collect(_make_system_tablets_vitals())
+
+    assert seen['max_rows'] == 10
+    assert seen['columns'] == _SYSTEM_TABLETS_COLUMNS
+    assert collector.status == CollectorStatus.PASSED
+    assert "Collected 0 rows" in collector._message
+
+
+def test_SystemTabletsCollector_cql_failure_sets_failed_status(doctor_factory):
+    """
+    CqlFailedException sets FAILED status with the error message.
+    """
+    from utils import CqlFailedException
+
+    collector = _make_system_tablets_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table', side_effect=CqlFailedException("no tablets table")):
+        collector._collect(_make_system_tablets_vitals())
+
+    assert collector.status == CollectorStatus.FAILED
+    assert "no tablets table" in collector.result.message
+
+
+def test_SystemTabletsCollector_missing_table_sets_skipped_status(doctor_factory):
+    """
+    system.tablets not existing (pre-tablets Scylla) is SKIPPED, not FAILED.
+    """
+    from utils import CqlFailedException
+
+    collector = _make_system_tablets_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table',
+                      side_effect=CqlFailedException("unconfigured table tablets")):
+        collector._collect(_make_system_tablets_vitals())
+
+    assert collector.status == CollectorStatus.SKIPPED
+
+
+def test_SystemTabletsCollector_masks_all_data_from_drift(doctor_factory):
+    """
+    Masks all data so tablet maps are excluded from cluster drift comparison.
+    """
+    rows = [
+        {'table_id': 'aaaa', 'keyspace_name': 'ks_a', 'table_name': 't1', 'last_token': '100',
+         'replicas': '[(aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, 0)]', 'base_table': ''},
+    ]
+
+    collector = _make_system_tablets_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table', return_value=('COPY system.tablets ...', rows)):
+        collector._collect(_make_system_tablets_vitals())
+
+    assert collector.mask == ['*']
+
+    result = collector.result
+    assert result.data
+    result.strip()
+    assert result.data == {}
+
+
+###############################################################################
 # LargePartitionsCellsRowsCollector unit tests ################################
 ###############################################################################
 
@@ -1901,6 +2551,26 @@ def test_LargePartitionsCellsRowsCollector_cql_failure_raises(doctor_factory):
     with patch.object(Executor, 'read_cql_table', side_effect=CqlFailedException("boom")):
         with pytest.raises(CqlFailedException, match="boom"):
             collector._collect(_make_large_partitions_vitals())
+
+
+def test_LargePartitionsCellsRowsCollector_masks_all_data_from_drift(doctor_factory):
+    """
+    The collector masks all its data so it is excluded from cluster drift comparison.
+    """
+    collector = _make_large_partitions_collector(doctor_factory)
+
+    def fake_read_cql_table(scylla_config, table_name, max_rows=-1):
+        return (f'SELECT * FROM {table_name}', _make_large_table_rows(2, table_name))
+
+    with patch.object(Executor, 'read_cql_table', side_effect=fake_read_cql_table):
+        collector._collect(_make_large_partitions_vitals())
+
+    assert collector.mask == ['*']
+
+    result = collector.result
+    assert result.data  # data was collected
+    result.strip()
+    assert result.data == {}  # all data stripped for comparison
 
 
 ###############################################################################
