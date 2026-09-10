@@ -27,16 +27,26 @@ import socket
 import ssl
 import urllib
 
-from typing import Any, Dict, List, Set, Tuple, Optional, Iterable
+from typing import Any, Dict, List, Mapping, Set, Tuple, Optional, Iterable
 
 from analyzers_base import Analyzer, AnalyzerStatus
 from common import GossipInfoInvariantValues, HumanBytesUnitFormat, ConfigParameter
-from common import DictView, NodePlatform, AbortedException
+from common import DictView, NodePlatform, AbortedException, Authenticator, SYSTEMD_INFINITY
+from models.os_support import OSSupportMatrix, OSSupportMatrixError
 
 
 ###############################################################################
 # Utils
 ###############################################################################
+class DriverVersionNotIndexed(Exception):
+    """
+    Raised when the driver version API responded successfully but returned no versions for the requested driver,
+    i.e. a driver name Scylla Doctor recognizes that the API backend does not index (yet).
+
+    Distinct from a failed API call: a recognized-but-unindexed driver is reported as a warning, not an error.
+    """
+
+
 class InvalidVersionFormat(Exception):
     def __init__(self, raw_version: str):
         super().__init__(f"Unexpected version format: \"{raw_version}\"")
@@ -103,6 +113,25 @@ def compare_versions(raw_version_a: str, raw_version_b: str, comparison_operator
     return False
 
 
+def system_auth_managed_by_raft(keyspaces: Mapping, topology_data: Mapping) -> bool:
+    """
+    System-auth-2 stores auth in Raft. Pre-GA used a system_auth_v2 keyspace; GA OSS 6.0 /
+    Enterprise 2024.2 folded those tables into system (scylladb/scylladb#18769). Leftover
+    system_auth is created as SimpleStrategy RF=1 for cqlsh and must not be NTS/RF-checked.
+
+    Completed Consistent Topology (system.topology upgrade_state == 'done' on every host) is the
+    only signal used: auth-v2/Raft is guaranteed only once that upgrade procedure has finished, so
+    a cluster on a GA version that skipped it still uses legacy system_auth and still needs the
+    NTS/RF checks (scylladb/scylladb#17951). Version is deliberately not used as a fallback.
+    """
+    if "system_auth_v2" in keyspaces:
+        return True
+    if not topology_data.get("consistent_topology_supported"):
+        return False
+    rows = topology_data.get("system_topology_rows") or []
+    return bool(rows) and all(row['upgrade_state'] == 'done' for row in rows)
+
+
 def get_url_content(url: str, headers=None,  data=None, timeout: int = 3) -> Optional[str]:
     """
     :param url: URL endpoint to make a post call to.
@@ -158,6 +187,23 @@ def has_ipaddr_any(ip_addr_list: List[str]) -> bool:
             return True
 
     return False
+
+
+def effective_limitnofile(limitnofile_data: Mapping, sysctl_data: Mapping) -> int:
+    """
+    Returns the number of file descriptors 'scylla-server.service' effectively gets.
+
+    'scylla-server.service' ships 'LimitNOFILE=infinity' since scylladb/scylladb@78c8598, which does not grant
+    an unlimited number of descriptors: the kernel refuses a NOFILE hard limit above 'fs.nr_open', so systemd
+    clamps it there and that is the ceiling the service actually runs with.
+    :param limitnofile_data: 'ScyllaLimitNOFILECollector' vitals data
+    :param sysctl_data: 'SysctlCollector' vitals data
+    :return: The effective LimitNOFILE value
+    """
+    if limitnofile_data['limitnofile'] == SYSTEMD_INFINITY:
+        return sysctl_data['fs.nr_open']
+
+    return int(limitnofile_data['limitnofile'])
 
 
 ###############################################################################
@@ -261,7 +307,7 @@ class CPUScalingAnalyzer(Analyzer):
         """
         scaling_governor = vitals[self.__collector].data['scaling_governor']
         if not scaling_governor:
-            self.status = AnalyzerStatus.FAILED
+            self.status = AnalyzerStatus.SKIPPED
             self.message = "CPU does not support scaling"
         else:
             active_services = [service for service in vitals[self.__collector].data['services']
@@ -791,8 +837,15 @@ class DriverVersionAnalyzer(Analyzer):
             'ScyllaDB Python Driver': 'Python',
             'github.com/scylladb/gocql': 'Go',
             'github.com/gocql/gocql': 'Go',
+            # scylla-rust-driver renamed to ScyllaDB Rust Driver in 0.14.0
             'scylla-rust-driver': 'Rust',
+            'ScyllaDB Rust Driver': 'Rust',
             'Scylla Shard-Aware C/C++ Driver': 'CPP',
+            # cpp-rs-driver STARTUP DRIVER_NAME: "ScyllaDB Cpp-Rust Driver" until the
+            # cpp-rust-driver rename, then "ScyllaDB CPP RS Driver". Version line is 0.x/1.x,
+            # not legacy cpp-driver 2.x — keep a separate config key from CPP.
+            'ScyllaDB Cpp-Rust Driver': 'CppRust',
+            'ScyllaDB CPP RS Driver': 'CppRust',
             # DataStax Python Driver: It has been >5 years since the Scylla driver used that name (Jun 2020)
             # DataStax Java Driver for Apache Cassandra: This name was never used by Scylla drivers.
         }
@@ -828,7 +881,9 @@ class DriverVersionAnalyzer(Analyzer):
         :param client_driver_name: The client driver name (e.g. Scylla Python Driver)
         :param scylla_version: The scylla version (e.g. 2024.1)
         :return: The minimum driver version for the provided scylla_version and driver_name,
-                 or None in case a driver version could not be fetched.
+                 or None in case the driver version API call failed.
+        :raise DriverVersionNotIndexed: if the driver version API responded successfully but returned no versions
+                                        for the requested driver name.
         """
         return self._get_required_driver_version(self.__key_minimum_version, self.__config_minimum_version,
                                                  client_driver_name, scylla_version)
@@ -837,7 +892,9 @@ class DriverVersionAnalyzer(Analyzer):
         """
         :param client_driver_name: The client driver name (e.g. Scylla Python Driver)
         :return: The latest driver version for the provided driver_name,
-                 or None in case a driver version could not be fetched.
+                 or None in case the driver version API call failed.
+        :raise DriverVersionNotIndexed: if the driver version API responded successfully but returned no versions
+                                        for the requested driver name.
         """
         return self._get_required_driver_version(self.__key_latest_version, self.__config_latest_version,
                                                  client_driver_name)
@@ -850,7 +907,9 @@ class DriverVersionAnalyzer(Analyzer):
         :param client_driver_name: The client driver name (e.g. Scylla Python Driver)
         :param scylla_version: The scylla version (e.g. 2022.1.14 or 2024.1.4-0.20240428.67dd10537f78)
         :return: The minimum driver version for the provided scylla_version, or the latest driver version,
-                 or None in case a driver version could not be fetched.
+                 or None in case the driver version API call failed.
+        :raise DriverVersionNotIndexed: if the driver version API responded successfully but returned no versions
+                                        for the requested driver name.
         """
         # If a user did not provide any required driver versions, we fetch it via an API call.
         config_driver_name = self.__driver_names_to_config_mapping[client_driver_name]
@@ -860,10 +919,14 @@ class DriverVersionAnalyzer(Analyzer):
             data = {'driverName': client_driver_name, 'scyllaVersion': scylla_version}
             response = get_url_content(self.__api_endpoint, headers, data)
 
-            if response is None or len(json.loads(response)) == 0:
+            if response is None:
                 return None
-            else:
-                required_driver_response = json.loads(response)
+
+            required_driver_response = json.loads(response)
+            if len(required_driver_response) == 0:
+                # The API is reachable but has no version data for this driver name
+                # (e.g. a supported driver name the backend hasn't indexed yet).
+                raise DriverVersionNotIndexed(client_driver_name)
 
             # Select the oldest returned driver version in case of minimum, otherwise the newest.
             required_driver = required_driver_response[-1 if version_type == self.__key_minimum_version else 0]
@@ -927,16 +990,21 @@ class DriverVersionAnalyzer(Analyzer):
                 warning_messages.append(f"Unknown driver name: {client_driver_name}")
                 continue
 
-            for client_driver_version in client_driver_versions[client_driver_name]:
+            try:
                 minimum_driver_version = self._get_minimum_driver_version(client_driver_name, scylla_version)
                 recommended_driver_version = self._get_latest_driver_version(client_driver_name)
+            except DriverVersionNotIndexed:
+                # Warning (iv): The driver name is recognized, but the version API has no data for it yet.
+                warning_messages.append(f"No version data available for driver: {client_driver_name}")
+                continue
 
-                if minimum_driver_version is None or recommended_driver_version is None:
-                    self.status = AnalyzerStatus.FAILED
-                    self.message = (f"API call error occurred to retrieve the minimum or latest driver version for "
-                                    f"'{client_driver_name}'")
-                    return
+            if minimum_driver_version is None or recommended_driver_version is None:
+                self.status = AnalyzerStatus.FAILED
+                self.message = (f"API call error occurred to retrieve the minimum or latest driver "
+                                f"version for '{client_driver_name}'")
+                return
 
+            for client_driver_version in client_driver_versions[client_driver_name]:
                 try:
                     # Error (i): The used driver name is proper and the version is below the minimum version.
                     if compare_versions(client_driver_version, minimum_driver_version, "<"):
@@ -1272,6 +1340,14 @@ class NodeInstanceTypeAnalyzer(Analyzer):
                 "z3-highmem-44-standardlssd",
                 "z3-highmem-88-standardlssd",
                 "z3-highmem-176-standardlssd"
+            ],
+            "OCI": [
+                "VM.DenseIO.E4.Flex",
+                "VM.DenseIO.E5.Flex",
+                "VM.DenseIO.E6.Ax.Flex",
+                "BM.DenseIO.E4.128",
+                "BM.DenseIO.E5.128",
+                "BM.DenseIO.E6.Ax.192",
             ]
         }
 
@@ -1452,72 +1528,78 @@ class OSSupportAnalyzer(Analyzer):
         return "Operating system"
 
     @property
-    def __collector(self) -> str:
+    def __os_collector(self) -> str:
         return "OSCollector"
 
     @property
-    def depends_on(self) -> Set[str]:
-        return {self.__collector}
+    def __scylla_version_collector(self) -> str:
+        return "ScyllaVersionCollector"
 
     @property
-    def __supported_distros(self) -> Dict[str, Any]:
+    def depends_on(self) -> Set[str]:
+        return {self.__os_collector, self.__scylla_version_collector}
+
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
         return {
-            'ubuntu': {
-                'versions': ["24.04", "22.04", "20.04", "18.04", "16.04"],
-            },
-            'debian': {
-                'versions': ["12", "11", "10", "9"],
-            },
-            'centos': {
-                'versions': ["10", "9", "8", "7"],
-                'minimum_version': "7.2"
-            },
-            'rhel': {
-                'versions': ["10", "9", "8"],
-            },
-            'rocky': {
-                'versions': ["10", "9", "8"],
-            },
-            'amzn': {
-                'versions': ["2023"]
-            }
+            'os_support_url': ConfigParameter(
+                default='https://docs.scylladb.com/stable/_static/data/os-support.json',
+                description='URL of the ScyllaDB OS support matrix JSON.',
+            ),
         }
 
     def _analyze(self, vitals: DictView) -> None:
         """
-        Check that OS is officially supported.
-        """
-        distro = vitals[self.__collector].data['name']
-        version = vitals[self.__collector].data['version']
-        full_version_minor = vitals[self.__collector].data['version_minor']
-        split_version_minor = full_version_minor.split()
-        if len(split_version_minor) > 0:
-            version_minor = split_version_minor[0]
-        else:
-            version_minor = ""
+        Check that OS is officially supported for the running ScyllaDB version.
 
-        if not (distro in self.__supported_distros and
-                (version_minor in self.__supported_distros[distro]['versions'] or
-                 version in self.__supported_distros[distro]['versions'])):
+        The matrix is fetched from `os_support_url` at runtime. Outcomes: matrix
+        retrieval fails -> SKIPPED; the fetched matrix is malformed -> FAILED; the
+        running ScyllaDB version has no entry in the matrix -> SKIPPED; the host OS
+        is not listed -> FAILED; listed with a '*' suffix -> WARNING; otherwise PASSED.
+        """
+        current_version = vitals[self.__scylla_version_collector].data['version']
+
+        url = self._get_config_value('os_support_url')
+        payload = get_url_content(url)
+        if payload is None:
+            self.status = AnalyzerStatus.SKIPPED
+            self.message = (f"Cannot retrieve OS support matrix from {url}; "
+                            "the check is skipped on hosts without network egress")
+            return
+        try:
+            matrix = OSSupportMatrix.from_json(payload, url)
+        except OSSupportMatrixError as e:
             self.status = AnalyzerStatus.FAILED
-            self.message = f"'{distro} {version_minor}'" \
-                           " is not officially supported"
+            self.message = str(e)
             return
 
-        if self.__supported_distros[distro].get('minimum_version'):
-            minimum_version = self.__supported_distros[distro]['minimum_version']
-            try:
-                if not compare_versions(version_minor, minimum_version, ">="):
-                    self.status = AnalyzerStatus.FAILED
-                    self.message = f"{distro} {version} is officially supported starting from version {minimum_version}"
-                    return
-            except InvalidVersionFormat as e:
-                self.status = AnalyzerStatus.FAILED
-                self.message = f"Failed to analyze a OS version: {e}"
-                return
+        entry = matrix.find_version_entry(current_version)
+        if entry is None:
+            self.status = AnalyzerStatus.SKIPPED
+            self.message = f"No OS support matrix entry for Scylla version {current_version}"
+            return
+
+        distro = vitals[self.__os_collector].data['name']
+        version = vitals[self.__os_collector].data['version']
+        full_version_minor = vitals[self.__os_collector].data['version_minor']
+        split_version_minor = full_version_minor.split()
+        version_minor = split_version_minor[0] if split_version_minor else ""
+        matrix_label = entry.version
+        restricted = entry.match_os(distro, version, version_minor)
+
+        os_label = f"'{distro} {full_version_minor}'"
+        if restricted is None:
+            self.status = AnalyzerStatus.FAILED
+            self.message = f"{os_label} is not officially supported for {matrix_label}"
+            return
+
+        if restricted:
+            self.status = AnalyzerStatus.WARNING
+            self.message = f"{os_label} is supported for {matrix_label} with restrictions"
+            return
 
         self.status = AnalyzerStatus.PASSED
-        self.message = f"'{distro} {full_version_minor}' is officially supported"
+        self.message = f"{os_label} is officially supported for {matrix_label}"
 
 
 class PerftuneAnalyzer(Analyzer):
@@ -1775,11 +1857,26 @@ class RAIDSetupAnalyzer(Analyzer):
     def depends_on(self) -> Set[str]:
         return {self.__collector_raid, self.__collector_storage}
 
+    @staticmethod
+    def _block_device_basename(name: str) -> str:
+        nvme = re.match(r'^(nvme\d+n\d+)(?:p\d+)?$', name)
+        if nvme:
+            return nvme.group(1)
+        return re.sub(r'\d+$', '', name)
+
+    @classmethod
+    def _device_matches_member(cls, device: str, member: str) -> bool:
+        # Exact match, or whole-disk ↔ its partition (sda↔sda1, nvme0n1↔nvme0n1p1).
+        # Sibling partitions (sda1↔sda12) must not match.
+        if device == member:
+            return True
+        return cls._block_device_basename(member) == device or cls._block_device_basename(device) == member
+
     def _analyze(self, vitals: DictView) -> None:
         """
         Check that if any data-related directory is mounted on an SW RAID assembly it is of a RAID0 kind.
         """
-        mdstat_content = vitals[self.__collector_raid].data['/proc/mdstat']
+        arrays = vitals[self.__collector_raid].data['arrays']
 
         messages = []
         for dir, dir_stats in vitals[self.__collector_storage].data.items():
@@ -1791,16 +1888,18 @@ class RAIDSetupAnalyzer(Analyzer):
                 raid_mode = None
 
                 for device in devices:
-                    output = [line for line in mdstat_content if device in line]
+                    matches = [(name, info) for name, info in arrays.items()
+                               if any(self._device_matches_member(device, m) for m in info.get('members', []))]
 
-                    if output:
-                        if len(output) > 1:
+                    if matches:
+                        if len(matches) > 1:
                             self.status = AnalyzerStatus.WARNING
                             self.message = f"Funny RAID configuration detected for {dir}"
                             return
                         else:
-                            raid_device = output[0].split(" : ")[0]
-                            raid_mode = output[0].split(" : ")[1].split()[1].upper()
+                            raid_device, info = matches[0]
+                            level = info.get('level')
+                            raid_mode = level.upper() if level else None
 
                 if raid_mode not in [None, "RAID0"]:
                     self.status = AnalyzerStatus.WARNING
@@ -1849,6 +1948,53 @@ class UnusedNVMeDevicesAnalyzer(Analyzer):
 
         self.status = AnalyzerStatus.PASSED
         self.message = f"All {len(nvme_devices)} NVMe device(s) are in use"
+
+
+class DiskPerformanceExceededAnalyzer(Analyzer):
+    @property
+    def name(self) -> str:
+        return "Disk performance limits exceeded"
+
+    @property
+    def __collector(self) -> str:
+        return "DiskPerformanceExceededCollector"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__collector}
+
+    @classmethod
+    def config_parameters_definitions(cls) -> Dict[str, ConfigParameter]:
+        return {
+            'threshold': ConfigParameter(
+                default='0',
+                param_type=int,
+                unit='microseconds',
+                description='Accumulated time the IO demand may exceed a disk or an instance performance limit '
+                            'before a warning is issued.',
+            ),
+        }
+
+    def _analyze(self, vitals: DictView) -> None:
+        """
+        Check that the IO demand has not exceeded the disk or the instance performance limits.
+        """
+        threshold = self._get_config_value('threshold')
+        devices = vitals[self.__collector].data['devices']
+
+        exceeded = [f"{device}: {counter}={value} microseconds"
+                    for device, stats in sorted(devices.items())
+                    for counter, value in sorted(stats.items()) if value > threshold]
+
+        if exceeded:
+            self.status = AnalyzerStatus.WARNING
+            self.message = (f"IO demand has exceeded the performance limits since the instance has started: "
+                            f"{', '.join(exceeded)}. Check the Scylla IO scheduler configuration "
+                            f"(io_properties.yaml) and the disk provisioning.")
+            return
+
+        self.status = AnalyzerStatus.PASSED
+        self.message = f"No performance limits were exceeded on {len(devices)} NVMe device(s)"
 
 
 class RAMAnalyzer(Analyzer):
@@ -2196,8 +2342,12 @@ class ScyllaClusterSystemKeyspacesReplicationAnalyzer(Analyzer):
         return "ScyllaClusterStatusCollector"
 
     @property
+    def __collector_topology(self) -> str:
+        return "SystemTopologyCollector"
+
+    @property
     def depends_on(self) -> Set[str]:
-        return {self.__collector_keyspaces, self.__collector_nodes}
+        return {self.__collector_keyspaces, self.__collector_nodes, self.__collector_topology}
 
     @property
     def __keyspaces(self) -> Dict[str, Dict]:
@@ -2223,11 +2373,17 @@ class ScyllaClusterSystemKeyspacesReplicationAnalyzer(Analyzer):
 
     def _analyze(self, vitals: DictView) -> None:
         """
-        Check that system keyspaces use NetworkTopologyStrategy and have sufficient replication factor
+        Check that system keyspaces use NetworkTopologyStrategy and have sufficient replication factor.
+        system_auth is skipped for System-auth-2 (Consistent Topology done, or system_auth_v2 present).
         """
         node_count = len(vitals[self.__collector_nodes].data['up']) + len(vitals[self.__collector_nodes].data['down'])
         errors = []
-        for keyspace, settings in self.__keyspaces.items():
+        keyspaces = dict(self.__keyspaces)
+        if system_auth_managed_by_raft(vitals[self.__collector_keyspaces].data,
+                                       vitals[self.__collector_topology].data):
+            keyspaces.pop("system_auth", None)
+
+        for keyspace, settings in keyspaces.items():
             if keyspace not in vitals[self.__collector_keyspaces].data:
                 if not settings.get("optional"):
                     errors.append(f"Keyspace '{keyspace}' is missing")
@@ -2260,8 +2416,12 @@ class ScyllaKeyspacesReplicationAnalyzer(Analyzer):
         return "ScyllaClusterSystemKeyspacesCollector"
 
     @property
+    def __collector_topology(self) -> str:
+        return "SystemTopologyCollector"
+
+    @property
     def depends_on(self) -> Set[str]:
-        return {self.__collector_keyspaces}
+        return {self.__collector_keyspaces, self.__collector_topology}
 
     @property
     def __system_keyspaces_replication(self) -> Dict[str, str]:
@@ -2274,6 +2434,8 @@ class ScyllaKeyspacesReplicationAnalyzer(Analyzer):
             "system_schema": "LocalStrategy",
             "system": "LocalStrategy",
             "system_distributed_everywhere": "EverywhereStrategy",
+            # Pre-GA System-auth-2 keyspace; GA folded auth tables into system.
+            "system_auth_v2": "LocalStrategy",
         }
 
     @property
@@ -2282,11 +2444,16 @@ class ScyllaKeyspacesReplicationAnalyzer(Analyzer):
 
     def _analyze(self, vitals: DictView) -> None:
         """
-        Check that all keyspaces except for a few known ones use NetworkTopologyStrategy
+        Check that all keyspaces except for a few known ones use NetworkTopologyStrategy.
+        Leftover system_auth is skipped for System-auth-2 (Consistent Topology done, or system_auth_v2 present).
         """
         errors = []
         keyspaces_schema = vitals[self.__collector_keyspaces].data
+        skip_legacy_auth = system_auth_managed_by_raft(keyspaces_schema,
+                                                       vitals[self.__collector_topology].data)
         for keyspace, schema in keyspaces_schema.items():
+            if keyspace == "system_auth" and skip_legacy_auth:
+                continue
             replication_config = ast.literal_eval(schema.get("replication", "{}"))
             replication = replication_config.get("class", "")
             expected_replication = self.__system_keyspaces_replication.get(keyspace, self.__network_topology_strategy)
@@ -2376,8 +2543,9 @@ class FSFILEMAXAnalyzer(Analyzer):
         """
         Check fs.file-max limit is huge enough.
         """
-        limitnofiles_value = vitals[self.__collector_limitnofile].data['limitnofile']
-        filemax_value = vitals[self.__collector_sysctl].data['fs.file-max']
+        sysctl_data = vitals[self.__collector_sysctl].data
+        limitnofiles_value = effective_limitnofile(vitals[self.__collector_limitnofile].data, sysctl_data)
+        filemax_value = sysctl_data['fs.file-max']
 
         if filemax_value < limitnofiles_value:
             self.status = AnalyzerStatus.FAILED
@@ -2418,8 +2586,9 @@ class FSNROPENAnalyzer(Analyzer):
         """
         Check fs.nr_open limit is huge enough.
         """
-        limitnofiles_value = vitals[self.__collector_limitnofile].data['limitnofile']
-        nropen_value = vitals[self.__collector_sysctl].data['fs.nr_open']
+        sysctl_data = vitals[self.__collector_sysctl].data
+        limitnofiles_value = effective_limitnofile(vitals[self.__collector_limitnofile].data, sysctl_data)
+        nropen_value = sysctl_data['fs.nr_open']
 
         if nropen_value < limitnofiles_value:
             self.status = AnalyzerStatus.FAILED
@@ -2481,8 +2650,12 @@ class ScyllaLimitNOFILEAnalyzer(Analyzer):
         return "ScyllaLimitNOFILECollector"
 
     @property
+    def __collector_sysctl(self) -> str:
+        return "SysctlCollector"
+
+    @property
     def depends_on(self) -> Set[str]:
-        return {self.__collector}
+        return {self.__collector, self.__collector_sysctl}
 
     @property
     def __limitnofile_minimum(self) -> int:
@@ -2496,17 +2669,24 @@ class ScyllaLimitNOFILEAnalyzer(Analyzer):
         """
         Check that LimitNOFILE value is big enough for scylla service.
         """
-        limitnofile = vitals[self.__collector].data['limitnofile']
+        limitnofile_data = vitals[self.__collector].data
+        limitnofile = effective_limitnofile(limitnofile_data, vitals[self.__collector_sysctl].data)
+
+        # Name where an 'infinity' value came from, otherwise the number in the message has no visible source.
+        if limitnofile_data['limitnofile'] == SYSTEMD_INFINITY:
+            value_description = f"'{SYSTEMD_INFINITY}', effectively fs.nr_open ({limitnofile}),"
+        else:
+            value_description = f"{limitnofile}"
 
         if limitnofile < self.__limitnofile_minimum:
             self.status = AnalyzerStatus.FAILED
-            self.message = f"{limitnofile} is less than {self.__limitnofile_minimum} (minimum value)"
+            self.message = f"{value_description} is less than {self.__limitnofile_minimum} (minimum value)"
         elif limitnofile < self.__limitnofile_recommended:
             self.status = AnalyzerStatus.WARNING
-            self.message = f"{limitnofile} is less than {self.__limitnofile_recommended} (recommended value)"
+            self.message = f"{value_description} is less than {self.__limitnofile_recommended} (recommended value)"
         else:
             self.status = AnalyzerStatus.PASSED
-            self.message = f"{limitnofile} is greater than {self.__limitnofile_recommended} (recommended value)"
+            self.message = f"{value_description} is greater than {self.__limitnofile_recommended} (recommended value)"
 
 
 class ScyllaListenAddressAnalyzer(Analyzer):
@@ -3780,6 +3960,98 @@ class BrokenRolePermissionsAnalyzer(Analyzer):
         else:
             self.status = AnalyzerStatus.PASSED
             self.message = "No null permissions in the 'roles' table."
+
+
+class AuthenticationAnalyzer(Analyzer):
+    """
+    Verify authentication best practices: authentication enabled, and default cassandra/cassandra absent.
+    """
+
+    __DEFAULT_ROLE = 'cassandra'
+
+    @property
+    def name(self) -> str:
+        return "Authentication best practices"
+
+    @property
+    def __collector_config(self) -> str:
+        return "SystemConfigCollector"
+
+    @property
+    def __collector_roles(self) -> str:
+        return "RolesCollector"
+
+    @property
+    def __collector_default_credentials(self) -> str:
+        return "DefaultCredentialsCollector"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__collector_config, self.__collector_roles, self.__collector_default_credentials}
+
+    def _analyze(self, vitals: DictView) -> None:
+        """
+        Check that authentication is enabled and the default cassandra/cassandra credentials are not present.
+        """
+        # Effective in-memory authenticator from system.config, not the on-disk yaml: the option
+        # can also be given on the command line, in which case the yaml would be misleading.
+        authenticator_raw = (vitals[self.__collector_config].data.get('authenticator') or {}).get('value')
+        if not authenticator_raw:
+            self.status = AnalyzerStatus.FAILED
+            self.message = ("The 'authenticator' parameter is missing from system.config, "
+                            "authentication cannot be verified")
+            return
+
+        authenticator = Authenticator.parse(authenticator_raw)
+        roles = vitals[self.__collector_roles].data
+        default_credentials_check = vitals[self.__collector_default_credentials].data
+
+        if authenticator is Authenticator.ALLOW_ALL:
+            auth_status, auth_msg = (
+                AnalyzerStatus.FAILED,
+                f"Authentication is disabled (authenticator is '{authenticator_raw}')",
+            )
+        elif authenticator is Authenticator.TRANSITIONAL:
+            recommended = ', '.join(a.value for a in Authenticator.recommended())
+            auth_status, auth_msg = (
+                AnalyzerStatus.WARNING,
+                f"Authentication is transitional (authenticator is '{authenticator_raw}'); "
+                f"prefer a non-transitional authenticator ({recommended})",
+            )
+        elif authenticator is Authenticator.UNKNOWN:
+            auth_status, auth_msg = (
+                AnalyzerStatus.FAILED,
+                f"Unrecognized authenticator '{authenticator_raw}'",
+            )
+        else:
+            auth_status, auth_msg = (
+                AnalyzerStatus.PASSED,
+                f"Authentication is enabled (authenticator is '{authenticator_raw}')",
+            )
+
+        # Successful login with cassandra/cassandra already implies the default role exists, so
+        # report one finding instead of two near-identical failures.
+        default_role_present = any(row.get('role') == self.__DEFAULT_ROLE for row in roles)
+        default_user_login = default_credentials_check.get('default_user_login')
+        if default_user_login == 'allowed':
+            role_status, role_msg = (
+                AnalyzerStatus.FAILED,
+                f"Default user '{self.__DEFAULT_ROLE}' can still log in with password "
+                f"'{self.__DEFAULT_ROLE}'; create a custom superuser and drop the default role",
+            )
+        elif default_role_present:
+            role_status, role_msg = (
+                AnalyzerStatus.FAILED,
+                f"Default role '{self.__DEFAULT_ROLE}' is still present; create a custom superuser and drop it",
+            )
+        else:
+            role_status, role_msg = (
+                AnalyzerStatus.PASSED,
+                f"Default role '{self.__DEFAULT_ROLE}' is not present",
+            )
+
+        self.status = AnalyzerStatus.combine([auth_status, role_status])
+        self.message = f"{auth_msg}; {role_msg}"
 
 
 class STCSInSchemaAnalyzer(Analyzer):

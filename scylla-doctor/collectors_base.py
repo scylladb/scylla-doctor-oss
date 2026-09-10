@@ -36,10 +36,16 @@ class UnsupportedRestApiEndpoint(Exception):
 
 
 class Output:
-    def __init__(self):
-        self.output = []
+    """Collector diagnostic/verbose entries. When disabled, put() is a no-op (no memory retained)."""
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self.output: List[OutputEntry] = []
 
     def put(self, type: OutputEntryType, name: str, value, level: Level = Level.DEFAULT):
+        if not self.enabled:
+            return
+
         # validate values
         if type in (OutputEntryType.STDOUT, OutputEntryType.API, OutputEntryType.VALUE):
             if not isinstance(value, str):
@@ -117,7 +123,16 @@ class CollectorResult:
     mask: Sequence[Union[str, Iterable]] = dataclasses.field(default_factory=list)
 
     class Encoder(json.JSONEncoder):
+        def __init__(self, *, include_output: bool = True, **kwargs):
+            super().__init__(**kwargs)
+            self.include_output = include_output
+
         def default(self, o):
+            if isinstance(o, CollectorResult):
+                d = {f.name: getattr(o, f.name) for f in dataclasses.fields(o)}
+                if not self.include_output:
+                    d.pop('output', None)
+                return d
             if isinstance(o, enum.Enum):
                 return o.value
             if isinstance(o, OutputEntry):
@@ -147,19 +162,20 @@ class CollectorResult:
                     "type": "Command output",
                     "name": "dpkg -l",
                     "value": "..."
-                }]
-            },
+                }],
             "message": "Data collected"
         }
+        ``output`` is optional (omitted by default in --save-vitals); missing means empty.
         """
         try:
-            for key in ['status', 'message', 'data', 'output']:
+            for key in ['status', 'message', 'data']:
                 if key not in json_obj:
                     raise ValueError(f"{key} is missing")
-            if type(json_obj['output']) is not list:
+            output_list = json_obj.get('output', [])
+            if type(output_list) is not list:
                 raise ValueError("Invalid output")
             output = Output()
-            for output_entry in json_obj['output']:
+            for output_entry in output_list:
                 for key in ['type', 'name', 'value', 'level']:
                     if key not in output_entry:
                         raise ValueError(f"{key} is missing in output")
@@ -306,6 +322,10 @@ class Collector(ConfigValuesParser, abc.ABC):
 
         self._config = configuration.get(self.id, {})
         self._paths = paths
+
+    def set_store_output(self, enabled: bool) -> None:
+        """Collector-wide: whether put() retains diagnostic entries."""
+        self._output.enabled = enabled
 
     @property
     def config(self) -> DictView:
@@ -563,6 +583,7 @@ class ScyllaRestApiAwareCollector(Collector, abc.ABC):
         if read_url_value is None:
             __error(f"Unable to read Scylla REST API: {url}", CollectorStatus.FAILED, UnableToReadScyllaRestApi)
 
-        self.output.put(OutputEntryType.API, url, json.dumps(json.loads(read_url_value), indent=4), level=Level.VERBOSE)  # type: ignore[arg-type] # noqa E501
+        parsed = json.loads(read_url_value)  # type: ignore[arg-type]
+        self.output.put(OutputEntryType.API, url, json.dumps(parsed, indent=4), level=Level.VERBOSE)
 
-        return json.loads(read_url_value)  # type: ignore[arg-type]
+        return parsed

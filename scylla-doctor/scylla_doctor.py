@@ -34,7 +34,7 @@ import re
 import sys
 import zipfile
 
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Tuple, Union
 
 from common import DictView, Paths, AbortedException, ConfigParameter
 from collectors_base import CollectorStatus, CollectorResult, Collector
@@ -44,7 +44,33 @@ from common import read_config_file
 import collectors
 from models.output_entry import Level
 
-from utils import Executor, Formatter
+from utils import Executor, Formatter, memoize
+
+
+###############################################################################
+# Class discovery cache #######################################################
+###############################################################################
+@memoize
+def _discover_classes() -> Tuple[Tuple, Tuple]:
+    """Discover collector/analyzer classes once per process. Returns immutable tuples."""
+    collectors_list = []
+    for _, cls in inspect.getmembers(sys.modules[__name__], predicate=inspect.isclass):
+        if not inspect.isabstract(cls) and issubclass(cls, Collector):
+            collectors_list.append(cls)
+    for _, cls in inspect.getmembers(sys.modules[collectors.__name__], predicate=inspect.isclass):
+        if not inspect.isabstract(cls) and issubclass(cls, Collector):
+            collectors_list.append(cls)
+
+    analyzers_list = []
+    try:
+        import analyzers
+        for _, cls in inspect.getmembers(analyzers, predicate=inspect.isclass):
+            if not inspect.isabstract(cls) and issubclass(cls, Analyzer):
+                analyzers_list.append(cls)
+    except ModuleNotFoundError:
+        pass
+
+    return tuple(collectors_list), tuple(analyzers_list)
 
 
 ###############################################################################
@@ -70,25 +96,29 @@ class Doctor:
         self.collectors = dict()
         self.analyzers = dict()
 
-        # Detect and collect available Collectors instances
-        for _, cls in inspect.getmembers(sys.modules[__name__], predicate=inspect.isclass):
-            if not inspect.isabstract(cls) and issubclass(cls, Collector):
-                collector = cls(self.environment.configuration, self.environment.paths)
-                self.collectors[collector.id] = collector
-        for _, cls in inspect.getmembers(sys.modules[collectors.__name__], predicate=inspect.isclass):
-            if not inspect.isabstract(cls) and issubclass(cls, Collector):
-                collector = cls(self.environment.configuration, self.environment.paths)
-                self.collectors[collector.id] = collector
+        collector_classes, analyzer_classes = _discover_classes()
+        store_output = self.should_store_output()
 
-        # Try to load available Analyzer classes
-        try:
-            import analyzers
-            for _, cls in inspect.getmembers(analyzers, predicate=inspect.isclass):
-                if not inspect.isabstract(cls) and issubclass(cls, Analyzer):
-                    analyzer = cls(self.environment.configuration)
-                    self.analyzers[analyzer.id] = analyzer
-        except ModuleNotFoundError:
-            pass
+        for cls in collector_classes:
+            collector = cls(self.environment.configuration, self.environment.paths)
+            collector.set_store_output(store_output)
+            self.collectors[collector.id] = collector
+
+        for cls in analyzer_classes:
+            analyzer = cls(self.environment.configuration)
+            self.analyzers[analyzer.id] = analyzer
+
+    def should_store_output(self) -> bool:
+        """Whether collectors retain Output entries in memory (print and/or save)."""
+        args = self.environment.args
+        return bool(args.verbose or args.detailed or self.include_output_in_vitals())
+
+    def include_output_in_vitals(self) -> bool:
+        """Global only: --include-output or [General] include_output."""
+        if self.environment.args.include_output:
+            return True
+        val = self.environment.get_config_parameter('General', 'include_output')
+        return bool(val and val.lower() in ("1", "yes", "true", "on"))
 
     def print_results(self, format=DoctorOutputFormat.FULL, file=None):
         """
@@ -136,9 +166,14 @@ class Doctor:
                 if entry.level <= level:
                     formatter.print_output_entry(entry, file=file)
 
-        formatter.print_table_checkup_header("Data analysis", file=file)
-        for name, analyzer in self.analyzers.items():
-            if name_matcher.match(name) and analyzer.executed:
+        analyzers_to_print = [
+            (name, analyzer)
+            for name, analyzer in self.analyzers.items()
+            if name_matcher.match(name) and analyzer.executed
+        ]
+        if analyzers_to_print:
+            formatter.print_table_checkup_header("Data analysis", file=file)
+            for name, analyzer in analyzers_to_print:
                 formatter.print_table_test_row(f"{name}: {analyzer.name}", analyzer.status.name, analyzer.message,
                                                file=file)
 
@@ -154,10 +189,7 @@ class Doctor:
                     raise AbortedException(f'Collector {collector.id} failed')
 
     @staticmethod
-    def read_vitals_file_version(file_name: str) -> str:
-        with open(file_name, 'r') as f:
-            vitals_json = json.load(f)
-
+    def read_vitals_version_from_json(vitals_json: dict) -> str:
         if 'SDVersionCollector' not in vitals_json:
             raise Exception("Vitals file does not contain SDVersionCollector data.")
 
@@ -170,6 +202,13 @@ class Doctor:
             raise Exception("Vitals file does not contain a version value.")
 
         return version
+
+    @staticmethod
+    def read_vitals_file_version(file_name: str) -> str:
+        with open(file_name, 'r') as f:
+            vitals_json = json.load(f)
+
+        return Doctor.read_vitals_version_from_json(vitals_json)
 
     def verify_vitals_version(self) -> None:
         if self.environment.args.ignore_vitals_version or not self.environment.args.load_vitals:
@@ -215,7 +254,12 @@ class Doctor:
 
     def save_vitals(self, file_name="vitals.json"):
         with open(file_name, 'w') as f:
-            json.dump(self.vitals, f, cls=CollectorResult.Encoder)
+            json.dump(
+                self.vitals,
+                f,
+                cls=CollectorResult.Encoder,
+                include_output=self.include_output_in_vitals(),
+            )
 
     def _should_load_collector(self, collector) -> bool:
         # If this specific collector is known and skipped - don't load its value from Vitals
@@ -281,11 +325,24 @@ class Doctor:
         """
         return self.read_tool_version()
 
+    @staticmethod
+    def general_config_parameters() -> Dict[str, ConfigParameter]:
+        return {
+            'include_output': ConfigParameter(
+                description=(
+                    'Set to 1/yes/true/on to include collector output arrays in --save-vitals JSON. '
+                    'Also --include-output. Unset omits output to save space.'
+                ),
+                default_description='unset (omitted)',
+            ),
+        }
+
     def config_parameters(self, section: Optional[str] = None) -> Dict[str, Dict[str, ConfigParameter]]:
         """
         Return configuration parameters and defaults for collectors and analyzers.
-        :param section: Optional component class name. When set, return only that section.
+        :param section: Optional component class name, or ``General``. When set, return only that section.
         """
+        general = self.general_config_parameters()
         components: Dict[str, Union[Collector, Analyzer]] = {}
 
         for name in sorted(self.collectors.keys()):
@@ -294,11 +351,13 @@ class Doctor:
             components[name] = self.analyzers[name]
 
         if section is not None:
+            if section == 'General':
+                return {'General': general}
             if section not in components:
                 raise ValueError(f"Unknown section: {section}")
             return {section: components[section].config_parameters}
 
-        result: Dict[str, Dict[str, ConfigParameter]] = {}
+        result: Dict[str, Dict[str, ConfigParameter]] = {'General': general}
         for name, component in components.items():
             if not type(component).config_parameters_definitions():
                 continue
@@ -402,6 +461,9 @@ class DoctorEnvironment:
                                    help="After running collectors, store vitals in a file (vitals.json by default)")
         self.__parser.add_argument('--load-vitals', nargs='?', default=None, const='vitals.json',
                                    help="Instead of running Collectors, load vitals from file (vitals.json by default)")
+        self.__parser.add_argument('--include-output', action='store_true',
+                                   help="Include collector output arrays in --save-vitals JSON "
+                                        "(omitted by default to save space; also [General] include_output)")
         self.__parser.add_argument('--output', default=DoctorOutputFormat.FULL, type=DoctorOutputFormat,
                                    choices=list(DoctorOutputFormat),
                                    help="Give out full human-readable report, short launch log, or machine-readable analyzers output for further processing")  # noqa: E501
@@ -410,7 +472,7 @@ class DoctorEnvironment:
         self.__parser.add_argument('--version', help="Print Scylla Doctor version and exit", action="store_true")
         self.__parser.add_argument('--list-parameters', nargs='?', const='', default=None, metavar='SECTION',
                                    help="Print configuration parameters and defaults. "
-                                        "Optional SECTION limits output to one collector/analyzer.")
+                                        "Optional SECTION limits output to General or one collector/analyzer.")
         self.__parser.add_argument('--list-parameters-json', action='store_true',
                                    help="Output --list-parameters as JSON (implies --list-parameters)")
         self.__parser.add_argument('--vitals-version', nargs='?', default=None, const='vitals.json',
@@ -418,26 +480,21 @@ class DoctorEnvironment:
         self.__parser.add_argument('--ignore-vitals-version', help="Skip vitals version compatibility check",
                                    action="store_true")
 
-        self.__parser.epilog = "Collectors:\n"
-        # Detect and collect available Collectors instances
-        for collector_source in [sys.modules[__name__], sys.modules[collectors.__name__]]:
-            for _, cls in inspect.getmembers(collector_source, predicate=inspect.isclass):
-                if not inspect.isabstract(cls) and issubclass(cls, Collector):
-                    self.__parser.epilog += f"{cls.__name__} - " \
-                                            f"{cls.__doc__ or cls({}, Paths({})).name or 'no description'}\n"
-
-        # Try to load available Analyzer classes
-        try:
-            import analyzers
-            self.__parser.epilog += "\nAnalyzers:\n"
-            for _, cls in inspect.getmembers(analyzers, predicate=inspect.isclass):
-                if not inspect.isabstract(cls) and issubclass(cls, Analyzer):
-                    s = getattr(cls, '_analyze')
-                    self.__parser.epilog += f"{cls.__name__} - {str(s.__doc__).strip()}\n"
-        except ModuleNotFoundError:
-            pass
+        self._build_epilog()
 
         self.args = self.__parser.parse_args(args)
+
+    def _build_epilog(self):
+        collector_classes, analyzer_classes = _discover_classes()
+        self.__parser.epilog = "Collectors:\n"
+        for cls in collector_classes:
+            self.__parser.epilog += f"{cls.__name__} - " \
+                                    f"{cls.__doc__ or cls({}, Paths({})).name or 'no description'}\n"
+        if analyzer_classes:
+            self.__parser.epilog += "\nAnalyzers:\n"
+            for cls in analyzer_classes:
+                s = getattr(cls, '_analyze')
+                self.__parser.epilog += f"{cls.__name__} - {str(s.__doc__).strip()}\n"
 
     def load_configurations(self):
         """

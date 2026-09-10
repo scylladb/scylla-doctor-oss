@@ -31,7 +31,7 @@ import zipfile
 
 from typing import Dict, Optional, Set, List, Iterable, Union, Sequence, Tuple, Generic, TypeVar
 
-from common import DictView, Paths, NodePlatform, ConfigParameter
+from common import DictView, Paths, NodePlatform, ConfigParameter, Authenticator, SYSTEMD_INFINITY
 from collectors_base import CollectorStatus, Collector, ScyllaRestApiAwareCollector
 from common import GossipInfoInvariantValues, InvalidConfigurationException
 from models.output_entry import OutputEntryType, Level
@@ -991,9 +991,65 @@ class PerftuneYamlDefaultCollector(Collector):
 
 
 class RAIDSetupCollector(Collector):
+    # md0 : active raid0 nvme0n2[1] nvme0n1[0]
+    # md1 : active (auto-read-only) raid1 sda1[0] sdb1[1]
+    # md2 : inactive sda1[0](S) sdb1[1](S)
+    # Numeric mdN names only: Scylla nodes use kernel-assigned /dev/mdN, not mdadm --name arrays.
+    _ARRAY_LINE_RE = re.compile(r'^(?P<name>md\d+)\s*:\s+(?P<state>\S+)(?:\s+\([^)]*\))?\s*(?P<rest>.*)$')
+    _MEMBER_RE = re.compile(r'^([^\s\[\]]+)\[\d+\](?:\([^)]*\))?$')
+
     @property
     def name(self) -> str:
         return "RAID Setup"
+
+    @classmethod
+    def _parse_mdstat(cls, content: List[str]) -> Dict:
+        """
+        Parse /proc/mdstat into a structured dict so cluster drift comparison is stable.
+
+        Member device order in the raw file can differ across nodes with the same RAID layout;
+        sorting members (and other lists) makes the collector data comparable.
+        """
+        personalities: List[str] = []
+        arrays: Dict[str, Dict] = {}
+        unused_devices: List[str] = []
+
+        for raw_line in content:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if line.startswith('Personalities'):
+                personalities = re.findall(r'\[([^\]]+)\]', line.split(':', 1)[1] if ':' in line else '')
+                continue
+
+            if line.startswith('unused devices:'):
+                # Kernel/mdadm separate multiple unused devices with whitespace, not commas.
+                unused_value = line.split(':', 1)[1].strip()
+                if unused_value and unused_value != '<none>':
+                    unused_devices = sorted(unused_value.split())
+                continue
+
+            array_match = cls._ARRAY_LINE_RE.match(line)
+            if not array_match:
+                continue
+
+            # First non-member token (if any) is the personality/level, e.g. "raid0", "linear";
+            # inactive arrays list only members and have no level token.
+            tokens = (array_match.group('rest') or '').split()
+            level = tokens.pop(0) if tokens and not cls._MEMBER_RE.match(tokens[0]) else None
+            members = sorted(match.group(1) for match in (cls._MEMBER_RE.match(t) for t in tokens) if match)
+            arrays[array_match.group('name')] = {
+                'state': array_match.group('state'),
+                'level': level,
+                'members': members,
+            }
+
+        return {
+            'personalities': sorted(personalities),
+            'arrays': {name: arrays[name] for name in sorted(arrays)},
+            'unused_devices': unused_devices,
+        }
 
     def _collect(self, vitals: DictView) -> None:
         filename = "/proc/mdstat"
@@ -1010,19 +1066,11 @@ class RAIDSetupCollector(Collector):
         if not content:
             self.status = CollectorStatus.FAILED
             self._message = f"Cannot read {filename}"
-        else:
-            self.status = CollectorStatus.PASSED
-            self._data = {
-                filename: content
-            }
-            self._output.put(OutputEntryType.FILE, filename, content, level=Level.VERBOSE)
+            return
 
-    @property
-    def mask(self) -> Sequence[Union[str, Iterable]]:
-        """
-        Exclude this Collector from drifts checking due to false alarms.
-        """
-        return ["/proc/mdstat"]
+        self._data = self._parse_mdstat(content)
+        self._output.put(OutputEntryType.FILE, filename, content, level=Level.VERBOSE)
+        self.status = CollectorStatus.PASSED
 
 
 class NVMeDevicesCollector(Collector):
@@ -1076,13 +1124,13 @@ class NVMeDevicesCollector(Collector):
         return [disk for disk in nvme_disks if disk != root_device]
 
     @staticmethod
-    def _active_raid_nvme_members(mdstat_content: List[str]) -> Set[str]:
-        members = set()
-        for line in mdstat_content:
-            if ' : active ' not in line:
-                continue
-            members.update(re.findall(r'(nvme\d+n\d+)', line))
-        return members
+    def _active_raid_nvme_members(raid_data: Dict) -> Set[str]:
+        return {
+            match.group(1)
+            for array in raid_data['arrays'].values() if array.get('state') == 'active'
+            for member in array.get('members', [])
+            for match in [re.match(r'(nvme\d+n\d+)', member)] if match
+        }
 
     def _mounted_nvme_disks(self, nvme_disks: Set[str]) -> Optional[Set[str]]:
         mounted = set()
@@ -1100,14 +1148,14 @@ class NVMeDevicesCollector(Collector):
 
     def _collect(self, vitals: DictView) -> None:
         nvme_disks = self._applicable_nvme_disks(vitals, self._list_nvme_disks())
-        mdstat_content = vitals[self.__collector_raid].data['/proc/mdstat']
+        raid_data = vitals[self.__collector_raid].data
 
         nvme_disk_set = set(nvme_disks)
         mounted = self._mounted_nvme_disks(nvme_disk_set)
         if mounted is None:
             return
 
-        used = mounted | self._active_raid_nvme_members(mdstat_content)
+        used = mounted | self._active_raid_nvme_members(raid_data)
         used &= nvme_disk_set
 
         self._data = {
@@ -1115,6 +1163,92 @@ class NVMeDevicesCollector(Collector):
             'used_nvme_devices': sorted(used),
             'unused_nvme_devices': sorted(nvme_disk_set - used),
         }
+        self.status = CollectorStatus.PASSED
+
+
+class DiskPerformanceExceededCollector(Collector):
+    # Counters reported by the AWS Nitro NVMe devices: the accumulated time (microseconds) IO demand exceeded the
+    # volume or the instance performance limits. Both instance store and EBS devices report them, with slightly
+    # different key names depending on the nvme-cli version, hence a suffix match.
+    _EXCEEDED_KEY_SUFFIXES = ("performance_exceeded_iops", "performance_exceeded_tp")
+
+    @property
+    def name(self) -> str:
+        return "Disk performance exceeded statistics"
+
+    @property
+    def privileged(self) -> bool:
+        return True
+
+    @property
+    def __collector_nvme(self) -> str:
+        return "NVMeDevicesCollector"
+
+    @property
+    def __collector_provider(self) -> str:
+        return "InfrastructureProviderCollector"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__collector_nvme, self.__collector_provider}
+
+    @property
+    def mask(self) -> Sequence[Union[str, Iterable]]:
+        """
+        Counters are per-node cumulative values, therefore they always differ between nodes - exclude from drifts
+        checking.
+        """
+        return ["devices"]
+
+    def _device_stats(self, device: str) -> Optional[Dict[str, int]]:
+        # ponytail: JSON output only. Older nvme-cli builds without JSON support print a human readable report -
+        #           parse it as well if such nvme-cli versions have to be supported.
+        command = f"nvme amzn stats /dev/{device} --output-format=json"
+        output = Executor.run_command(command, check=False)
+        self._output.put(OutputEntryType.STDOUT, command, output.stdout, level=Level.VERBOSE)
+
+        if output.returncode != 0:
+            return None
+
+        try:
+            stats = json.loads(output.stdout)
+        except json.JSONDecodeError:
+            return None
+
+        exceeded = {key: value for key, value in stats.items() if key.endswith(self._EXCEEDED_KEY_SUFFIXES)}
+        return exceeded or None
+
+    def _collect(self, vitals: DictView) -> None:
+        provider = vitals[self.__collector_provider].data.get('provider')
+        if provider != 'AWS':
+            self.status = CollectorStatus.SKIPPED
+            self._message = "Detailed NVMe performance statistics are available on AWS Nitro instances only"
+            return
+
+        if not shutil.which('nvme'):
+            self.status = CollectorStatus.SKIPPED
+            self._message = "'nvme' utility is not installed, skipping NVMe performance statistics collection"
+            return
+
+        # Only the data disks in active use are relevant to Scylla's IO workload. NVMeDevicesCollector
+        # already drops the AWS root EBS volume (the OS volume) from 'used_nvme_devices', so its
+        # performance-exceeded counters are intentionally not inspected here.
+        devices = vitals[self.__collector_nvme].data['used_nvme_devices']
+        if not devices:
+            self.status = CollectorStatus.SKIPPED
+            self._message = "No NVMe devices in use"
+            return
+
+        stats = {device: device_stats for device in devices
+                 if (device_stats := self._device_stats(device)) is not None}
+
+        if not stats:
+            self.status = CollectorStatus.SKIPPED
+            self._message = ("Performance statistics are not reported for any NVMe device, "
+                             "an nvme-cli version with the 'amzn' plugin and a Nitro-based instance are required")
+            return
+
+        self._data = {'devices': stats}
         self.status = CollectorStatus.PASSED
 
 
@@ -1680,15 +1814,23 @@ class ScyllaLimitNOFILECollector(Collector):
         self._output.put(OutputEntryType.STDOUT, command, service_env, level=Level.VERBOSE)
 
         try:
-            limitnofile_line = Executor.search_string("^LimitNOFILE", service_env.split("\n"))
-            limitnofile = int(limitnofile_line[0].split("=")[1])
+            limitnofile_line = Executor.search_string("^LimitNOFILE=", service_env.split("\n"))
+            limitnofile_value = limitnofile_line[0].split("=", 1)[1].strip()
         except Exception:
             self.status = CollectorStatus.FAILED
             self._message = "Cannot retrive 'LimitNOFILE' value"
             return
 
+        # 'scylla-server.service' ships 'LimitNOFILE=infinity' since scylladb/scylladb@78c8598 and systemd reports
+        # that literal back, so the value is kept as a string. Validate it here - the stripped build has no
+        # analyzers, and a collector is the only place that can report an unparsable value.
+        if limitnofile_value != SYSTEMD_INFINITY and not limitnofile_value.isdigit():
+            self.status = CollectorStatus.FAILED
+            self._message = f"Cannot retrive 'LimitNOFILE' value: unexpected value '{limitnofile_value}'"
+            return
+
         self._data = {
-            'limitnofile': limitnofile
+            'limitnofile': limitnofile_value
         }
         self.status = CollectorStatus.PASSED
 
@@ -1848,12 +1990,22 @@ class ScyllaSeedsCollector(Collector):
         rpc_port = scylla_config['ssl_storage_port'] if use_ssl else scylla_config['storage_port']
 
         for seed in detected_seeds:
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as seed_socket:
-                    self._data[seed] = seed_socket.connect_ex((seed, rpc_port))
-            except Exception:
-                self._data[seed] = -1
+            seed = seed.strip()
+            if not seed:
+                continue
+            host = seed[1:-1] if seed.startswith('[') and seed.endswith(']') else seed
+            self._data[seed] = self.__connect_seed(host, rpc_port)
         self.status = CollectorStatus.PASSED
+
+    @staticmethod
+    def __connect_seed(host: str, port: int) -> int:
+        try:
+            with socket.create_connection((host, port), timeout=2.0):
+                return 0
+        except socket.gaierror:
+            return -1
+        except OSError as e:
+            return e.errno if e.errno is not None else -1
 
 
 class ScyllaSSTablesCollector(Collector):
@@ -2672,6 +2824,149 @@ class RolePermissionsCollector(Collector):
         self.status = CollectorStatus.PASSED
 
 
+class RolesCollector(Collector):
+    """
+    Collects role metadata from system.roles.
+
+    salted_hash is intentionally omitted from collected data — it is sensitive and not needed
+    for authentication best-practice analysis.
+    """
+
+    # Columns that are safe / useful for analysis and cluster comparison.
+    __COLUMNS = ['role', 'is_superuser', 'can_login', 'member_of']
+
+    @property
+    def name(self) -> str:
+        return "Collects system.roles content"
+
+    @property
+    def __collector_cql(self) -> str:
+        return "CqlshCollector"
+
+    @property
+    def __collector_scylla_config(self) -> str:
+        return "ScyllaConfigurationFileCollector"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__collector_cql, self.__collector_scylla_config}
+
+    def _collect(self, vitals: DictView) -> None:
+        query, rows = Executor.read_cql_table(
+            vitals[self.__collector_scylla_config].data, 'system.roles', columns=self.__COLUMNS)
+        self._output.put(OutputEntryType.CQL, query, rows, Level.VERBOSE)
+
+        # Sort by the 'role' column to make this data comparable between nodes
+        self._data = sorted(rows, key=lambda row: row.get('role', ''))
+        self.status = CollectorStatus.PASSED
+
+
+class ServiceLevelsCollector(Collector):
+    """
+    Collects service levels from system.service_levels_v2.
+
+    Stored as a map keyed by service_level name so cluster diffs show added, removed, or
+    changed levels (shares, timeout, workload_type) by name. Pre-2024.2 storage is ignored
+    because those Scylla versions are no longer supported.
+    """
+
+    @property
+    def name(self) -> str:
+        return "Collects cluster service levels"
+
+    @property
+    def __collector_cql(self) -> str:
+        return "CqlshCollector"
+
+    @property
+    def __collector_scylla_config(self) -> str:
+        return "ScyllaConfigurationFileCollector"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__collector_cql, self.__collector_scylla_config}
+
+    def _collect(self, vitals: DictView) -> None:
+        table_name = 'system.service_levels_v2'
+        try:
+            query, rows = Executor.read_cql_table(
+                vitals[self.__collector_scylla_config].data, table_name)
+            self._output.put(OutputEntryType.CQL, query, rows, Level.VERBOSE)
+
+            self._data = {}
+            for row in rows:
+                name = row.get('service_level', '').strip()
+                if name:
+                    self._data[name] = row
+            self.status = CollectorStatus.PASSED
+        except CqlFailedException as e:
+            if "unconfigured table" in str(e):
+                self.status = CollectorStatus.SKIPPED
+                self._message = (
+                    "system.service_levels_v2 does not exist - service levels are not supported on this node"
+                )
+            else:
+                self.status = CollectorStatus.FAILED
+                self._message = f"{e}"
+
+
+class DefaultCredentialsCollector(Collector):
+    """
+    Probes whether the default cassandra/cassandra user can log in.
+
+    Always completes with PASSED. ``default_user_login`` is one of:
+    - ``not_verified`` — authentication is off / probe unsafe (e.g. TransitionalAuthenticator)
+    - ``denied`` — default user cannot log in
+    - ``allowed`` — default user can log in
+    """
+
+    __DEFAULT_USER = "cassandra"
+    __DEFAULT_PASSWORD = "cassandra"
+
+    @property
+    def name(self) -> str:
+        return "Probe default CQL credentials"
+
+    @property
+    def __collector_cql(self) -> str:
+        return "CqlshCollector"
+
+    @property
+    def __collector_scylla_config(self) -> str:
+        return "ScyllaConfigurationFileCollector"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__collector_cql, self.__collector_scylla_config}
+
+    def _collect(self, vitals: DictView) -> None:
+        scylla_config = vitals[self.__collector_scylla_config].data
+        authenticator = scylla_config.get('authenticator')
+
+        # Only password-capable authenticators that reject bad passwords outright. See
+        # Authenticator.password_login_probe_safe (TransitionalAuthenticator is not safe to probe).
+        if not Authenticator.parse(authenticator).password_login_probe_safe:
+            self._data = {'default_user_login': 'not_verified'}
+            self._message = (
+                f"Default user login was not verified (authenticator is '{authenticator or 'unset'}')"
+            )
+            self.status = CollectorStatus.PASSED
+            return
+
+        # Trivial authenticated query — success means the default user can still log in.
+        query = "SELECT now() FROM system.local"
+        output = Executor.cqlsh(query, scylla_config, user=self.__DEFAULT_USER, password=self.__DEFAULT_PASSWORD)
+        default_user_login = 'allowed' if output is not None else 'denied'
+        self._data = {'default_user_login': default_user_login}
+        self._output.put(
+            OutputEntryType.VALUE,
+            "default_user_login",
+            default_user_login,
+            level=Level.VERBOSE,
+        )
+        self.status = CollectorStatus.PASSED
+
+
 class SystemConfigCollector(Collector):
     @property
     def name(self) -> str:
@@ -2808,10 +3103,14 @@ class ScyllaVersionCollector(Collector):
         scylla_packages = sorted(Executor.search_string("scylla", output.stdout.split('\n'), re.IGNORECASE))
         # normalize number of whitespaces in putput to improve readability and ease up comparison
         scylla_packages = [' '.join(p.split()) for p in scylla_packages]
-        if any(["enterprise" in package for package in scylla_packages]):
-            edition = "enterprise"
-        elif any(["dev" in package for package in scylla_packages]):
+        # 2025.1+ is a single Enterprise distribution; package names no longer contain "enterprise".
+        version_match = re.match(r'^(\d+)\.(\d+)', version.strip())
+        if any("dev" in package for package in scylla_packages):
             edition = "development"
+        elif version_match and (int(version_match.group(1)), int(version_match.group(2))) >= (2025, 1):
+            edition = "enterprise"
+        elif any("enterprise" in package for package in scylla_packages):
+            edition = "enterprise"
         else:
             edition = "oss"
         self._data = {
@@ -3090,7 +3389,7 @@ class LSPCICollector(Collector):
 
 class SeastarCPUMapCollector(Collector):
     """
-    Collect the output of 'seastar-cpu-map.sh -n scylla'
+    Collect the output of 'seastar-cpu-map.sh -n scylla' and the shard to CPU mapping parsed out of it
     """
     @property
     def name(self) -> str:
@@ -3101,6 +3400,21 @@ class SeastarCPUMapCollector(Collector):
         full_command = f"{self._paths['scylla_directory_scripts']}/{short_command}"
         output = Executor.run_command(full_command)
         self._output.put(OutputEntryType.STDOUT, short_command, output.stdout, level=Level.VERBOSE)
+
+        # seastar-cpu-map.sh prints a line per shard, e.g. "shard: 0, cpu: 0" or "shard: 0, cpu: 0,16"
+        shard_cpu_map = {shard: cpu
+                         for shard, cpu in re.findall(r"^shard:\s*(\d+),\s*cpu:\s*(\S+)",
+                                                      output.stdout, re.MULTILINE)}
+        if not shard_cpu_map:
+            self.status = CollectorStatus.FAILED
+            self._message = f"No shard to CPU mapping could be parsed out of '{short_command}' output"
+            return
+
+        self._data = {'shard_cpu_map': shard_cpu_map}
+        self._output.put(OutputEntryType.VALUE, "shard to CPU mapping",
+                         ", ".join(f"shard {shard}: CPU {cpu}"
+                                   for shard, cpu in sorted(shard_cpu_map.items(), key=lambda item: int(item[0]))),
+                         level=Level.DETAILED)
         self.status = CollectorStatus.PASSED
 
 

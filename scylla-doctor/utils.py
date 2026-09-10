@@ -33,12 +33,14 @@ import yaml
 import shlex
 import ssl
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
 
 from typing import Dict, Optional, List, Union, Tuple, Any
 
+from common import Authenticator
 from models.output_entry import OutputEntry
 
 ###############################################################################
@@ -879,6 +881,25 @@ class CloudProviderOCI(CloudProvider):
         else:
             return True
 
+    @property
+    @memoize
+    def instance_type(self) -> Optional[str]:
+        """
+        Return instance shape from OCI IMDS (e.g. VM.DenseIO.E5.Flex).
+        """
+        metadata = json.loads(self.read_metadata("instance/"))
+        return metadata.get("shape")
+
+    def read_metadata(self, url_path, api_version: Optional[str] = None) -> str:
+        """
+        Read metadata
+        :param url_path: metadata endpoint suffix (e.g. "instance/").
+        :param api_version: unused for OCI; present for interface compatibility.
+        """
+        return super().gather_instance_data(
+            self.__INSTANCE_DATA_BASE_URL + url_path,
+            headers=self.__INSTANCE_DATA_HEADERS)
+
 
 class CloudProviderOS(CloudProvider):
     """
@@ -961,9 +982,16 @@ class Executor:
         return ["1", "yes", "true", "on"]
 
     @staticmethod
-    def cqlsh(query, scylla_config):
+    def cqlsh(query, scylla_config, user: Optional[str] = None, password: Optional[str] = None):
         """
         Execute a query using cqlsh
+
+        :param query: CQL query to execute
+        :param scylla_config: Scylla configuration (from scylla.yaml)
+        :param user: Optional CQL username override. When authentication is required and this is
+                     omitted, falls back to CQL config / default ``cassandra``.
+        :param password: Optional CQL password override. When authentication is required and this is
+                         omitted, falls back to CQL config / default ``cassandra``.
 
         Return values:
          - CompletedProcess instance -> No error
@@ -977,11 +1005,13 @@ class Executor:
         command_args += ["-e", query]
         credentials_args = []
 
-        # Check if authentication is required
-        if Executor.cqlsh_authentication_required(scylla_config):
-            user = Executor.cql_config.get("user") or "cassandra"
-            password = Executor.cql_config.get("password") or "cassandra"
-            credentials_args = ["-u", user, "-p", password]
+        # Explicit user/password overrides always attach credentials, even when the
+        # authenticator isn't recognized as requiring them (e.g. a credential probe).
+        if user is not None or password is not None or Executor.cqlsh_authentication_required(scylla_config):
+            resolved_user = user if user is not None else (Executor.cql_config.get("user") or "cassandra")
+            resolved_password = password if password is not None else (
+                Executor.cql_config.get("password") or "cassandra")
+            credentials_args = ["-u", resolved_user, "-p", resolved_password]
 
         def do_execute_command(cmd_args: List[str], cred_args: List[str]):
             """
@@ -1118,12 +1148,7 @@ class Executor:
          - False -> Authentication is not required
         """
 
-        allowed_authenticators = ['PasswordAuthenticator', 'com.scylladb.auth.TransitionalAuthenticator']
-
-        if scylla_config.get('authenticator') in allowed_authenticators:
-            return True
-
-        return False
+        return Authenticator.parse(scylla_config.get('authenticator')).requires_password_for_cqlsh
 
     @staticmethod
     def cqlsh_ssl_enabled(scylla_config):
@@ -1157,15 +1182,16 @@ class Executor:
     @staticmethod
     def generate_output_filename(path=None, prefix="", suffix="", extension=""):
         """
-        Generate a time-based file name
+        Generate a time-based file name.
+
+        When ``path`` is omitted, the system temporary directory is used so files are not written next to
+        the scylla-doctor binary (for example /usr/bin when installed as a system package).
 
         Return value: String
         """
 
         if path is None:
-            path = pathlib.PurePosixPath(__file__).parent
-            if not os.path.isdir(path):
-                path = path.parent
+            path = tempfile.gettempdir()
 
         filename = pathlib.PurePosixPath(path).joinpath(f'{prefix}{time.strftime("%Y%m%d%H%M%S")}{suffix}{extension}')
 
@@ -1346,8 +1372,9 @@ class Executor:
 
         :param command: a string with a command to be executed
         :param shell: When 'True' run a ``command`` in a shell
-        :param output_file: an optional file name to redirect the ``command``'s stdout into
-        :param output_file_compression: when 'True' gztar the ``output_file`` after running the ``command``
+        :param output_file: optional path; ``command`` stdout is written here
+        :param output_file_compression: when True, gztar ``output_file`` beside it (basename-only members), then
+            delete it if the archive was created successfully.
         :param timeout: timeout in seconds to wait for a ``command``'s completion.
         :param check: When 'True' raise a subprocess.CalledProcessError if the ``command`` fails.
         :return: subprocess.CompletedProcess object
@@ -1369,16 +1396,17 @@ class Executor:
                 res = run(command=command, shell=shell, stdout=destination_file)
 
             if output_file_compression:
+                output_path = pathlib.Path(output_file)
                 try:
-                    shutil.make_archive(f"{pathlib.Path(output_file).stem}",
-                                        'gztar', f"{pathlib.Path(output_file).parent}", output_file)
+                    shutil.make_archive(str(output_path.with_suffix('')), 'gztar',
+                                        str(output_path.parent), output_path.name)
                 except OSError:
                     pass
-
-                try:
-                    os.remove(output_file)
-                except OSError:
-                    pass
+                else:
+                    try:
+                        os.remove(output_file)
+                    except OSError:
+                        pass
 
         else:
             res = run(command=command, shell=shell)

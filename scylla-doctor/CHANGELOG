@@ -180,3 +180,30 @@ v1.13
   * DOCTOR-85: Analyze ZSTD compression levels in schema and scylla.yaml by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/277
   * feat: add SystemTabletsCollector for tablet ownership by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/282
   * DOCTOR-99: Include views in table description collection by @vreniers in https://github.com/scylladb/scylla-doctor/pull/284
+
+v1.14
+* Fixes:
+  * fix(analyzers): skip CPUScalingAnalyzer when CPU scaling is not supported by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/313
+  * fix: connect to IPv6 seed hosts by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/294
+  * fix(collectors): treat Scylla 2025.1+ as enterprise (DOCTOR-112) by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/312
+  * fix(cluster): list mismatched vitals file versions by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/303
+  * fix: write command output archives next to the output file by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/308
+  * DOCTOR-119: handle 'LimitNOFILE=infinity' from systemd by @fruch in https://github.com/scylladb/scylla-doctor/pull/320
+
+* Enhancements:
+  * Add AuthenticationAnalyzer for auth best practices (#171) by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/288
+  * Cache collector/analyzer class discovery and dedup swagger parse by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/272
+  * Add ServiceLevelsCollector for LIST ALL SERVICE_LEVELS by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/295
+  * RAIDSetupCollector: parse /proc/mdstat into comparable structured data by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/287
+  * Omit empty Data analysis header in full output by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/298
+  * Recognize ScyllaDB Rust Driver name in DriverVersionAnalyzer by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/301
+  * Recognize cpp-rs-driver in DriverVersionAnalyzer by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/302
+  * Omit collector output from --save-vitals by default (squashed #290) by @vreniers in https://github.com/scylladb/scylla-doctor/pull/296
+  * Write journalctl dumps to the system temp directory by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/306
+  * Add Claude Code GitHub Workflow by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/293
+  * scylla-doctor-cluster: exclude ScyllaLogsCollector from diff by default by @vreniers in https://github.com/scylladb/scylla-doctor/pull/304
+  * Collect OCI instance type and analyze recommended DenseIO.E5.Flex by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/311
+  * Skip system_auth RF checks for System-auth-2 by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/310
+  * OSSupportAnalyzer: check OS vs Scylla version by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/292
+  * Include shard to CPU mapping in vitals by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/314
+  * Add DiskPerformanceExceededCollector and DiskPerformanceExceededAnalyzer by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/317

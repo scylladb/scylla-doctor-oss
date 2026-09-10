@@ -20,10 +20,12 @@ import json
 import pytest
 import random
 
+import scylla_doctor
 from models.output_entry import OutputEntryType
 from utils import Executor
 from unittest.mock import patch
-from collectors_base import UnableToReadScyllaRestApi, UnsupportedRestApiEndpoint, CollectorStatus, CollectorResult
+from collectors_base import UnableToReadScyllaRestApi, UnsupportedRestApiEndpoint, CollectorStatus, CollectorResult, \
+    Collector
 from tests.helpers import DummyBaseCollector, DummyCollector, DummyFailedCollector, \
     DummyDependsOnFailedCollector, DummyCycle1Collector, DummyCycle2Collector, DummyRaisesCollector, \
     DummySkippedCollector, DummyDependsOnSkippedCollector, assert_output_gathered, DummyScyllaRestAPIAwareCollector
@@ -73,6 +75,23 @@ def test_config_skip(doctor_factory):
     doctor.run()
     for collector in doctor.collectors.values():
         assert collector.status == CollectorStatus.SKIPPED
+
+
+def test_discover_classes_is_cached():
+    """
+    _discover_classes() discovers once and returns the same cached lists on subsequent calls.
+    """
+    collectors_first, analyzers_first = scylla_doctor._discover_classes()
+    collectors_second, analyzers_second = scylla_doctor._discover_classes()
+
+    # Same objects returned -> discovery ran only once
+    assert collectors_first is collectors_second
+    assert analyzers_first is analyzers_second
+
+    # Discovery actually found real collector classes
+    assert len(collectors_first) > 0
+    for cls in collectors_first:
+        assert issubclass(cls, Collector)
 
 
 def test_collector_raises(doctor_factory):

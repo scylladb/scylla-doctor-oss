@@ -83,9 +83,19 @@ def test_get_config_value_fallback():
 def test_config_parameters_list_all_omits_run_only_sections(doctor_factory):
     doctor = doctor_factory(collectors=None, analyzers=None)
     params = doctor.config_parameters()
+    assert 'General' in params
+    assert 'include_output' in params['General']
     assert 'RAMAnalyzer' in params
     assert 'ClockSourceCollector' not in params
-    assert all(len(section) >= 2 for section in params.values())
+    component_sections = {name: section for name, section in params.items() if name != 'General'}
+    assert all(len(section) >= 2 for section in component_sections.values())
+
+
+def test_config_parameters_general_section(doctor_factory):
+    doctor = doctor_factory(collectors=[], analyzers=[])
+    params = doctor.config_parameters('General')
+    assert list(params['General']) == ['include_output']
+    assert 'unset (omitted)' in params['General']['include_output'].display_default()
 
 
 def test_print_config_parameters_text(doctor_factory):
@@ -152,6 +162,8 @@ def test_main_list_parameters_json_without_list_flag(capsys):
             scylla_doctor.main()
         assert exc_info.value.code == 0
         payload = json.loads(capsys.readouterr().out)
+        assert 'General' in payload
+        assert 'include_output' in payload['General']
         assert 'RAMAnalyzer' in payload
         assert 'ClockSourceCollector' not in payload
     finally:
