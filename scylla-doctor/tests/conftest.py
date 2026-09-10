@@ -51,8 +51,10 @@ def doctor_factory():
         if collectors is not None:
             doctor.collectors = OrderedDict()
             for collector in collectors:
-                doctor.collectors[collector.__name__] = collector(doctor.environment.configuration,
-                                                                  doctor.environment.paths)
+                instance = collector(doctor.environment.configuration, doctor.environment.paths)
+                # Tests assert on output entries; production Doctor still gates via should_store_output().
+                instance.set_store_output(True)
+                doctor.collectors[collector.__name__] = instance
         if analyzers is not None:
             doctor.analyzers = OrderedDict()
             for analyzer in analyzers:

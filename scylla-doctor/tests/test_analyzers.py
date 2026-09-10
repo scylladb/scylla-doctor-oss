@@ -19,6 +19,8 @@ import dataclasses
 import copy
 import json
 import random
+from unittest.mock import patch
+
 import pytest
 
 import analyzers
@@ -99,7 +101,7 @@ def test_CPUScalingAnalyzer():
 
     check_analyzer(analyzer, "CPUScalingCollector", [
         ({'scaling_governor': None},
-         AnalyzerResult(AnalyzerStatus.FAILED, "CPU does not support scaling")),
+         AnalyzerResult(AnalyzerStatus.SKIPPED, "CPU does not support scaling")),
         ({'scaling_governor': "powersave", 'services': {}},
          AnalyzerResult(AnalyzerStatus.FAILED, "CPU scaling setup was not done")),
         ({'scaling_governor': "powersave", 'services': {'cpufrequtils': {'active': True}}},
@@ -225,11 +227,15 @@ def test_DriverVersionAnalyzer():
         'DriverVersionAnalyzer': {
             'minimum_version': json.dumps({
                 'Python': '3.24.5',
-                'Go': 'v1.7'
+                'Go': 'v1.7',
+                'Rust': '0.13.2',
+                'CppRust': '1.0.0',
             }),
             'latest_version': json.dumps({
                 'Python': '3.26',
-                'Go': 'v1.8'
+                'Go': 'v1.8',
+                'Rust': '0.15.0',
+                'CppRust': '1.1.0',
             })
         }
     }
@@ -302,6 +308,40 @@ def test_DriverVersionAnalyzer():
                                                                   "is below the latest driver version 3.26")},
         {'client_connections': [{'driver_name': 'ScyllaDB Python Driver', 'driver_version': '3.26'}],
          'result': AnalyzerResult(AnalyzerStatus.PASSED, message="Client driver versions are within bounds.")},
+        # scylla-rust-driver (<= 0.13.2) and ScyllaDB Rust Driver (>= 0.14.0)
+        {'client_connections': [{'driver_name': 'scylla-rust-driver', 'driver_version': '0.12.0'}],
+         'result': AnalyzerResult(AnalyzerStatus.FAILED, message="ERROR: scylla-rust-driver with version 0.12.0 "
+                                                                 "is below the minimum driver version 0.13.2")},
+        {'client_connections': [{'driver_name': 'scylla-rust-driver', 'driver_version': '0.13.2'}],
+         'result': AnalyzerResult(AnalyzerStatus.WARNING, message="WARNING: scylla-rust-driver with version 0.13.2 "
+                                                                  "is below the latest driver version 0.15.0")},
+        {'client_connections': [{'driver_name': 'scylla-rust-driver', 'driver_version': '0.15.0'}],
+         'result': AnalyzerResult(AnalyzerStatus.PASSED, message="Client driver versions are within bounds.")},
+        {'client_connections': [{'driver_name': 'ScyllaDB Rust Driver', 'driver_version': '0.12.0'}],
+         'result': AnalyzerResult(AnalyzerStatus.FAILED, message="ERROR: ScyllaDB Rust Driver with version 0.12.0 "
+                                                                 "is below the minimum driver version 0.13.2")},
+        {'client_connections': [{'driver_name': 'ScyllaDB Rust Driver', 'driver_version': '0.13.2'}],
+         'result': AnalyzerResult(AnalyzerStatus.WARNING, message="WARNING: ScyllaDB Rust Driver with version 0.13.2 "
+                                                                  "is below the latest driver version 0.15.0")},
+        {'client_connections': [{'driver_name': 'ScyllaDB Rust Driver', 'driver_version': '0.15.0'}],
+         'result': AnalyzerResult(AnalyzerStatus.PASSED, message="Client driver versions are within bounds.")},
+        # cpp-rs-driver: historical "ScyllaDB Cpp-Rust Driver" and current "ScyllaDB CPP RS Driver"
+        {'client_connections': [{'driver_name': 'ScyllaDB Cpp-Rust Driver', 'driver_version': '0.5.0'}],
+         'result': AnalyzerResult(AnalyzerStatus.FAILED, message="ERROR: ScyllaDB Cpp-Rust Driver with version 0.5.0 "
+                                                                 "is below the minimum driver version 1.0.0")},
+        {'client_connections': [{'driver_name': 'ScyllaDB Cpp-Rust Driver', 'driver_version': '1.0.0'}],
+         'result': AnalyzerResult(AnalyzerStatus.WARNING, message="WARNING: ScyllaDB Cpp-Rust Driver with version "
+                                                                  "1.0.0 is below the latest driver version 1.1.0")},
+        {'client_connections': [{'driver_name': 'ScyllaDB Cpp-Rust Driver', 'driver_version': '1.1.0'}],
+         'result': AnalyzerResult(AnalyzerStatus.PASSED, message="Client driver versions are within bounds.")},
+        {'client_connections': [{'driver_name': 'ScyllaDB CPP RS Driver', 'driver_version': '0.5.0'}],
+         'result': AnalyzerResult(AnalyzerStatus.FAILED, message="ERROR: ScyllaDB CPP RS Driver with version 0.5.0 "
+                                                                 "is below the minimum driver version 1.0.0")},
+        {'client_connections': [{'driver_name': 'ScyllaDB CPP RS Driver', 'driver_version': '1.0.0'}],
+         'result': AnalyzerResult(AnalyzerStatus.WARNING, message="WARNING: ScyllaDB CPP RS Driver with version 1.0.0 "
+                                                                  "is below the latest driver version 1.1.0")},
+        {'client_connections': [{'driver_name': 'ScyllaDB CPP RS Driver', 'driver_version': '1.1.0'}],
+         'result': AnalyzerResult(AnalyzerStatus.PASSED, message="Client driver versions are within bounds.")},
     ]
 
     for driver_version in driver_version_tests:
@@ -352,6 +392,70 @@ def test_DriverVersionAnalyzer_AvailableAPI():
     check_analyzer(driver_version_analyzer, "ClientConnectionCollector", [
         (test_vitals, test_result),
     ], initial_vitals=vitals)
+
+
+def test_DriverVersionAnalyzer_ApiUsesClientDriverName():
+    """Version API is queried with the client-reported driver name, not a language alias."""
+    vitals = {
+        'ScyllaVersionCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'version': '2024.1.4'}, Output(), '')
+    }
+
+    rust_api_versions = [
+        {'version': '0.15.0'},
+        {'version': '0.13.2'},
+    ]
+    requested_driver_names = []
+
+    def mock_get_url_content(url, headers=None, data=None, timeout=3):
+        driver_name = (data or {}).get('driverName')
+        requested_driver_names.append(driver_name)
+        if driver_name == 'ScyllaDB Rust Driver':
+            return json.dumps(rust_api_versions)
+        return '[]'
+
+    driver_version_analyzer = analyzers.DriverVersionAnalyzer({})
+    with patch('analyzers.get_url_content', side_effect=mock_get_url_content):
+        check_analyzer(driver_version_analyzer, "ClientConnectionCollector", [
+            ({'127.0.0.1': [{'driver_name': 'ScyllaDB Rust Driver', 'driver_version': '0.12.0'}]},
+             AnalyzerResult(AnalyzerStatus.FAILED,
+                            message="ERROR: ScyllaDB Rust Driver with version 0.12.0 "
+                                    "is below the minimum driver version 0.13.2")),
+            ({'127.0.0.1': [{'driver_name': 'ScyllaDB Rust Driver', 'driver_version': '0.13.2'}]},
+             AnalyzerResult(AnalyzerStatus.WARNING,
+                            message="WARNING: ScyllaDB Rust Driver with version 0.13.2 "
+                                    "is below the latest driver version 0.15.0")),
+            ({'127.0.0.1': [{'driver_name': 'ScyllaDB Rust Driver', 'driver_version': '0.15.0'}]},
+             AnalyzerResult(AnalyzerStatus.PASSED,
+                            message="Client driver versions are within bounds.")),
+        ], initial_vitals=vitals)
+
+    assert requested_driver_names
+    assert set(requested_driver_names) == {'ScyllaDB Rust Driver'}
+
+
+def test_DriverVersionAnalyzer_UnindexedDriverAPI():
+    """
+    Default (empty) minimum_version/latest_version config forces an API lookup. A driver name the
+    backend hasn't indexed yet (empty JSON list response) must degrade to a WARNING, not a hard FAILED,
+    same as an unrecognized driver name.
+    """
+    vitals = {
+        'ScyllaVersionCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'version': '2024.1.4'}, Output(), '')
+    }
+
+    driver_version_analyzer = analyzers.DriverVersionAnalyzer({})
+    test_vitals = {'127.0.0.1': [{'driver_name': 'ScyllaDB CPP RS Driver', 'driver_version': '1.0.0'}]}
+    test_result = AnalyzerResult(AnalyzerStatus.WARNING,
+                                 message="WARNING: No version data available for driver: ScyllaDB CPP RS Driver")
+
+    with patch('analyzers.get_url_content', return_value='[]'):
+        check_analyzer(driver_version_analyzer, "ClientConnectionCollector", [
+            (test_vitals, test_result),
+        ], initial_vitals=vitals)
 
 
 def test_IOSetupAnalyzer():
@@ -583,28 +687,104 @@ def test_ChronyServicesAnalyzer():
     ])
 
 
-def test_OSSupportAnalyzer():
+def test_OSSupportAnalyzer(monkeypatch):
+    matrix = json.dumps({
+        "ScyllaDB Versions": [
+            {
+                "version": "ScyllaDB 2025.1",
+                "supported_OS": {
+                    "Ubuntu": ["22.04", "24.04"],
+                    "Debian": ["11", "12"],
+                    "Rocky / CentOS / RHEL": ["8", "9"],
+                    "Amazon Linux": ["2023"],
+                    "Fedora": ["41"],
+                },
+            },
+            {
+                "version": "Enterprise 2024.1",
+                "supported_OS": {
+                    "Ubuntu": ["22.04", "24.04*"],
+                    "Debian": ["11"],
+                    "Rocky / CentOS / RHEL": ["8", "9"],
+                    "Amazon Linux": [],
+                },
+            },
+        ]
+    })
+    monkeypatch.setattr(analyzers, 'get_url_content',
+                        lambda url: None if url == 'https://example.invalid/os-support.json' else matrix)
     analyzer = analyzers.OSSupportAnalyzer({})
     analyzer.analyze({})
-    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
-                           "Required OSCollector results not found")
+    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
+
+    scylla_2025 = CollectorResult(
+        CollectorStatus.PASSED, {'version': '2025.1.4', 'edition': 'enterprise'}, Output(), '')
+    scylla_2024 = CollectorResult(
+        CollectorStatus.PASSED, {'version': '2024.1.9', 'edition': 'enterprise'}, Output(), '')
 
     check_analyzer(analyzer, "OSCollector", [
         ({'name': "gentoo", 'version': '17.1', 'version_minor': "17.1"},
-         AnalyzerResult(AnalyzerStatus.FAILED, "is not officially supported")),
-        ({'name': "ubuntu", "version": "19.04", 'version_minor': "19.04"},
-         AnalyzerResult(AnalyzerStatus.FAILED, "is not officially supported")),
-        ({'name': "centos", 'version': "7", 'version_minor': "7.1"},
-         AnalyzerResult(AnalyzerStatus.FAILED, "is officially supported starting from")),
+         AnalyzerResult(AnalyzerStatus.FAILED, "is not officially supported for ScyllaDB 2025.1")),
+        ({'name': "ubuntu", "version": "20", 'version_minor': "20.04"},
+         AnalyzerResult(AnalyzerStatus.FAILED, "is not officially supported for ScyllaDB 2025.1")),
+        ({'name': "ubuntu", 'version': "22", 'version_minor': "22.04"},
+         AnalyzerResult(AnalyzerStatus.PASSED, "is officially supported for ScyllaDB 2025.1")),
         ({'name': "rhel", 'version': "8", 'version_minor': "8.9"},
-         AnalyzerResult(AnalyzerStatus.PASSED, "is officially supported")),
-        ({'name': "ubuntu", 'version': "20.04", 'version_minor': "20.04"},
-         AnalyzerResult(AnalyzerStatus.PASSED, "is officially supported")),
+         AnalyzerResult(AnalyzerStatus.PASSED, "is officially supported for ScyllaDB 2025.1")),
         ({'name': "rocky", 'version': "9", 'version_minor': "9.3"},
-         AnalyzerResult(AnalyzerStatus.PASSED, "is officially supported")),
-        ({'name': "rocky", 'version': "7", 'version_minor': "7.9"},
-         AnalyzerResult(AnalyzerStatus.FAILED, "is not officially supported")),
-    ])
+         AnalyzerResult(AnalyzerStatus.PASSED, "is officially supported for ScyllaDB 2025.1")),
+        ({'name': "rocky", 'version': "10", 'version_minor': "10.0"},
+         AnalyzerResult(AnalyzerStatus.FAILED, "is not officially supported for ScyllaDB 2025.1")),
+        ({'name': "centos", 'version': "7", 'version_minor': "7.9"},
+         AnalyzerResult(AnalyzerStatus.FAILED, "is not officially supported for ScyllaDB 2025.1")),
+        ({'name': "amzn", 'version': "2023", 'version_minor': "2023"},
+         AnalyzerResult(AnalyzerStatus.PASSED, "is officially supported for ScyllaDB 2025.1")),
+        ({'name': "fedora", 'version': "41", 'version_minor': "41"},
+         AnalyzerResult(AnalyzerStatus.PASSED, "is officially supported for ScyllaDB 2025.1")),
+    ], initial_vitals={'ScyllaVersionCollector': scylla_2025})
+
+    check_analyzer(analyzer, "OSCollector", [
+        ({'name': "ubuntu", 'version': "24", 'version_minor': "24.04"},
+         AnalyzerResult(AnalyzerStatus.WARNING, "is supported for Enterprise 2024.1 with restrictions")),
+        ({'name': "amzn", 'version': "2023", 'version_minor': "2023"},
+         AnalyzerResult(AnalyzerStatus.FAILED, "is not officially supported for Enterprise 2024.1")),
+        ({'name': "debian", 'version': "11", 'version_minor': "11"},
+         AnalyzerResult(AnalyzerStatus.PASSED, "is officially supported for Enterprise 2024.1")),
+    ], initial_vitals={'ScyllaVersionCollector': scylla_2024})
+
+    check_analyzer(analyzer, "ScyllaVersionCollector", [
+        ({'version': "6.2.0", 'edition': 'oss'},
+         AnalyzerResult(AnalyzerStatus.SKIPPED, "No OS support matrix entry for Scylla version 6.2.0")),
+        ({'version': "2025.1.dev", 'edition': 'development'},
+         AnalyzerResult(AnalyzerStatus.PASSED, "is officially supported for ScyllaDB 2025.1")),
+    ], initial_vitals={
+        'OSCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'name': "ubuntu", 'version': "22", 'version_minor': "22.04"}, Output(), ''),
+    })
+
+    monkeypatch.setattr(analyzers, 'get_url_content', lambda *args, **kwargs: None)
+    fetch_fail = analyzers.OSSupportAnalyzer({
+        'OSSupportAnalyzer': {'os_support_url': 'https://example.invalid/os-support.json'}
+    })
+    fetch_fail.analyze({
+        'OSCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'name': "ubuntu", 'version': "22", 'version_minor': "22.04"}, Output(), ''),
+        'ScyllaVersionCollector': scylla_2025,
+    })
+    assert_analyzer_result(fetch_fail, AnalyzerStatus.SKIPPED, "Cannot retrieve OS support matrix")
+
+    bad_entry_payload = json.dumps({"ScyllaDB Versions": [{"version": "ScyllaDB 2025.1"}]})
+    monkeypatch.setattr(analyzers, 'get_url_content', lambda url: bad_entry_payload)
+    bad_entry = analyzers.OSSupportAnalyzer({})
+    bad_entry.analyze({
+        'OSCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'name': "ubuntu", 'version': "22", 'version_minor': "22.04"}, Output(), ''),
+        'ScyllaVersionCollector': scylla_2025,
+    })
+    assert_analyzer_result(bad_entry, AnalyzerStatus.FAILED, "invalid supported_OS")
 
 
 def test_PerftuneAnalyzer():
@@ -1149,15 +1329,53 @@ def test_RAIDSetupAnalyzer():
     }
 
     check_analyzer(analyzer, "RAIDSetupCollector", [
-        ({'/proc/mdstat': ["Personalities :"]},
+        ({'personalities': [], 'arrays': {}, 'unused_devices': []},
          AnalyzerResult(AnalyzerStatus.PASSED, "No RAID")),
-        ({'/proc/mdstat': ["md1 : active raid1 nvme0n1p6"]},
+        ({'personalities': ['raid1'],
+          'arrays': {'md1': {'state': 'active', 'level': 'raid1', 'members': ['nvme0n1p6']}},
+          'unused_devices': []},
          AnalyzerResult(AnalyzerStatus.WARNING, "RAID1 detected ")),
-        ({'/proc/mdstat': ["md1 : active raid0 nvme0n1p6"]},
+        ({'personalities': ['raid0'],
+          'arrays': {'md1': {'state': 'active', 'level': 'raid0', 'members': ['nvme0n1p6']}},
+          'unused_devices': []},
          AnalyzerResult(AnalyzerStatus.PASSED, "RAID0")),
-        ({'/proc/mdstat': ["md1: active raid1 nvme0n1p6", "md1 : active raid4 nvme0n1p6"]},
+        ({'personalities': ['raid1', 'raid4'],
+          'arrays': {
+              'md1': {'state': 'active', 'level': 'raid1', 'members': ['nvme0n1p6']},
+              'md2': {'state': 'active', 'level': 'raid4', 'members': ['nvme0n1p6']},
+          },
+          'unused_devices': []},
          AnalyzerResult(AnalyzerStatus.WARNING, "Funny RAID")),
     ], initial_vitals=vitals)
+
+    # Whole-disk device must match its partition member (nvme0n1 ↔ nvme0n1p6).
+    vitals_parent = {
+        'StorageConfigurationCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'data_file_directories': {'/my/path': {'devices': {'nvme': {'nvme0n1'}, 'non_nvme': {}}}}}, Output(), '')
+    }
+    check_analyzer(analyzer, "RAIDSetupCollector", [
+        ({'personalities': ['raid0'],
+          'arrays': {'md1': {'state': 'active', 'level': 'raid0', 'members': ['nvme0n1p6']}},
+          'unused_devices': []},
+         AnalyzerResult(AnalyzerStatus.PASSED, "RAID0")),
+    ], initial_vitals=vitals_parent)
+
+    # Sibling partitions must not substring-match (sda1 must not match device sda12).
+    vitals_sibling = {
+        'StorageConfigurationCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'data_file_directories': {'/my/path': {'devices': {'nvme': {}, 'non_nvme': {'sda12'}}}}}, Output(), '')
+    }
+    check_analyzer(analyzer, "RAIDSetupCollector", [
+        ({'personalities': ['raid0', 'raid1'],
+          'arrays': {
+              'md0': {'state': 'active', 'level': 'raid0', 'members': ['sda1']},
+              'md1': {'state': 'active', 'level': 'raid1', 'members': ['sda12']},
+          },
+          'unused_devices': []},
+         AnalyzerResult(AnalyzerStatus.WARNING, "RAID1 detected")),
+    ], initial_vitals=vitals_sibling)
 
 
 def test_UnusedNVMeDevicesAnalyzer():
@@ -1179,6 +1397,32 @@ def test_UnusedNVMeDevicesAnalyzer():
           'used_nvme_devices': ['nvme0n1'],
           'unused_nvme_devices': ['nvme1n1', 'nvme2n1']},
          AnalyzerResult(AnalyzerStatus.WARNING, "Unused NVMe device(s) detected: nvme1n1, nvme2n1")),
+    ])
+
+
+def test_DiskPerformanceExceededAnalyzer():
+    analyzer = analyzers.DiskPerformanceExceededAnalyzer({})
+    analyzer.analyze({})
+    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
+                           "Required DiskPerformanceExceededCollector results not found")
+
+    check_analyzer(analyzer, "DiskPerformanceExceededCollector", [
+        ({'devices': {'nvme0n1': {'ec2_instance_performance_exceeded_iops': 0,
+                                  'ec2_instance_performance_exceeded_tp': 0}}},
+         AnalyzerResult(AnalyzerStatus.PASSED, "No performance limits were exceeded on 1 NVMe device(s)")),
+        ({'devices': {'nvme0n1': {'ec2_instance_performance_exceeded_iops': 15,
+                                  'ec2_instance_performance_exceeded_tp': 0}}},
+         AnalyzerResult(AnalyzerStatus.WARNING,
+                        "nvme0n1: ec2_instance_performance_exceeded_iops=15 microseconds")),
+    ])
+
+    # A threshold tolerates counters up to its value.
+    analyzer = analyzers.DiskPerformanceExceededAnalyzer({'DiskPerformanceExceededAnalyzer': {'threshold': '20'}})
+    check_analyzer(analyzer, "DiskPerformanceExceededCollector", [
+        ({'devices': {'nvme0n1': {'ec2_instance_performance_exceeded_iops': 15}}},
+         AnalyzerResult(AnalyzerStatus.PASSED, "No performance limits were exceeded")),
+        ({'devices': {'nvme0n1': {'ec2_instance_performance_exceeded_iops': 21}}},
+         AnalyzerResult(AnalyzerStatus.WARNING, "exceeded_iops=21 microseconds")),
     ])
 
 
@@ -1252,7 +1496,10 @@ def test_ScyllaClusterSystemKeyspacesReplicationAnalyzer():
     vitals = {
         'ScyllaClusterStatusCollector': CollectorResult(
             CollectorStatus.PASSED,
-            {'up': ["127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4"], 'down': []}, Output(), '')
+            {'up': ["127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4"], 'down': []}, Output(), ''),
+        'SystemTopologyCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'system_topology_rows': [], 'consistent_topology_supported': False}, Output(), ''),
     }
 
     replication = {
@@ -1287,6 +1534,93 @@ def test_ScyllaClusterSystemKeyspacesReplicationAnalyzer():
         (bad_keyspaces_with_audit,
          AnalyzerResult(AnalyzerStatus.FAILED, "audit keyspace has replication factor 1")),
     ], initial_vitals=vitals)
+
+
+def test_ScyllaClusterSystemKeyspacesReplicationAnalyzer_system_auth_v2():
+    analyzer = analyzers.ScyllaClusterSystemKeyspacesReplicationAnalyzer({})
+    nodes = CollectorResult(
+        CollectorStatus.PASSED,
+        {'up': ["127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4"], 'down': []}, Output(), '')
+    nts = {
+        'class': 'org.apache.cassandra.locator.NetworkTopologyStrategy',
+        'us-central1_us': '3',
+        'us-east4_us': '3'
+    }
+    legacy_auth = {
+        'class': 'org.apache.cassandra.locator.SimpleStrategy',
+        'replication_factor': '1',
+    }
+    good = {name: {'replication': repr(nts)}
+            for name in analyzer._ScyllaClusterSystemKeyspacesReplicationAnalyzer__keyspaces
+            if name != "system_auth"}
+    good_with_legacy_auth = dict(good, system_auth={'replication': repr(legacy_auth)})
+    good_with_auth_v2 = dict(
+        good_with_legacy_auth,
+        system_auth_v2={'replication': "{'class': 'org.apache.cassandra.locator.LocalStrategy'}"},
+    )
+    good_auth_v2_no_legacy = dict(
+        good,
+        system_auth_v2={'replication': "{'class': 'org.apache.cassandra.locator.LocalStrategy'}"},
+    )
+    topology_unknown = CollectorResult(
+        CollectorStatus.PASSED,
+        {'system_topology_rows': [], 'consistent_topology_supported': None}, Output(), '')
+    topology_not_supported = CollectorResult(
+        CollectorStatus.PASSED,
+        {'system_topology_rows': [], 'consistent_topology_supported': False}, Output(), '')
+    topology_done = CollectorResult(
+        CollectorStatus.PASSED,
+        {'system_topology_rows': [{"upgrade_state": "done", "host_id": "1"},
+                                  {"upgrade_state": "done", "host_id": "2"}],
+         'consistent_topology_supported': True}, Output(), '')
+    topology_not_done = CollectorResult(
+        CollectorStatus.PASSED,
+        {'system_topology_rows': [{"upgrade_state": "not done", "host_id": "1"}],
+         'consistent_topology_supported': True}, Output(), '')
+
+    # Consistent Topology not supported: leftover system_auth still needs NTS unless system_auth_v2 exists
+    check_analyzer(analyzer, "ScyllaClusterSystemKeyspacesCollector", [
+        (good_with_legacy_auth,
+         AnalyzerResult(AnalyzerStatus.FAILED, "system_auth keyspace is not using")),
+        (good_with_auth_v2,
+         AnalyzerResult(AnalyzerStatus.PASSED, "All system keyspaces")),
+        (good_auth_v2_no_legacy,
+         AnalyzerResult(AnalyzerStatus.PASSED, "All system keyspaces")),
+    ], initial_vitals={
+        'ScyllaClusterStatusCollector': nodes,
+        'SystemTopologyCollector': topology_not_supported,
+    })
+
+    # Consistent Topology upgrade finished: leftover SimpleStrategy RF=1 must PASS
+    check_analyzer(analyzer, "ScyllaClusterSystemKeyspacesCollector", [
+        (good_with_legacy_auth,
+         AnalyzerResult(AnalyzerStatus.PASSED, "All system keyspaces")),
+        (good,
+         AnalyzerResult(AnalyzerStatus.PASSED, "All system keyspaces")),
+    ], initial_vitals={
+        'ScyllaClusterStatusCollector': nodes,
+        'SystemTopologyCollector': topology_done,
+    })
+
+    # Consistent Topology upgrade not finished: still auth-v1, must FAIL
+    check_analyzer(analyzer, "ScyllaClusterSystemKeyspacesCollector", [
+        (good_with_legacy_auth,
+         AnalyzerResult(AnalyzerStatus.FAILED, "system_auth keyspace is not using")),
+    ], initial_vitals={
+        'ScyllaClusterStatusCollector': nodes,
+        'SystemTopologyCollector': topology_not_done,
+    })
+
+    # Topology state unavailable: never skip the checks (no version fallback)
+    check_analyzer(analyzer, "ScyllaClusterSystemKeyspacesCollector", [
+        (good_with_legacy_auth,
+         AnalyzerResult(AnalyzerStatus.FAILED, "system_auth keyspace is not using")),
+        (good_with_auth_v2,
+         AnalyzerResult(AnalyzerStatus.PASSED, "All system keyspaces")),
+    ], initial_vitals={
+        'ScyllaClusterStatusCollector': nodes,
+        'SystemTopologyCollector': topology_unknown,
+    })
 
 
 def test_ScyllaClusterSchemaAnalyzer():
@@ -1325,13 +1659,28 @@ def test_ScyllaLimitNOFILEAnalyzer():
                            "Required ScyllaLimitNOFILECollector results not found")
 
     check_analyzer(analyzer, "ScyllaLimitNOFILECollector", [
-        ({'limitnofile': 5000},
+        ({'limitnofile': "5000"},
          AnalyzerResult(AnalyzerStatus.FAILED, "minimum value")),
-        ({'limitnofile': 15000},
+        ({'limitnofile': "15000"},
          AnalyzerResult(AnalyzerStatus.WARNING, "recommended value")),
-        ({'limitnofile': 1000000},
+        ({'limitnofile': "1000000"},
          AnalyzerResult(AnalyzerStatus.PASSED, "greater than")),
-    ])
+        # 'LimitNOFILE=infinity' is scylla-server.service's shipped default (DOCTOR-119). It resolves to the
+        # 'fs.nr_open' ceiling systemd clamps it to, and is held to the same thresholds.
+        ({'limitnofile': "infinity"},
+         AnalyzerResult(AnalyzerStatus.PASSED, "'infinity', effectively fs.nr_open (1048576), is greater than")),
+    ], initial_vitals={
+        'SysctlCollector': CollectorResult(CollectorStatus.PASSED, {'fs.nr_open': 1048576}, Output(), '')
+    })
+
+    # On an 'infinity' host a pathologically low 'fs.nr_open' is the effective limit, and must still FAIL
+    check_analyzer(analyzer, "SysctlCollector", [
+        ({'fs.nr_open': 8192},
+         AnalyzerResult(AnalyzerStatus.FAILED, "'infinity', effectively fs.nr_open (8192), is less than 10000")),
+    ], initial_vitals={
+        'ScyllaLimitNOFILECollector': CollectorResult(
+            CollectorStatus.PASSED, {'limitnofile': "infinity"}, Output(), '')
+    })
 
 
 def test_FSFILEMAXAnalyzer():
@@ -1342,7 +1691,7 @@ def test_FSFILEMAXAnalyzer():
     vitals = {
         'ScyllaLimitNOFILECollector': CollectorResult(
             CollectorStatus.PASSED,
-            {'limitnofile': 1000000}, Output(), '')
+            {'limitnofile': "1000000"}, Output(), '')
     }
 
     check_analyzer(analyzer, "SysctlCollector", [
@@ -1354,6 +1703,17 @@ def test_FSFILEMAXAnalyzer():
          AnalyzerResult(AnalyzerStatus.PASSED, "greater than recommended value")),
     ], initial_vitals=vitals)
 
+    # 'LimitNOFILE=infinity' resolves to 'fs.nr_open', so that is what 'fs.file-max' is compared against
+    check_analyzer(analyzer, "SysctlCollector", [
+        ({'fs.file-max': 50000, 'fs.nr_open': 1048576},
+         AnalyzerResult(AnalyzerStatus.FAILED, "less than LimitNOFILE value 1048576")),
+        ({'fs.file-max': 10000000000000000000, 'fs.nr_open': 1048576},
+         AnalyzerResult(AnalyzerStatus.PASSED, "greater than recommended value")),
+    ], initial_vitals={
+        'ScyllaLimitNOFILECollector': CollectorResult(
+            CollectorStatus.PASSED, {'limitnofile': "infinity"}, Output(), '')
+    })
+
 
 def test_FSNROPENAnalyzer():
     analyzer = analyzers.FSNROPENAnalyzer({})
@@ -1363,7 +1723,7 @@ def test_FSNROPENAnalyzer():
     vitals = {
         'ScyllaLimitNOFILECollector': CollectorResult(
             CollectorStatus.PASSED,
-            {'limitnofile': 1000000}, Output(), '')
+            {'limitnofile': "1000000"}, Output(), '')
     }
 
     check_analyzer(analyzer, "SysctlCollector", [
@@ -1374,6 +1734,17 @@ def test_FSNROPENAnalyzer():
         ({'fs.nr_open': 2000000000},
          AnalyzerResult(AnalyzerStatus.PASSED, "greater than recommended value")),
     ], initial_vitals=vitals)
+
+    # 'LimitNOFILE=infinity' resolves to 'fs.nr_open' itself, so it can never be below it
+    check_analyzer(analyzer, "SysctlCollector", [
+        ({'fs.nr_open': 50000},
+         AnalyzerResult(AnalyzerStatus.WARNING, "less than recommended value")),
+        ({'fs.nr_open': 2000000000},
+         AnalyzerResult(AnalyzerStatus.PASSED, "greater than recommended value")),
+    ], initial_vitals={
+        'ScyllaLimitNOFILECollector': CollectorResult(
+            CollectorStatus.PASSED, {'limitnofile': "infinity"}, Output(), '')
+    })
 
 
 def test_ScyllaInternodeCompressionAnalyzer():
@@ -1610,6 +1981,10 @@ def test_ScyllaSeedsAnalyzer():
          AnalyzerResult(AnalyzerStatus.WARNING, "Some seeds are unreachable")),
         ({'localhost': 0, '127.0.0.1': 0},
          AnalyzerResult(AnalyzerStatus.PASSED, "All seeds are reachable")),
+        ({'2001:db8::1': 0, '[::1]': 0},
+         AnalyzerResult(AnalyzerStatus.PASSED, "All seeds are reachable")),
+        ({'2001:db8::1': 111},
+         AnalyzerResult(AnalyzerStatus.WARNING, "Some seeds are unreachable")),
 
     ])
 
@@ -1927,6 +2302,10 @@ def test_NodeInstanceTypeAnalyzer():
         ({'provider': "AWS", 'instance_type': "i8ge.48xlarge"},
          AnalyzerResult(AnalyzerStatus.PASSED, "listed as recommended")),
         ({'provider': "GCP", 'instance_type': "Something fictional"},
+         AnalyzerResult(AnalyzerStatus.WARNING, "not listed as recommended")),
+        ({'provider': "OCI", 'instance_type': "VM.DenseIO.E5.Flex"},
+         AnalyzerResult(AnalyzerStatus.PASSED, "listed as recommended")),
+        ({'provider': "OCI", 'instance_type': "VM.Standard.E5.Flex"},
          AnalyzerResult(AnalyzerStatus.WARNING, "not listed as recommended")),
     ])
 
@@ -3380,6 +3759,199 @@ def test_BrokenRolePermissionsAnalyzer_reports_all_broken_roles():
     assert "role_b" not in analyzer.message
 
 
+# AuthenticationAnalyzer ######################################################
+###############################################################################
+
+def _make_authentication_vitals(authenticator, roles, credentials):
+    # The analyzer reads the effective in-memory authenticator from system.config, whose rows are
+    # keyed by parameter name with the value under 'value'.
+    return {
+        "SystemConfigCollector": CollectorResult(
+            CollectorStatus.PASSED, {'authenticator': {'value': authenticator}}, Output(), ''),
+        "RolesCollector": CollectorResult(CollectorStatus.PASSED, roles, Output(), ''),
+        "DefaultCredentialsCollector": CollectorResult(
+            CollectorStatus.PASSED, credentials, Output(), ''),
+    }
+
+
+def test_AuthenticationAnalyzer_passes_when_secure():
+    """
+    Enabled auth, no default role, default user login denied -> PASSED.
+    """
+    analyzer = analyzers.AuthenticationAnalyzer({})
+    vitals = _make_authentication_vitals(
+        'PasswordAuthenticator',
+        [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
+        {'default_user_login': 'denied'},
+    )
+    analyzer.analyze(vitals)
+    assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, "Authentication is enabled")
+    assert "Default role 'cassandra' is not present" in analyzer.message
+
+
+@pytest.mark.parametrize("authenticator", [
+    'PasswordAuthenticator',
+    'org.apache.cassandra.auth.PasswordAuthenticator',
+    'CertificateOrPasswordAuthenticator',
+    'com.scylladb.auth.CertificateOrPasswordAuthenticator',
+])
+def test_AuthenticationAnalyzer_accepts_authenticator_name_aliases(authenticator):
+    """
+    Scylla resolves the authenticator by its case-insensitive short name, so FQN and short
+    spellings of a password-capable authenticator must be recognized as enabled authentication.
+    """
+    analyzer = analyzers.AuthenticationAnalyzer({})
+    vitals = _make_authentication_vitals(
+        authenticator,
+        [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
+        {'default_user_login': 'denied'},
+    )
+    analyzer.analyze(vitals)
+    assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, "Authentication is enabled")
+
+
+def test_AuthenticationAnalyzer_fails_when_auth_disabled():
+    """
+    AllowAllAuthenticator is a hard failure even if default role is absent.
+    """
+    analyzer = analyzers.AuthenticationAnalyzer({})
+    vitals = _make_authentication_vitals(
+        'AllowAllAuthenticator',
+        [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
+        {'default_user_login': 'not_verified'},
+    )
+    analyzer.analyze(vitals)
+    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "Authentication is disabled")
+
+
+def test_AuthenticationAnalyzer_fails_when_default_role_present():
+    """
+    Presence of the default cassandra role fails the check.
+    """
+    analyzer = analyzers.AuthenticationAnalyzer({})
+    vitals = _make_authentication_vitals(
+        'PasswordAuthenticator',
+        [{'role': 'cassandra', 'is_superuser': 'True', 'can_login': 'True'}],
+        {'default_user_login': 'denied'},
+    )
+    analyzer.analyze(vitals)
+    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "Default role 'cassandra' is still present")
+
+
+def test_AuthenticationAnalyzer_fails_when_default_user_can_log_in():
+    """
+    Allowed cassandra/cassandra login fails, and subsumes the default-role finding instead of
+    reporting the same problem twice.
+    """
+    analyzer = analyzers.AuthenticationAnalyzer({})
+    vitals = _make_authentication_vitals(
+        'PasswordAuthenticator',
+        [{'role': 'cassandra', 'is_superuser': 'True', 'can_login': 'True'}],
+        {'default_user_login': 'allowed'},
+    )
+    analyzer.analyze(vitals)
+    assert_analyzer_result(
+        analyzer, AnalyzerStatus.FAILED,
+        "Default user 'cassandra' can still log in with password 'cassandra'",
+    )
+    assert "is still present" not in analyzer.message
+
+
+def test_AuthenticationAnalyzer_warns_on_transitional_authenticator():
+    """
+    TransitionalAuthenticator yields WARNING when no other failures are present. The credential
+    probe is skipped under transitional auth (bad passwords fall back to anonymous access), so
+    ``default_user_login`` is ``not_verified`` here.
+    """
+    analyzer = analyzers.AuthenticationAnalyzer({})
+    vitals = _make_authentication_vitals(
+        'com.scylladb.auth.TransitionalAuthenticator',
+        [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
+        {'default_user_login': 'not_verified'},
+    )
+    analyzer.analyze(vitals)
+    assert_analyzer_result(analyzer, AnalyzerStatus.WARNING, "Authentication is transitional")
+    assert "prefer a non-transitional authenticator" in analyzer.message
+
+
+def test_AuthenticationAnalyzer_fails_on_transitional_authenticator_if_probe_ever_reports_allowed():
+    """
+    Belt-and-suspenders: even if some future probe ever reports allowed under transitional auth,
+    that must still be a hard FAIL, not merely a WARNING.
+    """
+    analyzer = analyzers.AuthenticationAnalyzer({})
+    vitals = _make_authentication_vitals(
+        'com.scylladb.auth.TransitionalAuthenticator',
+        [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
+        {'default_user_login': 'allowed'},
+    )
+    analyzer.analyze(vitals)
+    assert_analyzer_result(
+        analyzer, AnalyzerStatus.FAILED,
+        "Default user 'cassandra' can still log in with password 'cassandra'",
+    )
+
+
+@pytest.mark.parametrize("config_data", [
+    {},
+    {'authenticator': {}},
+    {'authenticator': {'value': ''}},
+    {'authenticator': {'value': None}},
+])
+def test_AuthenticationAnalyzer_fails_when_authenticator_is_missing(config_data):
+    """
+    An authenticator that could not be read from system.config must not be assumed to be any
+    particular authenticator: the analyzer fails instead.
+    """
+    analyzer = analyzers.AuthenticationAnalyzer({})
+    vitals = {
+        "SystemConfigCollector": CollectorResult(CollectorStatus.PASSED, config_data, Output(), ''),
+        "RolesCollector": CollectorResult(
+            CollectorStatus.PASSED, [{'role': 'cassandra', 'is_superuser': 'True', 'can_login': 'True'}],
+            Output(), ''),
+        "DefaultCredentialsCollector": CollectorResult(
+            CollectorStatus.PASSED, {'default_user_login': 'not_verified'}, Output(), ''),
+    }
+    analyzer.analyze(vitals)
+    assert_analyzer_result(
+        analyzer, AnalyzerStatus.FAILED, "The 'authenticator' parameter is missing from system.config")
+    assert "Authentication is disabled" not in analyzer.message
+
+
+@pytest.mark.parametrize("authenticator", [
+    'CertificateAuthenticator',
+    'com.scylladb.auth.CertificateAuthenticator',
+    'SaslauthdAuthenticator',
+    'com.scylladb.auth.SaslauthdAuthenticator',
+])
+def test_AuthenticationAnalyzer_passes_for_known_non_password_authenticators(authenticator):
+    """
+    Certificate-only and saslauthd authenticators enable auth without password login probes.
+    """
+    analyzer = analyzers.AuthenticationAnalyzer({})
+    vitals = _make_authentication_vitals(
+        authenticator,
+        [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
+        {'default_user_login': 'not_verified'},
+    )
+    analyzer.analyze(vitals)
+    assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, "Authentication is enabled")
+
+
+def test_AuthenticationAnalyzer_fails_on_unrecognized_authenticator():
+    """
+    Typos / unknown authenticator class names must not be reported as enabled authentication.
+    """
+    analyzer = analyzers.AuthenticationAnalyzer({})
+    vitals = _make_authentication_vitals(
+        'MistypedAuthenticator',
+        [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
+        {'default_user_login': 'not_verified'},
+    )
+    analyzer.analyze(vitals)
+    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "Unrecognized authenticator")
+
+
 def _make_stcs_vitals(schema: dict) -> dict:
     return {"ScyllaClusterTablesDescriptionCollector": CollectorResult(CollectorStatus.PASSED, schema, Output(), '')}
 
@@ -3603,8 +4175,18 @@ def test_ZstdCompressionLevelAnalyzer_skips_non_numeric_level():
     assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, _zstd_level_success_message())
 
 
-def _make_ks_replication_vitals(schema: dict) -> dict:
-    return {"ScyllaClusterSystemKeyspacesCollector": CollectorResult(CollectorStatus.PASSED, schema, Output(), '')}
+def _make_ks_replication_vitals(schema: dict,
+                                consistent_topology_supported: Optional[bool] = None,
+                                consistent_topology_done: bool = True) -> dict:
+    rows = [{"upgrade_state": "done" if consistent_topology_done else "not done", "host_id": "1"}] \
+        if consistent_topology_supported else []
+    return {
+        "ScyllaClusterSystemKeyspacesCollector": CollectorResult(CollectorStatus.PASSED, schema, Output(), ''),
+        "SystemTopologyCollector": CollectorResult(
+            CollectorStatus.PASSED,
+            {'system_topology_rows': rows, 'consistent_topology_supported': consistent_topology_supported},
+            Output(), ''),
+    }
 
 
 def _ks_replication_error_message(ks: str, actual: str, expected: str) -> str:
@@ -3644,6 +4226,7 @@ def test_ScyllaKeyspacesReplicationAnalyzer_all_ok():
         "system_schema": {"replication": "{'class': 'org.apache.cassandra.locator.LocalStrategy'}"},
         "system_replicated_keys": {"replication": "{'class': 'org.apache.cassandra.locator.EverywhereStrategy'}"},
         "system_distributed_everywhere": {"replication": "{'class': 'org.apache.cassandra.locator.EverywhereStrategy'}"},  # noqa: E501
+        "system_auth_v2": {"replication": "{'class': 'org.apache.cassandra.locator.LocalStrategy'}"},
         "my_ks": {"replication": "{'class': 'org.apache.cassandra.locator.NetworkTopologyStrategy', 'dc1': '3'}"},
     }
     analyzer.analyze(_make_ks_replication_vitals(schema))
@@ -3690,3 +4273,88 @@ def test_ScyllaKeyspacesReplicationAnalyzer_missing_replication_field():
     analyzer.analyze(_make_ks_replication_vitals(schema))
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            _ks_replication_error_message("my_ks", "", "NetworkTopologyStrategy"))
+
+
+def test_ScyllaKeyspacesReplicationAnalyzer_system_auth_v2_skips_legacy_auth():
+    """
+    system_auth_v2 uses LocalStrategy; leftover system_auth strategy is ignored.
+    """
+    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    schema = {
+        "system_auth_v2": {"replication": "{'class': 'org.apache.cassandra.locator.LocalStrategy'}"},
+        "system_auth": {
+            "replication": "{'class': 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor': '1'}"
+        },
+    }
+    analyzer.analyze(_make_ks_replication_vitals(schema))
+    assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, _ks_replication_success_message())
+
+
+def test_ScyllaKeyspacesReplicationAnalyzer_topology_done_leftover_system_auth():
+    """
+    GA System-auth-2 has no system_auth_v2; with Consistent Topology done, leftover
+    SimpleStrategy system_auth is ignored.
+    """
+    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    schema = {
+        "system_auth": {
+            "replication": "{'class': 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor': '1'}"
+        },
+    }
+    analyzer.analyze(_make_ks_replication_vitals(schema, consistent_topology_supported=True))
+    assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, _ks_replication_success_message())
+
+
+def test_ScyllaKeyspacesReplicationAnalyzer_topology_not_done_legacy_system_auth():
+    """
+    Consistent Topology upgrade not finished: still auth-v1, must FAIL.
+    """
+    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    schema = {
+        "system_auth": {
+            "replication": "{'class': 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor': '1'}"
+        },
+    }
+    analyzer.analyze(_make_ks_replication_vitals(
+        schema, consistent_topology_supported=True, consistent_topology_done=False))
+    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
+                           _ks_replication_error_message(
+                               "system_auth",
+                               "org.apache.cassandra.locator.SimpleStrategy",
+                               "NetworkTopologyStrategy"))
+
+
+def test_ScyllaKeyspacesReplicationAnalyzer_no_topology_signal_legacy_system_auth():
+    """
+    No Consistent Topology signal (unsupported or unavailable): leftover SimpleStrategy
+    system_auth still fails - version is never used as a fallback.
+    """
+    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    schema = {
+        "system_auth": {
+            "replication": "{'class': 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor': '1'}"
+        },
+    }
+    for supported in (None, False):
+        analyzer.analyze(_make_ks_replication_vitals(schema, consistent_topology_supported=supported))
+        assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
+                               _ks_replication_error_message(
+                                   "system_auth",
+                                   "org.apache.cassandra.locator.SimpleStrategy",
+                                   "NetworkTopologyStrategy"))
+
+
+def test_ScyllaKeyspacesReplicationAnalyzer_system_auth_v2_wrong_strategy():
+    """
+    system_auth_v2 must use LocalStrategy.
+    """
+    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    schema = {
+        "system_auth_v2": {"replication": "{'class': 'org.apache.cassandra.locator.NetworkTopologyStrategy'}"},
+    }
+    analyzer.analyze(_make_ks_replication_vitals(schema))
+    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
+                           _ks_replication_error_message(
+                               "system_auth_v2",
+                               "org.apache.cassandra.locator.NetworkTopologyStrategy",
+                               "LocalStrategy"))

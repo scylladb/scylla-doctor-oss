@@ -16,10 +16,12 @@
 # along with Scylla Doctor.  If not, see <http://www.gnu.org/licenses/>.
 
 import copy
+import json
 import tests.helpers
 import numbers
 import os
 import re
+import socket
 from typing import Tuple, List, Dict
 from unittest.mock import patch, Mock
 
@@ -1333,7 +1335,10 @@ def test_RAIDSetupCollector(doctor_factory):
     # /proc/mdstat is only present when the md kernel module is available - absence is a valid SKIPPED outcome.
     if os.path.isfile("/proc/mdstat"):
         assert result.status == CollectorStatus.PASSED, result.message
-        assert '/proc/mdstat' in result.data
+        assert set(result.data) == {'personalities', 'arrays', 'unused_devices'}
+        assert isinstance(result.data['personalities'], list)
+        assert isinstance(result.data['arrays'], dict)
+        assert isinstance(result.data['unused_devices'], list)
     else:
         assert result.status == CollectorStatus.SKIPPED, result.message
         assert "not present" in result.message
@@ -1355,20 +1360,129 @@ def test_RAIDSetupCollector_passes_when_mdstat_present(doctor_factory):
     doctor = doctor_factory(collectors=[collectors.RAIDSetupCollector])
     collector = doctor.collectors['RAIDSetupCollector']
 
-    mdstat_content = ["Personalities : [raid1]\n", "md0 : active raid1 sda1[0] sdb1[1]\n"]
+    mdstat_content = [
+        "Personalities : [raid1]\n",
+        "md0 : active raid1 sda1[0] sdb1[1]\n",
+        "      1024 blocks super 1.2 512k chunks\n",
+        "\n",
+        "unused devices: <none>\n",
+    ]
     with patch.object(Executor, 'read_file_content', return_value=mdstat_content):
         collector._collect({})
 
     assert collector.status == CollectorStatus.PASSED, collector.result.message
-    assert collector.result.data['/proc/mdstat'] == mdstat_content
+    assert collector.result.data == {
+        'personalities': ['raid1'],
+        'arrays': {
+            'md0': {
+                'state': 'active',
+                'level': 'raid1',
+                'members': ['sda1', 'sdb1'],
+            }
+        },
+        'unused_devices': [],
+    }
+    # Structured data is intended for cluster drift; do not mask the whole collector.
+    assert collector.mask == []
+
+
+def test_RAIDSetupCollector_parse_sorts_members_for_comparability():
+    """Member order in /proc/mdstat can differ across nodes; parsed data must not."""
+    content_a = [
+        "Personalities : [raid0] \n",
+        "md0 : active raid0 nvme0n2[1] nvme0n1[0]\n",
+        "      786167808 blocks super 1.2 1024k chunks\n",
+        "\n",
+        "unused devices: <none>\n",
+    ]
+    content_b = [
+        "Personalities : [raid0]\n",
+        "md0 : active raid0 nvme0n1[0] nvme0n2[1]\n",
+        "      786167808 blocks super 1.2 1024k chunks\n",
+        "unused devices: <none>\n",
+    ]
+
+    parsed_a = collectors.RAIDSetupCollector._parse_mdstat(content_a)
+    parsed_b = collectors.RAIDSetupCollector._parse_mdstat(content_b)
+
+    assert parsed_a == parsed_b
+    assert parsed_a == {
+        'personalities': ['raid0'],
+        'arrays': {
+            'md0': {
+                'state': 'active',
+                'level': 'raid0',
+                'members': ['nvme0n1', 'nvme0n2'],
+            }
+        },
+        'unused_devices': [],
+    }
+
+
+def test_RAIDSetupCollector_parse_inactive_and_flags():
+    content = [
+        "Personalities : [raid1] [raid0]\n",
+        "md1 : active (auto-read-only) raid1 sda1[0] sdb1[1]\n",
+        "md2 : inactive nvme0n1[0](S) nvme1n1[1](S)\n",
+        "unused devices: sdc1 sdd1\n",
+    ]
+
+    assert collectors.RAIDSetupCollector._parse_mdstat(content) == {
+        'personalities': ['raid0', 'raid1'],
+        'arrays': {
+            'md1': {
+                'state': 'active',
+                'level': 'raid1',
+                'members': ['sda1', 'sdb1'],
+            },
+            'md2': {
+                'state': 'inactive',
+                'level': None,
+                'members': ['nvme0n1', 'nvme1n1'],
+            },
+        },
+        'unused_devices': ['sdc1', 'sdd1'],
+    }
+
+
+def test_RAIDSetupCollector_parse_non_raid_personality():
+    """Personalities like 'linear'/'multipath'/'faulty' aren't prefixed with 'raid' but must still
+    be captured as the array's level instead of being silently dropped as an unmatched member."""
+    content = [
+        "Personalities : [linear]\n",
+        "md3 : active linear sdc1[0] sdd1[1]\n",
+        "unused devices: <none>\n",
+    ]
+
+    assert collectors.RAIDSetupCollector._parse_mdstat(content) == {
+        'personalities': ['linear'],
+        'arrays': {
+            'md3': {
+                'state': 'active',
+                'level': 'linear',
+                'members': ['sdc1', 'sdd1'],
+            },
+        },
+        'unused_devices': [],
+    }
 
 
 def test_NVMeDevicesCollector():
-    mdstat = ['Personalities : [raid0] ', 'md127 : active raid0 nvme0n1[0] nvme1n1[1]']
+    raid_data = {
+        'personalities': ['raid0'],
+        'arrays': {
+            'md127': {
+                'state': 'active',
+                'level': 'raid0',
+                'members': ['nvme0n1', 'nvme1n1'],
+            }
+        },
+        'unused_devices': [],
+    }
     vitals = {
         'RAIDSetupCollector': CollectorResult(
             CollectorStatus.PASSED,
-            {'/proc/mdstat': mdstat},
+            raid_data,
             Output(),
             '',
         ),
@@ -1409,11 +1523,11 @@ def test_NVMeDevicesCollector():
 
 
 def test_NVMeDevicesCollector_mounted_partition():
-    mdstat = ['Personalities :']
+    raid_data = {'personalities': [], 'arrays': {}, 'unused_devices': []}
     vitals = {
         'RAIDSetupCollector': CollectorResult(
             CollectorStatus.PASSED,
-            {'/proc/mdstat': mdstat},
+            raid_data,
             Output(),
             '',
         ),
@@ -1453,11 +1567,11 @@ def test_NVMeDevicesCollector_mounted_partition():
 
 @pytest.mark.parametrize('root_source', ['/dev/nvme0n1p1', '/dev/nvme0n1'])
 def test_NVMeDevicesCollector_aws_root_volume_excluded(root_source):
-    mdstat = ['Personalities :']
+    raid_data = {'personalities': [], 'arrays': {}, 'unused_devices': []}
     vitals = {
         'RAIDSetupCollector': CollectorResult(
             CollectorStatus.PASSED,
-            {'/proc/mdstat': mdstat},
+            raid_data,
             Output(),
             '',
         ),
@@ -1494,6 +1608,90 @@ def test_NVMeDevicesCollector_aws_root_volume_excluded(root_source):
     assert collector.status == CollectorStatus.PASSED, collector.message
     assert collector._data['nvme_devices'] == ['nvme1n1']
     assert collector._data['unused_nvme_devices'] == ['nvme1n1']
+
+
+# DiskPerformanceExceededCollector unit tests ################################
+
+_AMZN_STATS_JSON = """{
+  "total_read_ops": 100,
+  "total_write_ops": 200,
+  "ebs_volume_performance_exceeded_iops": 0,
+  "ebs_volume_performance_exceeded_tp": 0,
+  "ec2_instance_performance_exceeded_iops": 42,
+  "ec2_instance_performance_exceeded_tp": 0,
+  "volume_queue_length": 1
+}"""
+
+
+def _disk_performance_vitals(provider='AWS', used_devices=None):
+    return {
+        'InfrastructureProviderCollector': CollectorResult(
+            CollectorStatus.PASSED, {'provider': provider}, Output(), ''),
+        'NVMeDevicesCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'nvme_devices': ['nvme0n1'],
+             'used_nvme_devices': ['nvme0n1'] if used_devices is None else used_devices,
+             'unused_nvme_devices': []},
+            Output(), ''),
+    }
+
+
+def test_DiskPerformanceExceededCollector():
+    collector = collectors.DiskPerformanceExceededCollector({}, {})
+    with patch('collectors.shutil.which', return_value='/usr/sbin/nvme'), \
+         patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=_AMZN_STATS_JSON)):
+        collector._collect(_disk_performance_vitals())
+
+    assert collector.status == CollectorStatus.PASSED, collector.message
+    # Only the "performance exceeded" counters are stored.
+    assert collector._data['devices'] == {'nvme0n1': {'ebs_volume_performance_exceeded_iops': 0,
+                                                      'ebs_volume_performance_exceeded_tp': 0,
+                                                      'ec2_instance_performance_exceeded_iops': 42,
+                                                      'ec2_instance_performance_exceeded_tp': 0}}
+
+
+# Key-name variants documented by AWS for the same counters - the collector must match the
+# "performance exceeded" suffix regardless of the prefix, so each of these is picked up.
+_ALTERNATE_EXCEEDED_KEYS = [
+    'ec2_instance_ebs_performance_exceeded_iops',
+    'ec2_instance_ebs_performance_exceeded_tp',
+    'instance_store_volume_performance_exceeded_iops',
+    'instance_store_volume_performance_exceeded_tp',
+    'ebs_volume_performance_exceeded_iops',
+    'ebs_volume_performance_exceeded_tp',
+    'ec2_instance_performance_exceeded_iops',
+    'ec2_instance_performance_exceeded_tp',
+]
+
+
+@pytest.mark.parametrize('key', _ALTERNATE_EXCEEDED_KEYS)
+def test_DiskPerformanceExceededCollector_alternate_key_names(key):
+    stats_json = json.dumps({'total_read_ops': 1, key: 7, 'volume_queue_length': 1})
+    collector = collectors.DiskPerformanceExceededCollector({}, {})
+    with patch('collectors.shutil.which', return_value='/usr/sbin/nvme'), \
+         patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=stats_json)):
+        collector._collect(_disk_performance_vitals())
+
+    assert collector.status == CollectorStatus.PASSED, collector.message
+    # The alternate key is captured, and the non-matching counter is not.
+    assert collector._data['devices'] == {'nvme0n1': {key: 7}}
+
+
+@pytest.mark.parametrize('provider,which,used_devices,run_result,message', [
+    ('GCP', '/usr/sbin/nvme', None, Mock(returncode=0, stdout=_AMZN_STATS_JSON), "AWS Nitro instances only"),
+    ('AWS', None, None, Mock(returncode=0, stdout=_AMZN_STATS_JSON), "'nvme' utility is not installed"),
+    ('AWS', '/usr/sbin/nvme', [], Mock(returncode=0, stdout=_AMZN_STATS_JSON), "No NVMe devices in use"),
+    ('AWS', '/usr/sbin/nvme', None, Mock(returncode=1, stdout="Unknown plugin: amzn\n"), "are not reported"),
+    ('AWS', '/usr/sbin/nvme', None, Mock(returncode=0, stdout="Total Ops:\n  Read: 1\n"), "are not reported"),
+])
+def test_DiskPerformanceExceededCollector_skipped(provider, which, used_devices, run_result, message):
+    collector = collectors.DiskPerformanceExceededCollector({}, {})
+    with patch('collectors.shutil.which', return_value=which), \
+         patch.object(Executor, 'run_command', return_value=run_result):
+        collector._collect(_disk_performance_vitals(provider=provider, used_devices=used_devices))
+
+    assert collector.status == CollectorStatus.SKIPPED
+    assert message in collector.message
 
 
 def test_CPUSetCollector(doctor_factory, monkeypatch):
@@ -1551,6 +1749,34 @@ def test_CqlshCollector(doctor_factory, await_scylla_start):
 
     result = doctor.vitals['CqlshCollector']
     assert result.status == CollectorStatus.PASSED, result.message
+
+
+def test_ServiceLevelsCollector(doctor_factory, await_scylla_start):
+    sl_name = 'sd_test_service_level'
+    Executor.paths = {'scylla_directory': '/opt/scylladb'}
+    created = Executor.cqlsh(
+        f"CREATE SERVICE LEVEL {sl_name} WITH SHARES = 200",
+        {'rpc_address': 'localhost'}) is not None
+    try:
+        doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
+                                            collectors.CqlshCollector,
+                                            collectors.ServiceLevelsCollector])
+        doctor.run()
+
+        result = doctor.vitals['ServiceLevelsCollector']
+        if result.status == CollectorStatus.SKIPPED:
+            pytest.skip(result.message)
+        if not created and result.status == CollectorStatus.FAILED:
+            pytest.skip(result.message)
+        assert result.status == CollectorStatus.PASSED, result.message
+        command = Executor.read_cql_table_command('system.service_levels_v2')
+        assert_output_gathered(result, OutputEntryType.CQL, command, empty_value_allowed=True)
+        if created:
+            assert sl_name in result.data
+            assert result.data[sl_name].get('shares') == '200'
+    finally:
+        if created:
+            Executor.cqlsh(f"DROP SERVICE LEVEL {sl_name}", {'rpc_address': 'localhost'})
 
 
 @pytest.fixture(autouse=True, scope="function")
@@ -1696,7 +1922,7 @@ def test_ScyllaClusterTablesDescriptionCollector_cql_failure(doctor_factory):
     assert "boom" in collector._message
 
 
-def test_ScyllaVersionCollector(doctor_factory, monkeypatch):
+def test_ScyllaVersionCollector(doctor_factory):
     doctor = doctor_factory(collectors=[collectors.ScyllaVersionCollector])
     doctor.run()
 
@@ -1707,20 +1933,36 @@ def test_ScyllaVersionCollector(doctor_factory, monkeypatch):
     assert isinstance(result.data['packages'], list)
     assert any(["scylla" in package for package in result.data['packages']])
 
-    for edition, packages in [
-        ("enterprise", "scylla-enterprise-server-2021.1.5-0.20210818.fc817c0cd.x86_64"),
-        ("development", "ii  scylla 5.1.dev-0.20220606.605ee74c39b2-1       amd64        Scylla database metapackage"),
-        ("oss", "ii  scylla-server 5.0.5-0.20221009.5a97a1060-1      amd64        Scylla database server binaries")
+
+def test_ScyllaVersionCollector_edition(doctor_factory, monkeypatch):
+    for edition, version, packages in [
+        ("enterprise", "2021.1.5-0.20210818.fc817c0cd",
+         "scylla-enterprise-server-2021.1.5-0.20210818.fc817c0cd.x86_64"),
+        ("development", "5.1.dev-0.20220606.605ee74c39b2",
+         "ii  scylla 5.1.dev-0.20220606.605ee74c39b2-1       amd64        Scylla database metapackage"),
+        ("oss", "5.0.5-0.20221009.5a97a1060",
+         "ii  scylla-server 5.0.5-0.20221009.5a97a1060-1      amd64        Scylla database server binaries"),
+        # 2025.1+ no longer uses "enterprise" in the package name (DOCTOR-112)
+        ("enterprise", "2026.1.9-0.20260716.66fb4eb48e87",
+         "ii  scylla-server 2026.1.9-0.20260716.66fb4eb48e87-1 amd64 Scylla database server binaries"),
+        ("enterprise", "2025.1.0", "scylla-server-2025.1.0.x86_64"),
+        ("oss", "2024.2.0", "scylla-server-2024.2.0.x86_64"),
+        # nightly/dev builds on 2025.1+ should still classify as development, not enterprise
+        ("development", "2026.1.dev-0.20260716.66fb4eb48e87",
+         "ii  scylla 2026.1.dev-0.20260716.66fb4eb48e87-1 amd64 Scylla database metapackage"),
     ]:
         doctor = doctor_factory(collectors=[collectors.ScyllaVersionCollector])
 
-        def mock_run(command, shell=True, check=False):
-            return subprocess.CompletedProcess(None, None, stdout=packages)
+        def mock_run(command, shell=True, check=False, _version=version, _packages=packages):
+            if "--version" in command:
+                return subprocess.CompletedProcess(command, 0, stdout=_version + "\n")
+            return subprocess.CompletedProcess(command, 0, stdout=_packages)
 
         monkeypatch.setattr(Executor, "run_command", mock_run)
         doctor.run()
         result = doctor.vitals['ScyllaVersionCollector']
         assert result.data['edition'] == edition
+        assert result.data['version'] == version
         assert result.data['packages'] == [' '.join(packages.split())]
 
 
@@ -1738,10 +1980,55 @@ def test_ScyllaLimitNOFILECollector(doctor_factory, provider_identify_shorten_ti
     result = doctor.vitals['ScyllaLimitNOFILECollector']
     if not is_container():
         assert result.status == CollectorStatus.PASSED, result.message
-        assert result.data['limitnofile']
+        assert result.data['limitnofile'] == "infinity" or result.data['limitnofile'].isdigit()
     else:
         assert result.status == CollectorStatus.SKIPPED, result.message
         assert "Not available" in result.message
+
+
+SYSTEMCTL_SHOW_TEMPLATE = """Type=simple
+LimitNOFILE={limitnofile}
+LimitNOFILESoft={limitnofile}
+LimitNPROC=infinity
+"""
+
+
+def _run_limitnofile_collector(limitnofile):
+    collector = collectors.ScyllaLimitNOFILECollector({}, {})
+    vitals = {'NodePlatformCollector': CollectorResult(
+        CollectorStatus.PASSED, {'platform': collectors.NodePlatform.BAREMETAL}, Output(), '')}
+
+    with patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout="2000\n")), \
+         patch('collectors.ServiceManager') as mock_sm_class:
+        mock_sm_class.return_value.service_environment.return_value = \
+            SYSTEMCTL_SHOW_TEMPLATE.format(limitnofile=limitnofile)
+        collector._collect(vitals)
+
+    return collector
+
+
+@pytest.mark.parametrize("limitnofile", ["800000", " 800000 "])
+def test_ScyllaLimitNOFILECollector_numeric_value(limitnofile):
+    collector = _run_limitnofile_collector(limitnofile)
+
+    assert collector.status == CollectorStatus.PASSED, collector._message
+    assert collector._data == {'limitnofile': "800000"}
+
+
+def test_ScyllaLimitNOFILECollector_infinity():
+    # scylla-server.service ships 'LimitNOFILE=infinity' since scylladb/scylladb@78c8598 (DOCTOR-119)
+    collector = _run_limitnofile_collector("infinity")
+
+    assert collector.status == CollectorStatus.PASSED, collector._message
+    assert collector._data == {'limitnofile': "infinity"}
+
+
+@pytest.mark.parametrize("limitnofile", ["not-a-number", "", "-1"])
+def test_ScyllaLimitNOFILECollector_unexpected_value(limitnofile):
+    collector = _run_limitnofile_collector(limitnofile)
+
+    assert collector.status == CollectorStatus.FAILED
+    assert f"'{limitnofile}'" in collector._message
 
 
 def test_SysctlCollector(doctor_factory):
@@ -1820,7 +2107,8 @@ def test_ScyllaManagerAgentLogsCollector_passes(doctor_factory):
     collector = _make_manager_agent_logs_collector(doctor_factory)
 
     with patch.object(collectors.ServiceManager, 'service_exists', return_value=True), \
-            patch.object(Executor, 'generate_output_filename', return_value="scylla_manager_agent_logs_test.txt"), \
+            patch.object(Executor, 'generate_output_filename',
+                         return_value="scylla_manager_agent_logs_test.txt"), \
             patch.object(Executor, 'run_command', return_value=Mock()) as mock_run:
         collector._collect(_make_node_platform_vitals(collectors.NodePlatform.BAREMETAL))
 
@@ -1887,6 +2175,81 @@ def test_ScyllaSeedsCollector(doctor_factory):
     assert len(result.data) > 0
     for seed in result.data:
         assert isinstance(result.data[seed], int)
+
+
+def _seeds_config_vitals(seeds: str, storage_port: int = 7000) -> Dict:
+    return {
+        'ScyllaConfigurationFileCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {
+                'seed_provider': [{'parameters': [{'seeds': seeds}]}],
+                'storage_port': storage_port,
+                'ssl_storage_port': 7001,
+            },
+            Output(), '',
+        ),
+    }
+
+
+@pytest.mark.parametrize("seed,resolved_host", [
+    ("127.0.0.1", "127.0.0.1"),
+    ("2001:db8::1", "2001:db8::1"),
+    ("[::1]", "::1"),
+])
+def test_ScyllaSeedsCollector_address_families(doctor_factory, seed, resolved_host):
+    doctor = doctor_factory(collectors=[collectors.ScyllaSeedsCollector])
+    collector = doctor.collectors['ScyllaSeedsCollector']
+
+    fake_sock = Mock()
+    fake_sock.__enter__ = Mock(return_value=fake_sock)
+    fake_sock.__exit__ = Mock(return_value=False)
+
+    with patch("collectors.socket.create_connection", return_value=fake_sock) as create_conn:
+        collector._collect(_seeds_config_vitals(seed))
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data[seed] == 0
+    create_conn.assert_called_once_with((resolved_host, 7000), timeout=2.0)
+
+
+def test_ScyllaSeedsCollector_ipv6_connect_failure_errno(doctor_factory):
+    doctor = doctor_factory(collectors=[collectors.ScyllaSeedsCollector])
+    collector = doctor.collectors['ScyllaSeedsCollector']
+
+    with patch("collectors.socket.create_connection",
+               side_effect=ConnectionRefusedError(111, "Connection refused")):
+        collector._collect(_seeds_config_vitals("2001:db8::1"))
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data["2001:db8::1"] == 111
+
+
+def test_ScyllaSeedsCollector_gaierror_unreachable(doctor_factory):
+    doctor = doctor_factory(collectors=[collectors.ScyllaSeedsCollector])
+    collector = doctor.collectors['ScyllaSeedsCollector']
+
+    with patch("collectors.socket.create_connection",
+               side_effect=socket.gaierror(socket.EAI_NONAME, "unknown host")):
+        collector._collect(_seeds_config_vitals("not-a-real-host.invalid"))
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data["not-a-real-host.invalid"] == -1
+
+
+def test_ScyllaSeedsCollector_skips_empty_seed_entries(doctor_factory):
+    doctor = doctor_factory(collectors=[collectors.ScyllaSeedsCollector])
+    collector = doctor.collectors['ScyllaSeedsCollector']
+
+    fake_sock = Mock()
+    fake_sock.__enter__ = Mock(return_value=fake_sock)
+    fake_sock.__exit__ = Mock(return_value=False)
+
+    with patch("collectors.socket.create_connection", return_value=fake_sock):
+        collector._collect(_seeds_config_vitals("2001:db8::1,"))
+
+    assert collector.status == CollectorStatus.PASSED
+    assert list(collector._data) == ["2001:db8::1"]
+    assert collector._data["2001:db8::1"] == 0
 
 
 def test_ScyllaSSTablesCollector(doctor_factory):
@@ -2155,6 +2518,37 @@ def test_SeastarCPUMapCollector(doctor_factory, await_scylla_start):
     assert result.status == CollectorStatus.PASSED, result.message
     assert_output_gathered(result, OutputEntryType.STDOUT, 'seastar-cpu-map.sh -n scylla',
                            value_content="shard: 0")
+    assert result.data['shard_cpu_map'], "shard to CPU mapping is missing from the collector data"
+    assert '0' in result.data['shard_cpu_map'], f"shard 0 is missing: {result.data['shard_cpu_map']}"
+
+
+def test_SeastarCPUMapCollector_parses_shard_cpu_map():
+    """
+    Verifies that the shard to CPU mapping is parsed out of the 'seastar-cpu-map.sh' output into the collector data
+    """
+    cpu_map_output = (
+        "shard: 0, cpu: 0\n"
+        "shard: 1, cpu: 1,17\n"
+    )
+    collector = collectors.SeastarCPUMapCollector({}, {'scylla_directory_scripts': '/opt/scylladb/scripts'})
+    with patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=cpu_map_output)):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED, collector.message
+    assert collector._data['shard_cpu_map'] == {'0': '0', '1': '1,17'}
+    assert_output_gathered(collector, OutputEntryType.VALUE, 'shard to CPU mapping', value_content='shard 1: CPU 1,17')
+
+
+def test_SeastarCPUMapCollector_failed_without_shard_cpu_map():
+    """
+    Verifies that the collector fails when no shard to CPU mapping can be parsed, e.g. when Scylla is not running
+    """
+    collector = collectors.SeastarCPUMapCollector({}, {'scylla_directory_scripts': '/opt/scylladb/scripts'})
+    with patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout='no scylla process found\n')):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.FAILED
+    assert 'No shard to CPU mapping' in collector.message
 
 
 def test_PerftuneSystemConfigurationCollector_multi_value_echo_line(doctor_factory, monkeypatch):
@@ -2622,3 +3016,205 @@ def test_RolePermissionsCollector_cql_failure_raises(doctor_factory):
     with patch.object(Executor, 'read_cql_table', side_effect=CqlFailedException("auth error")):
         with pytest.raises(CqlFailedException, match="auth error"):
             collector._collect(_make_role_permissions_vitals())
+
+
+# RolesCollector / DefaultCredentialsCollector unit tests #####################
+###############################################################################
+
+def _make_roles_collector(doctor_factory):
+    doctor = doctor_factory(collectors=[collectors.RolesCollector], analyzers=())
+    return doctor.collectors['RolesCollector']
+
+
+def _make_default_credentials_collector(doctor_factory):
+    doctor = doctor_factory(collectors=[collectors.DefaultCredentialsCollector], analyzers=())
+    return doctor.collectors['DefaultCredentialsCollector']
+
+
+def _make_auth_collector_vitals(authenticator='PasswordAuthenticator'):
+    config_data = {'rpc_address': '127.0.0.1', 'authenticator': authenticator}
+    return {
+        'ScyllaConfigurationFileCollector': CollectorResult(
+            CollectorStatus.PASSED, config_data, Output(), '',
+        ),
+        'CqlshCollector': CollectorResult(
+            CollectorStatus.PASSED, {}, Output(), '',
+        ),
+    }
+
+
+def test_RolesCollector_stores_sorted_rows_without_salted_hash(doctor_factory):
+    """
+    Roles are stored sorted by role name; collector requests non-sensitive columns only.
+    """
+    rows = [
+        {'role': 'cassandra', 'is_superuser': 'True', 'can_login': 'True', 'member_of': ''},
+        {'role': 'admin', 'is_superuser': 'True', 'can_login': 'True', 'member_of': ''},
+    ]
+    expected_columns = ['role', 'is_superuser', 'can_login', 'member_of']
+
+    collector = _make_roles_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table',
+                      return_value=('COPY system.roles ...', rows)) as mock_read:
+        collector._collect(_make_auth_collector_vitals())
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data == sorted(rows, key=lambda r: r['role'])
+    _, kwargs = mock_read.call_args
+    assert kwargs.get('columns') == expected_columns
+
+
+def test_RolesCollector_cql_failure_raises(doctor_factory):
+    """
+    CqlFailedException propagates out of _collect uncaught.
+    """
+    from utils import CqlFailedException
+
+    collector = _make_roles_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table', side_effect=CqlFailedException("auth error")):
+        with pytest.raises(CqlFailedException, match="auth error"):
+            collector._collect(_make_auth_collector_vitals())
+
+
+# ServiceLevelsCollector unit tests ###########################################
+###############################################################################
+
+def _make_service_levels_collector(doctor_factory):
+    doctor = doctor_factory(collectors=[collectors.ServiceLevelsCollector], analyzers=())
+    return doctor.collectors['ServiceLevelsCollector']
+
+
+def test_ServiceLevelsCollector_stores_rows_keyed_by_name(doctor_factory):
+    rows = [
+        {'service_level': 'olap', 'shares': '100', 'timeout': 'null', 'workload_type': 'batch'},
+        {'service_level': 'oltp', 'shares': '1000', 'timeout': 'null', 'workload_type': 'interactive'},
+    ]
+    query = Executor.read_cql_table_command('system.service_levels_v2')
+
+    collector = _make_service_levels_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table', return_value=(query, rows)) as mock_read:
+        collector._collect(_make_auth_collector_vitals())
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data == {
+        'olap': rows[0],
+        'oltp': rows[1],
+    }
+    mock_read.assert_called_once()
+    assert mock_read.call_args.args[1] == 'system.service_levels_v2'
+
+
+def test_ServiceLevelsCollector_empty_result(doctor_factory):
+    query = Executor.read_cql_table_command('system.service_levels_v2')
+    collector = _make_service_levels_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table', return_value=(query, [])):
+        collector._collect(_make_auth_collector_vitals())
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data == {}
+
+
+def test_ServiceLevelsCollector_cql_failure(doctor_factory):
+    from utils import CqlFailedException
+
+    collector = _make_service_levels_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table', side_effect=CqlFailedException("auth error")):
+        collector._collect(_make_auth_collector_vitals())
+
+    assert collector.status == CollectorStatus.FAILED
+    assert "auth error" in collector.message
+
+
+def test_ServiceLevelsCollector_missing_table_sets_skipped_status(doctor_factory):
+    from utils import CqlFailedException
+
+    collector = _make_service_levels_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table',
+                      side_effect=CqlFailedException("unconfigured table service_levels_v2")):
+        collector._collect(_make_auth_collector_vitals())
+
+    assert collector.status == CollectorStatus.SKIPPED
+
+
+def test_DefaultCredentialsCollector_skips_probe_when_auth_disabled(doctor_factory):
+    """
+    When authenticator does not require credentials, probe is not attempted.
+    """
+    collector = _make_default_credentials_collector(doctor_factory)
+    with patch.object(Executor, 'cqlsh') as mock_cqlsh:
+        collector._collect(_make_auth_collector_vitals(authenticator='AllowAllAuthenticator'))
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data == {'default_user_login': 'not_verified'}
+    mock_cqlsh.assert_not_called()
+
+
+@pytest.mark.parametrize("authenticator", [
+    'com.scylladb.auth.TransitionalAuthenticator',
+    'TransitionalAuthenticator',
+])
+def test_DefaultCredentialsCollector_skips_probe_under_transitional_authenticator(doctor_factory, authenticator):
+    """
+    TransitionalAuthenticator lets bad passwords in anonymously, so the probe would always
+    report allowed; it must be skipped rather than trusted.
+    """
+    collector = _make_default_credentials_collector(doctor_factory)
+    with patch.object(Executor, 'cqlsh') as mock_cqlsh:
+        collector._collect(_make_auth_collector_vitals(authenticator=authenticator))
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data == {'default_user_login': 'not_verified'}
+    mock_cqlsh.assert_not_called()
+
+
+@pytest.mark.parametrize("authenticator", [
+    'org.apache.cassandra.auth.PasswordAuthenticator',
+    'PasswordAuthenticator',
+    # CertificateOrPasswordAuthenticator falls back to password auth for clients without a
+    # certificate, and rejects a bad password, so the probe is meaningful there too.
+    'CertificateOrPasswordAuthenticator',
+    'com.scylladb.auth.CertificateOrPasswordAuthenticator',
+])
+def test_DefaultCredentialsCollector_probes_password_authenticator_aliases(doctor_factory, authenticator):
+    """
+    Scylla resolves the authenticator by its case-insensitive short name, so FQN and short
+    spellings of a password-capable authenticator are both probed.
+    """
+    collector = _make_default_credentials_collector(doctor_factory)
+    mock_output = Mock()
+    mock_output.returncode = 0
+    with patch.object(Executor, 'cqlsh', return_value=mock_output) as mock_cqlsh:
+        collector._collect(_make_auth_collector_vitals(authenticator=authenticator))
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data == {'default_user_login': 'allowed'}
+    mock_cqlsh.assert_called_once()
+
+
+def test_DefaultCredentialsCollector_reports_allowed_default_user_login(doctor_factory):
+    """
+    Successful cqlsh with cassandra/cassandra marks default_user_login=allowed.
+    """
+    collector = _make_default_credentials_collector(doctor_factory)
+    mock_output = Mock()
+    mock_output.returncode = 0
+    with patch.object(Executor, 'cqlsh', return_value=mock_output) as mock_cqlsh:
+        collector._collect(_make_auth_collector_vitals())
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data == {'default_user_login': 'allowed'}
+    mock_cqlsh.assert_called_once()
+    assert mock_cqlsh.call_args.kwargs['user'] == 'cassandra'
+    assert mock_cqlsh.call_args.kwargs['password'] == 'cassandra'
+
+
+def test_DefaultCredentialsCollector_reports_denied_default_user_login(doctor_factory):
+    """
+    Failed cqlsh with cassandra/cassandra marks default_user_login=denied.
+    """
+    collector = _make_default_credentials_collector(doctor_factory)
+    with patch.object(Executor, 'cqlsh', return_value=None):
+        collector._collect(_make_auth_collector_vitals())
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data == {'default_user_login': 'denied'}

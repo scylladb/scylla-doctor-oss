@@ -18,15 +18,53 @@
 import shlex
 import subprocess
 import json
+import pathlib
+import tarfile
+import tempfile
 from unittest.mock import Mock, patch
 import pytest
 from utils import Executor, CqlFailedException, UrlReadFailedException, RestEndpointReadError, CloudProvider, \
     SystemConfigurationError
-from utils import CloudProviderGCP, CloudProviderAWS, CloudProviderAE, RestEndpointOutputFormatError, ServiceManager
+from utils import CloudProviderGCP, CloudProviderAWS, CloudProviderAE, CloudProviderOCI, \
+    RestEndpointOutputFormatError, ServiceManager
+from common import Authenticator
 
 
 def cqlsh_command():
     return f"{Executor.paths['scylla_directory']}/share/cassandra/bin/cqlsh"
+
+
+class TestAuthenticator:
+    @pytest.mark.parametrize("raw,expected", [
+        (None, Authenticator.ALLOW_ALL),
+        ('', Authenticator.ALLOW_ALL),
+        ('AllowAllAuthenticator', Authenticator.ALLOW_ALL),
+        ('org.apache.cassandra.auth.AllowAllAuthenticator', Authenticator.ALLOW_ALL),
+        ('PasswordAuthenticator', Authenticator.PASSWORD),
+        ('org.apache.cassandra.auth.PasswordAuthenticator', Authenticator.PASSWORD),
+        ('passwordauthenticator', Authenticator.PASSWORD),
+        ('CertificateAuthenticator', Authenticator.CERTIFICATE),
+        ('CertificateOrPasswordAuthenticator', Authenticator.CERTIFICATE_OR_PASSWORD),
+        ('com.scylladb.auth.CertificateOrPasswordAuthenticator', Authenticator.CERTIFICATE_OR_PASSWORD),
+        ('TransitionalAuthenticator', Authenticator.TRANSITIONAL),
+        ('com.scylladb.auth.TransitionalAuthenticator', Authenticator.TRANSITIONAL),
+        ('SaslauthdAuthenticator', Authenticator.SASLAUTHD),
+        ('MistypedAuthenticator', Authenticator.UNKNOWN),
+    ])
+    def test_parse(self, raw, expected):
+        assert Authenticator.parse(raw) is expected
+
+    def test_password_capabilities(self):
+        assert Authenticator.PASSWORD.requires_password_for_cqlsh
+        assert Authenticator.PASSWORD.password_login_probe_safe
+        assert Authenticator.CERTIFICATE_OR_PASSWORD.requires_password_for_cqlsh
+        assert Authenticator.CERTIFICATE_OR_PASSWORD.password_login_probe_safe
+        assert Authenticator.TRANSITIONAL.requires_password_for_cqlsh
+        assert not Authenticator.TRANSITIONAL.password_login_probe_safe
+        assert not Authenticator.CERTIFICATE.requires_password_for_cqlsh
+        assert not Authenticator.CERTIFICATE.password_login_probe_safe
+        assert not Authenticator.ALLOW_ALL.requires_password_for_cqlsh
+        assert not Authenticator.UNKNOWN.password_login_probe_safe
 
 
 class TestExecutorCqlsh:
@@ -34,9 +72,18 @@ class TestExecutorCqlsh:
 
     @pytest.mark.parametrize("config,expected", [
         ({'authenticator': 'PasswordAuthenticator'}, True),
+        ({'authenticator': 'org.apache.cassandra.auth.PasswordAuthenticator'}, True),
         ({'authenticator': 'com.scylladb.auth.TransitionalAuthenticator'}, True),
+        ({'authenticator': 'TransitionalAuthenticator'}, True),
+        # Scylla matches short names case-insensitively; weird casing must still require auth.
+        ({'authenticator': 'passwordauthenticator'}, True),
+        ({'authenticator': 'CertificateOrPasswordAuthenticator'}, True),
+        ({'authenticator': 'com.scylladb.auth.CertificateOrPasswordAuthenticator'}, True),
         ({'authenticator': 'AllowAllAuthenticator'}, False),
+        # Certificate-only auth has no password to pass to cqlsh.
+        ({'authenticator': 'com.scylladb.auth.CertificateAuthenticator'}, False),
         ({'authenticator': 'UnknownAuthenticator'}, False),
+        ({'authenticator': None}, False),
         ({}, False),
     ])
     def test_cqlsh_authentication_required(self, config, expected):
@@ -310,6 +357,53 @@ class TestExecutorCqlsh:
         error_msg = str(exc_info.value)
         assert user not in error_msg
         assert password not in error_msg
+
+    @patch('utils.Executor.run_command')
+    @patch('utils.Executor.cqlsh_authentication_required')
+    def test_cqlsh_explicit_credentials_override_config(self, mock_auth_required, mock_run_command):
+        """Explicit user/password arguments override CQL config credentials."""
+        mock_auth_required.return_value = True
+        Executor.cql_config = {'user': 'configured_user', 'password': 'configured_password'}
+        Executor.paths = {'scylla_directory': '/some/path'}
+        auth_scylla_config = {'rpc_address': '192.168.1.10', 'authenticator': 'PasswordAuthenticator'}
+        mock_result = Mock()
+        mock_result.returncode = 0
+        mock_run_command.return_value = mock_result
+
+        result = Executor.cqlsh(
+            "SELECT now() FROM system.local", auth_scylla_config,
+            user="cassandra", password="cassandra")
+
+        assert result is not None
+        expected = shlex.join([
+            cqlsh_command(), "192.168.1.10", "-e", "SELECT now() FROM system.local",
+            "-u", "cassandra", "-p", "cassandra",
+        ])
+        mock_run_command.assert_called_once_with(expected, shell=True, timeout=300, check=False)
+
+    @patch('utils.Executor.run_command')
+    def test_cqlsh_explicit_credentials_attach_even_when_not_required(self, mock_run_command):
+        """
+        Explicit user/password (e.g. a credential probe) must attach -u/-p even for
+        authenticators that cqlsh_authentication_required() doesn't recognize.
+        """
+        Executor.cql_config = {}
+        Executor.paths = {'scylla_directory': '/some/path'}
+        scylla_config = {'rpc_address': '192.168.1.10', 'authenticator': 'AllowAllAuthenticator'}
+        mock_result = Mock()
+        mock_result.returncode = 0
+        mock_run_command.return_value = mock_result
+
+        result = Executor.cqlsh(
+            "SELECT now() FROM system.local", scylla_config,
+            user="cassandra", password="cassandra")
+
+        assert result is not None
+        expected = shlex.join([
+            cqlsh_command(), "192.168.1.10", "-e", "SELECT now() FROM system.local",
+            "-u", "cassandra", "-p", "cassandra",
+        ])
+        mock_run_command.assert_called_once_with(expected, shell=True, timeout=300, check=False)
 
 
 class ConcreteCloudProvider(CloudProvider):
@@ -725,6 +819,40 @@ class TestCloudProviderAzure:
                             f"returned '{json.loads(bad_api_response)}'") == str(exc_info.value)
 
 
+class TestCloudProviderOCI:
+    @pytest.fixture
+    def provider(self):
+        return CloudProviderOCI()
+
+    def test_instance_type(self, provider):
+        """instance_type parses shape from the instance JSON"""
+        metadata = json.dumps({"shape": "VM.DenseIO.E5.Flex"})
+        with patch.object(provider, 'read_metadata', return_value=metadata):
+            result = provider.instance_type
+            assert result == "VM.DenseIO.E5.Flex"
+
+    def test_instance_type_calls_read_metadata(self, provider):
+        """instance_type must call read_metadata with the correct endpoint"""
+        metadata = json.dumps({"shape": "VM.DenseIO.E5.Flex"})
+        with patch.object(provider, 'read_metadata', return_value=metadata) as mock_read:
+            provider.instance_type
+            mock_read.assert_called_once_with("instance/")
+
+    def test_instance_type_missing_shape(self, provider):
+        """instance_type returns None when shape is absent"""
+        with patch.object(provider, 'read_metadata', return_value=json.dumps({})):
+            assert provider.instance_type is None
+
+    def test_instance_type_memoized(self, provider):
+        """Repeated access to instance_type must use the cache"""
+        metadata = json.dumps({"shape": "VM.DenseIO.E5.Flex"})
+        with patch.object(provider, 'read_metadata', return_value=metadata) as mock_read:
+            result1 = provider.instance_type
+            result2 = provider.instance_type
+            assert result1 == result2
+            mock_read.assert_called_once()
+
+
 class TestServiceManager:
     """Test cases for ServiceManager class"""
 
@@ -1033,3 +1161,38 @@ class TestReadCqlTable:
         _, rows = Executor.read_cql_table({}, "test.table", max_rows=1)
         assert len(rows) == 1
         assert rows[0] == {'col_a': 'val_a0', 'col_b': 'val_b0'}
+
+
+class TestGenerateOutputFilename:
+    def test_defaults_to_system_temp_dir(self):
+        name = Executor.generate_output_filename(prefix="scylla_logs_", extension=".txt")
+        assert pathlib.Path(name).parent == pathlib.Path(tempfile.gettempdir())
+        assert pathlib.Path(name).name.startswith("scylla_logs_")
+        assert name.endswith(".txt")
+
+    def test_respects_explicit_path(self, tmp_path):
+        name = Executor.generate_output_filename(path=str(tmp_path), prefix="x_", extension=".log")
+        assert pathlib.Path(name).parent == tmp_path
+        assert pathlib.Path(name).name.startswith("x_")
+        assert name.endswith(".log")
+
+
+class TestRunCommandOutputCompression:
+    def test_archive_next_to_output_file_with_basename_members(self, tmp_path, monkeypatch):
+        cwd = tmp_path / "cwd"
+        dest = tmp_path / "out"
+        cwd.mkdir()
+        dest.mkdir()
+        monkeypatch.chdir(cwd)
+
+        output_file = dest / "scylla_logs_20250825102108.txt"
+        Executor.run_command("echo hello", output_file=str(output_file), output_file_compression=True)
+
+        archive = dest / "scylla_logs_20250825102108.tar.gz"
+        assert archive.is_file()
+        assert not output_file.exists()
+        assert not (cwd / "scylla_logs_20250825102108.tar.gz").exists()
+
+        with tarfile.open(archive, "r:gz") as tar:
+            assert tar.getnames() == ["scylla_logs_20250825102108.txt"]
+            assert b"hello" in tar.extractfile("scylla_logs_20250825102108.txt").read()

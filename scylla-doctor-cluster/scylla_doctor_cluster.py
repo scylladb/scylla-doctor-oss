@@ -392,6 +392,47 @@ def analyze_vitals(node, vitals, config: Configuration, failures, warnings):
                 warnings[name][result['message']].append(node)
 
 
+def verify_cluster_vitals_versions(files: List[str]) -> None:
+    """
+    Compare each vitals file's collected Scylla Doctor version to this tool version.
+    Raise after scanning all files so mixed-version directories list every mismatch.
+
+    Parses one file at a time and discards it. Analysis re-reads matching files later so
+    peak memory stays one node plus the diff baseline, not the whole directory.
+    """
+    import scylla_doctor
+
+    tool_version = scylla_doctor.Doctor.read_tool_version()
+    mismatched = []
+    collected_versions = set()
+    unreadable = False
+    for file in files:
+        try:
+            vitals_version = scylla_doctor.Doctor.read_vitals_file_version(file)
+        except Exception as e:
+            mismatched.append(f"{os.path.basename(file)} ({e})")
+            unreadable = True
+            continue
+        collected_versions.add(vitals_version)
+        if vitals_version != tool_version:
+            mismatched.append(f"{os.path.basename(file)} (v{vitals_version})")
+
+    if mismatched:
+        if not unreadable and len(collected_versions) == 1:
+            # The cluster is consistent, only this tool is out of step: the fix is the
+            # Scylla Doctor that this tool loads, not a re-collection.
+            hint = (f"All vitals were collected with Scylla Doctor {collected_versions.pop()}; "
+                    f"run Scylla Doctor Cluster with a matching Scylla Doctor version "
+                    f"(--scylla-doctor-path).")
+        else:
+            hint = "Re-collect the vitals so every node uses the same Scylla Doctor version."
+        raise ValueError(
+            f"Version mismatch: analyzer: {tool_version}. "
+            f"Mismatched files: {', '.join(mismatched)}. "
+            f"{hint}"
+        )
+
+
 def analyze_cluster(config: Configuration):
     """
     Check vitals gathered from Scylla Cluster. Look for failed collectors and analyzers, warnings and inconsistencies
@@ -407,6 +448,8 @@ def analyze_cluster(config: Configuration):
     if not files:
         raise ValueError(f"No detected vitals in the specified directory '{config.path_to_vitals}'.\n"
                          f"Verify that the directory is correct, and that the files have the '.vitals.json' extension.")
+
+    verify_cluster_vitals_versions(files)
 
     for file in files:
         node = os.path.basename(file).split('.vitals.json')[0]

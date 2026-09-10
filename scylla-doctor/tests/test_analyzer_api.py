@@ -15,11 +15,13 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with Scylla Doctor.  If not, see <http://www.gnu.org/licenses/>.
 
+import io
 import random
 
-from analyzers_base import AnalyzerStatus
+from analyzers_base import Analyzer, AnalyzerStatus
 from tests.helpers import DummyDependsOnSkippedAndFailedAnalyzer, DummyDependsOnFailedAnalyzer, DummyFailedCollector, \
     DummySkippedCollector, DummyBaseCollector
+import scylla_doctor
 
 
 def test_config_skip(doctor_factory):
@@ -58,3 +60,40 @@ def test_analyzer_fail_due_to_failed_collector(doctor_factory):
         assert analyzer.status == AnalyzerStatus.FAILED
         # Verify that a failed analyzer's message has the information about failed dependencies
         assert f"Required {DummyFailedCollector.name} was not successful" in analyzer.message
+
+
+class DummyPassAnalyzer(Analyzer):
+    name = "DummyPassAnalyzer"
+
+    @property
+    def depends_on(self):
+        return {"DummyBaseCollector"}
+
+    def _analyze(self, vitals):
+        self.status = AnalyzerStatus.PASSED
+        self.message = "ok"
+
+
+def test_print_results_omits_empty_data_analysis_section(doctor_factory):
+    """Stripped/customer builds have no analyzers; do not print an empty Data analysis header."""
+    doctor = doctor_factory(collectors=[DummyBaseCollector], analyzers=())
+    doctor.run()
+
+    with io.StringIO() as result:
+        doctor.print_results(format=scylla_doctor.DoctorOutputFormat.FULL, file=result)
+        output = result.getvalue()
+
+    assert "+ Data collection" in output
+    assert "+ Data analysis" not in output
+
+
+def test_print_results_includes_data_analysis_when_analyzers_ran(doctor_factory):
+    doctor = doctor_factory(collectors=[DummyBaseCollector], analyzers=[DummyPassAnalyzer])
+    doctor.run()
+
+    with io.StringIO() as result:
+        doctor.print_results(format=scylla_doctor.DoctorOutputFormat.FULL, file=result)
+        output = result.getvalue()
+
+    assert "+ Data analysis" in output
+    assert "DummyPassAnalyzer" in output

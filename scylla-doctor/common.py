@@ -21,10 +21,13 @@ import dataclasses
 import enum
 import os
 
-from typing import Any, Dict, Optional, Callable, Set, Type
+from typing import Any, Dict, Optional, Callable, Set, Tuple, Type
 from collections.abc import Mapping, Iterable
 
 ENCODING = "UTF-8"
+
+# The literal systemd reports for a resource limit that was configured as 'infinity'
+SYSTEMD_INFINITY = "infinity"
 
 _CONFIG_VALUE_UNSET = object()
 
@@ -58,6 +61,65 @@ class AbortedException(Exception):
 
 class InvalidConfigurationException(Exception):
     pass
+
+
+class Authenticator(enum.Enum):
+    """
+    Known Scylla CQL authenticators.
+
+    Matching is by case-insensitive short name (FQN or short). Unset/empty maps to ALLOW_ALL
+    (Scylla default). Unrecognized values map to UNKNOWN.
+    """
+    ALLOW_ALL = 'AllowAllAuthenticator'
+    PASSWORD = 'PasswordAuthenticator'
+    CERTIFICATE = 'CertificateAuthenticator'
+    CERTIFICATE_OR_PASSWORD = 'CertificateOrPasswordAuthenticator'
+    TRANSITIONAL = 'TransitionalAuthenticator'
+    SASLAUTHD = 'SaslauthdAuthenticator'
+    UNKNOWN = 'UnknownAuthenticator'
+
+    @classmethod
+    def parse(cls, authenticator: Optional[str]) -> 'Authenticator':
+        short = str(authenticator or '').rsplit('.', maxsplit=1)[-1]
+        if not short:
+            return cls.ALLOW_ALL
+        for member in cls:
+            if member is cls.UNKNOWN:
+                continue
+            if member.value.lower() == short.lower():
+                return member
+        return cls.UNKNOWN
+
+    @property
+    def requires_password_for_cqlsh(self) -> bool:
+        """True when cqlsh needs -u/-p for this authenticator."""
+        return self in (
+            Authenticator.PASSWORD,
+            Authenticator.CERTIFICATE_OR_PASSWORD,
+            Authenticator.TRANSITIONAL,
+        )
+
+    @property
+    def password_login_probe_safe(self) -> bool:
+        """
+        True when a bad password is rejected outright, so a default-credentials probe is meaningful.
+
+        TransitionalAuthenticator falls back to anonymous access on bad credentials — probe unsafe.
+        """
+        return self in (
+            Authenticator.PASSWORD,
+            Authenticator.CERTIFICATE_OR_PASSWORD,
+        )
+
+    @classmethod
+    def recommended(cls) -> Tuple['Authenticator', ...]:
+        """Non-transitional authenticators preferred for production."""
+        return (
+            cls.PASSWORD,
+            cls.CERTIFICATE,
+            cls.CERTIFICATE_OR_PASSWORD,
+            cls.SASLAUTHD,
+        )
 
 
 class NodePlatform(enum.Enum):

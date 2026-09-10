@@ -164,3 +164,107 @@ def test_analyze_vitals_version_match_ok(doctor_factory, tmp_path, monkeypatch):
     doctor = doctor_factory(collectors=[collectors.SDVersionCollector], analyzers=())
     # Should not raise/exit
     doctor.analyze_vitals({"SDVersionCollector": _result(data={"version": "7.7.7"})})
+
+
+# save_vitals output omission #################################################
+
+
+def test_decode_tolerates_missing_output():
+    result = CollectorResult.decode({
+        "status": CollectorStatus.PASSED.value,
+        "data": {"k": "v"},
+        "message": "ok",
+    })
+    assert result.data == {"k": "v"}
+    assert list(result.output) == []
+
+
+def test_strip_missing_output_keeps_data_for_cluster_diff():
+    """Cluster DeepDiff uses strip(); empty output must still leave data comparable."""
+    result = CollectorResult.decode({
+        "status": CollectorStatus.PASSED.value,
+        "data": {"files": {"io.conf": {"a": "1"}}},
+        "message": "ok",
+    })
+    stripped = result.strip()
+    assert stripped.data == {"files": {"io.conf": {"a": "1"}}}
+    assert list(stripped.output) == []
+
+
+def test_save_vitals_omits_output_by_default(doctor_factory, tmp_path):
+    from tests.helpers import DummyBaseCollector
+
+    doctor = doctor_factory(collectors=[DummyBaseCollector], analyzers=())
+    doctor.vitals["DummyBaseCollector"] = _result(data={"x": 1}, verbose_value="detail")
+    path = tmp_path / "vitals.json"
+    doctor.save_vitals(str(path))
+
+    saved = json.loads(path.read_text())
+    entry = saved["DummyBaseCollector"]
+    assert "output" not in entry
+    assert entry["data"] == {"x": 1}
+    assert entry["status"] == CollectorStatus.PASSED.value
+    assert entry["message"] == "ok"
+
+
+@pytest.mark.parametrize("how", ["flag", "general"])
+def test_save_vitals_include_output_global(doctor_factory, tmp_path, how):
+    from tests.helpers import DummyBaseCollector
+
+    config = [("General", "include_output", "yes")] if how == "general" else ()
+    doctor = doctor_factory(collectors=[DummyBaseCollector], analyzers=(), config_options=config)
+    if how == "flag":
+        doctor.environment.args.include_output = True
+    doctor.vitals["DummyBaseCollector"] = _result(data={"x": 1}, verbose_value="detail")
+    path = tmp_path / "vitals.json"
+    doctor.save_vitals(str(path))
+
+    entry = json.loads(path.read_text())["DummyBaseCollector"]
+    assert "output" in entry
+    assert entry["output"][0]["value"] == "detail"
+
+
+def test_encoder_include_output_kwarg():
+    result = _result(data={"x": 1}, verbose_value="detail")
+    omitted = json.loads(json.dumps(result, cls=CollectorResult.Encoder, include_output=False))
+    assert "output" not in omitted
+    included = json.loads(json.dumps(result, cls=CollectorResult.Encoder, include_output=True))
+    assert included["output"][0]["value"] == "detail"
+
+
+def test_save_vitals_encoder_keeps_new_fields(doctor_factory, tmp_path):
+    """Omit path still encodes every CollectorResult field except output."""
+    from tests.helpers import DummyBaseCollector
+
+    doctor = doctor_factory(collectors=[DummyBaseCollector], analyzers=())
+    doctor.vitals["DummyBaseCollector"] = _result(data={"x": 1}, verbose_value="detail")
+    path = tmp_path / "vitals.json"
+    doctor.save_vitals(str(path))
+
+    entry = json.loads(path.read_text())["DummyBaseCollector"]
+    assert set(entry.keys()) == {"status", "data", "message", "mask"}
+    assert "output" not in entry
+
+
+def test_output_disabled_put_is_noop():
+    output = Output(enabled=False)
+    output.put(OutputEntryType.VALUE, "k", "v", level=Level.VERBOSE)
+    assert list(output) == []
+
+
+def test_collector_store_output_disabled(doctor_factory):
+    from tests.helpers import DummyBaseCollector
+
+    doctor = doctor_factory(collectors=[DummyBaseCollector], analyzers=())
+    assert doctor.should_store_output() is False
+    doctor.collectors["DummyBaseCollector"].set_store_output(doctor.should_store_output())
+    assert doctor.collectors["DummyBaseCollector"].output.enabled is False
+
+
+def test_collector_store_output_enabled_with_verbose(doctor_factory):
+    from tests.helpers import DummyBaseCollector
+
+    doctor = doctor_factory(collectors=[DummyBaseCollector], analyzers=())
+    doctor.environment.args.verbose = True
+    doctor.collectors["DummyBaseCollector"].set_store_output(doctor.should_store_output())
+    assert doctor.collectors["DummyBaseCollector"].output.enabled is True

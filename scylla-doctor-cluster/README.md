@@ -13,6 +13,22 @@ warnings, and inconsistencies among nodes.
 ## Usage
 `scylla_doctor_cluster.py path_to_scylla_doctor_outputs`
 
+### Vitals version check
+Every `*.vitals.json` file must have been collected by the same Scylla Doctor version as the running cluster tool.
+If any file differs, the run exits before analysis and lists **all** mismatched files and their versions.
+
+When the vitals disagree with each other, they have to be collected again with a single Scylla Doctor version:
+
+```
+Version mismatch: analyzer: 1.5. Mismatched files: fileA.vitals.json (v1.4), fileB.vitals.json (v1.3). Re-collect the vitals so every node uses the same Scylla Doctor version.
+```
+
+When every file agrees and only the cluster tool is out of step, the vitals are fine and the cluster tool has to load the matching Scylla Doctor:
+
+```
+Version mismatch: analyzer: 1.5. Mismatched files: fileA.vitals.json (v1.4), fileB.vitals.json (v1.4). All vitals were collected with Scylla Doctor 1.4; run Scylla Doctor Cluster with a matching Scylla Doctor version (--scylla-doctor-path).
+```
+
 ### Arguments
 | Argument                                            | Description                                                                                                                    |
 |-----------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------|
@@ -47,6 +63,8 @@ ScyllaClusterSchemaCollector
 ```
 
 Command line alternative to the above: `-sov ExcludeFromDiff,IPRoutesCollector, -sov ExcludeFromDiff,ScyllaSSTablesCollector, -sov ExcludeFromDiff,ScyllaClusterSchemaCollector, `
+
+The shipped `scylla_doctor_cluster.ini` (loaded with `--config-file scylla_doctor_cluster.ini`) excludes `IPRoutesCollector`, `ScyllaSSTablesCollector`, `IPAddressesCollector`, and `ScyllaLogsCollector` by default — collectors whose `data`/`message` are inherently node- or run-specific. `ScyllaLogsCollector.message` in particular embeds a per-run timestamped log file path, which always differs across nodes and runs.
 
 ##### SkipTest
 Each line contains a name of an Analyzer that is going to be skipped.
