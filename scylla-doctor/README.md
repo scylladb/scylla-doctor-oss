@@ -194,7 +194,7 @@ However, defaults can be overridden through an optional configuration file of us
 | --include-output                                                       | Include collector `output` arrays in `--save-vitals` JSON (omitted by default to save space). Also `[General] include_output=yes` |
 | --output {full,short,json}                                             | Give out full human-readable report, short launch log, or machine-readable analyzers output for further processing        |
 | --print-filter PRINT_FILTER                                            | Regular expression filter to apply to Collectors and Analyzers names before printing. Print only those which name matches |
-| --list-parameters [SECTION]                                            | Print configuration parameters and defaults (`General` plus collectors/analyzers with custom options). Optional SECTION limits output to one section |
+| --list-parameters [SECTION]                                            | Print configuration parameters and defaults for every collector and analyzer. Optional SECTION limits output to one section |
 | --list-parameters-json                                                 | Output `--list-parameters` as JSON (implies `--list-parameters`)                                                                          |
 | --version                                                              | Print Scylla Doctor version and exit                                                                                      |
 | --vitals-version [Vitals file]                                         | Print version stored in a vitals file (vitals.json by default) and exit                                                   |
@@ -213,7 +213,9 @@ Examples
 One can add as many items in the constructs above as needed using `|` as a separator.
 
 ### Saving vitals
-By default `--save-vitals` omits collector `output` (see `--include-output` or `[General] include_output`). Without include/`-v`/`-d`, collectors also skip retaining `output` in memory. Cluster load/diff/analyze use collector `data` (and status/message/mask), so they stay compatible without include. Use an include option only when you need `output` after `--load-vitals` (e.g. `--verbose` / `--detailed` reprint, or tooling that reads `output`).
+By default `--save-vitals` omits collector `output` (see `--include-output` or `[General] include_output`). Without include/`-v`/`-d`, collectors also skip retaining `output` in memory, except those that keep it by default (below). Cluster load/diff/analyze use collector `data` (and status/message/mask), so they stay compatible without include. Use an include option only when you need `output` after `--load-vitals` (e.g. `--verbose` / `--detailed` reprint, or tooling that reads `output`).
+
+Collectors whose useful payload is raw command output with no structured `data` counterpart keep their `output` in saved vitals by default, even without the global setting: `FirewallRulesCollector`, `IPAddressesCollector`, `KernelRingBufferCollector`, `ScyllaClusterSchemaDescriptionCollector`, `TCPConnectionsCollector`, `ProcInterruptsCollector`, `LSPCICollector`, `NodetoolCFStatsCollector`. Override per collector with `[<Collector>] include_output = yes|no` (or `-sov <Collector>,include_output,no`); the per-collector switch is OR-ed with the global one, so `no` only takes effect when `--include-output` is off. Any other value is rejected at startup. `--list-parameters` shows the current default. `ScyllaClusterSchemaDescriptionCollector` additionally stores the `DESC SCHEMA` text in `data.schema`.
 
 ### Vitals Version check
 When loading vitals from a file (`--load-vitals`), Scylla Doctor verifies that the vitals version matches the running tool version.
@@ -236,7 +238,7 @@ Following sections are supported:
 
 | Section name      | Description                           |
 |-------------------|---------------------------------------|
-| General           | Global options (e.g. `include_output`) |
+| General           | Global options: `include_output` (same as `--include-output`) |
 | DefaultPaths      | Definitions of paths (see more below) |
 | CQL               | CQL credentials                       |
 | \<Collector name> | Specific Collector parameters         |
@@ -517,7 +519,7 @@ skip_sysctls = net.core.rps_sock_flow_entries
 This analyzer performs two independent checks:
 
 1. **Source validation** — every key present in `scylla.yaml` must have `source = config` in `system.config`; every key absent from `scylla.yaml` must have `source = default` or `source = internal`.
-2. **Value validation** — every key present in `scylla.yaml` must have the same value in `system.config`.
+2. **Value validation** — every key present in `scylla.yaml` must have the same value in `system.config`. String values in `scylla.yaml` (e.g. `auto_bootstrap: "true"`, `native_transport_port_ssl: "9142"`) are converted to the `bool`, `integer`, `float` or `double` type reported by `system.config` before comparing, as Scylla does.
 
 | Field name (default value)      | Description                                                                                                  |
 |---------------------------------|--------------------------------------------------------------------------------------------------------------|

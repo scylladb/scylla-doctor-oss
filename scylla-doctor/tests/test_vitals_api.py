@@ -224,6 +224,65 @@ def test_save_vitals_include_output_global(doctor_factory, tmp_path, how):
     assert entry["output"][0]["value"] == "detail"
 
 
+def test_save_vitals_include_output_per_collector(doctor_factory, tmp_path):
+    """A collector with include_output_default keeps its output in saved vitals without the global flag."""
+    from tests.helpers import DummyBaseCollector
+
+    class OutputOnlyCollector(DummyBaseCollector):
+        @property
+        def include_output_default(self):
+            return True
+
+    doctor = doctor_factory(collectors=[DummyBaseCollector, OutputOnlyCollector], analyzers=())
+    assert doctor.include_output_in_vitals() is False
+    doctor.vitals["DummyBaseCollector"] = _result(data={"x": 1}, verbose_value="plain")
+    doctor.vitals["OutputOnlyCollector"] = _result(verbose_value="kept")
+    path = tmp_path / "vitals.json"
+    doctor.save_vitals(str(path))
+
+    saved = json.loads(path.read_text())
+    assert "output" not in saved["DummyBaseCollector"]
+    assert saved["OutputOnlyCollector"]["output"][0]["value"] == "kept"
+
+
+@pytest.mark.parametrize("value,expected", [("no", False), ("0", False), ("false", False), ("off", False),
+                                            ("yes", True), ("1", True), ("true", True), ("on", True), ("", None)])
+def test_collector_include_output_config_override(doctor_factory, value, expected):
+    """[<Collector>] include_output overrides the class default in both directions."""
+    from tests.helpers import DummyBaseCollector
+
+    class OutputOnlyCollector(DummyBaseCollector):
+        @property
+        def include_output_default(self):
+            return True
+
+    config = [("OutputOnlyCollector", "include_output", value)] if value else ()
+    doctor = doctor_factory(collectors=[OutputOnlyCollector], analyzers=(), config_options=config)
+    collector = doctor.collectors["OutputOnlyCollector"]
+    assert collector.include_output is (expected if expected is not None else True)
+    assert doctor.collector_includes_output("OutputOnlyCollector") is collector.include_output
+    assert doctor.collector_includes_output("Missing") is False
+    assert 'include_output' in collector.config_parameters
+
+
+def test_collector_include_output_invalid_value_rejected(doctor_factory):
+    """A typo must not silently drop a default-on collector's only payload."""
+    from tests.helpers import DummyBaseCollector
+
+    doctor = doctor_factory(collectors=[DummyBaseCollector], analyzers=(),
+                            config_options=[("DummyBaseCollector", "include_output", "yse")])
+    with pytest.raises(ValueError, match="DummyBaseCollector.*yse"):
+        doctor.collectors["DummyBaseCollector"].include_output
+
+
+def test_doctor_init_stores_output_for_default_on_collectors(doctor_factory):
+    """Production path: Doctor.__init__ enables retention per collector when the global switch is off."""
+    doctor = doctor_factory(collectors=None, analyzers=None)
+    assert doctor.should_store_output() is False
+    assert doctor.collectors["LSPCICollector"].output.enabled is True
+    assert doctor.collectors["ClockSourceCollector"].output.enabled is False
+
+
 def test_encoder_include_output_kwarg():
     result = _result(data={"x": 1}, verbose_value="detail")
     omitted = json.loads(json.dumps(result, cls=CollectorResult.Encoder, include_output=False))

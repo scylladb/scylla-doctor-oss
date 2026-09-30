@@ -101,7 +101,7 @@ class Doctor:
 
         for cls in collector_classes:
             collector = cls(self.environment.configuration, self.environment.paths)
-            collector.set_store_output(store_output)
+            collector.set_store_output(store_output or collector.include_output)
             self.collectors[collector.id] = collector
 
         for cls in analyzer_classes:
@@ -252,14 +252,17 @@ class Doctor:
                 if self.environment.args.abort_on_first_error:
                     raise AbortedException
 
+    def collector_includes_output(self, name: str) -> bool:
+        """Per-collector opt-in (Collector.include_output) for keeping `output` in saved vitals."""
+        collector = self.collectors.get(name)
+        return bool(collector and collector.include_output)
+
     def save_vitals(self, file_name="vitals.json"):
+        include_all = self.include_output_in_vitals()
+        payload = {name: result.as_dict(include_all or self.collector_includes_output(name))
+                   for name, result in self.vitals.items()}
         with open(file_name, 'w') as f:
-            json.dump(
-                self.vitals,
-                f,
-                cls=CollectorResult.Encoder,
-                include_output=self.include_output_in_vitals(),
-            )
+            json.dump(payload, f, cls=CollectorResult.Encoder)
 
     def _should_load_collector(self, collector) -> bool:
         # If this specific collector is known and skipped - don't load its value from Vitals
@@ -325,24 +328,11 @@ class Doctor:
         """
         return self.read_tool_version()
 
-    @staticmethod
-    def general_config_parameters() -> Dict[str, ConfigParameter]:
-        return {
-            'include_output': ConfigParameter(
-                description=(
-                    'Set to 1/yes/true/on to include collector output arrays in --save-vitals JSON. '
-                    'Also --include-output. Unset omits output to save space.'
-                ),
-                default_description='unset (omitted)',
-            ),
-        }
-
     def config_parameters(self, section: Optional[str] = None) -> Dict[str, Dict[str, ConfigParameter]]:
         """
         Return configuration parameters and defaults for collectors and analyzers.
-        :param section: Optional component class name, or ``General``. When set, return only that section.
+        :param section: Optional component class name. When set, return only that section.
         """
-        general = self.general_config_parameters()
         components: Dict[str, Union[Collector, Analyzer]] = {}
 
         for name in sorted(self.collectors.keys()):
@@ -351,18 +341,11 @@ class Doctor:
             components[name] = self.analyzers[name]
 
         if section is not None:
-            if section == 'General':
-                return {'General': general}
             if section not in components:
                 raise ValueError(f"Unknown section: {section}")
             return {section: components[section].config_parameters}
 
-        result: Dict[str, Dict[str, ConfigParameter]] = {'General': general}
-        for name, component in components.items():
-            if not type(component).config_parameters_definitions():
-                continue
-            result[name] = component.config_parameters
-        return result
+        return {name: component.config_parameters for name, component in components.items()}
 
     def print_config_parameters(self,
                                 section: Optional[str] = None,
@@ -472,7 +455,7 @@ class DoctorEnvironment:
         self.__parser.add_argument('--version', help="Print Scylla Doctor version and exit", action="store_true")
         self.__parser.add_argument('--list-parameters', nargs='?', const='', default=None, metavar='SECTION',
                                    help="Print configuration parameters and defaults. "
-                                        "Optional SECTION limits output to General or one collector/analyzer.")
+                                        "Optional SECTION limits output to one collector/analyzer.")
         self.__parser.add_argument('--list-parameters-json', action='store_true',
                                    help="Output --list-parameters as JSON (implies --list-parameters)")
         self.__parser.add_argument('--vitals-version', nargs='?', default=None, const='vitals.json',

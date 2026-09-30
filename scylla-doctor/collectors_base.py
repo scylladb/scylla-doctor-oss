@@ -15,7 +15,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with Scylla Doctor.  If not, see <http://www.gnu.org/licenses/>.
 
-from common import DictView, Paths, ConfigValuesParser
+from common import DictView, Paths, ConfigValuesParser, ConfigParameter
 from models.output_entry import OutputEntry, OutputEntryType, Level
 from typing import Any, Dict, List, Optional, Set, Sequence, Union, Iterable, Type
 import abc
@@ -129,10 +129,7 @@ class CollectorResult:
 
         def default(self, o):
             if isinstance(o, CollectorResult):
-                d = {f.name: getattr(o, f.name) for f in dataclasses.fields(o)}
-                if not self.include_output:
-                    d.pop('output', None)
-                return d
+                return o.as_dict(self.include_output)
             if isinstance(o, enum.Enum):
                 return o.value
             if isinstance(o, OutputEntry):
@@ -194,6 +191,13 @@ class CollectorResult:
             )
         except Exception as e:
             raise ValueError(f"Cannot parse to CollectorResult: {str(e)}, {str(json_obj)}")
+
+    def as_dict(self, include_output: bool = True) -> dict:
+        """Plain dict for JSON encoding; ``output`` dropped unless requested (see Doctor.save_vitals)."""
+        d = {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
+        if not include_output:
+            d.pop('output', None)
+        return d
 
     @staticmethod
     def any_key_mask():
@@ -322,6 +326,41 @@ class Collector(ConfigValuesParser, abc.ABC):
 
         self._config = configuration.get(self.id, {})
         self._paths = paths
+
+    @property
+    def include_output_default(self) -> bool:
+        """
+        Override to return True on collectors whose useful payload lives in `output` (raw command text that has no
+        structured `data` counterpart): their output is then retained and saved in vitals even without the global
+        --include-output.
+        """
+        return False
+
+    @property
+    def include_output(self) -> bool:
+        """
+        Per-collector opt-in to keep `output` in --save-vitals; OR-ed with the global --include-output, so `no` only
+        matters when the global switch is off. `[<Collector>] include_output` overrides the class default.
+        :raise ValueError: on a value outside the documented yes/no sets, so a typo cannot silently drop a payload.
+        """
+        raw = self.config.get('include_output', '').strip().lower()
+        if not raw:
+            return self.include_output_default
+        if raw in ("1", "yes", "true", "on"):
+            return True
+        if raw in ("0", "no", "false", "off"):
+            return False
+        raise ValueError(f"[{self.id}] include_output: invalid value '{raw}', expected yes/no")
+
+    @property
+    def config_parameters(self) -> Dict[str, ConfigParameter]:
+        params = super().config_parameters
+        params['include_output'] = ConfigParameter(
+            description='Set to 1/yes/true/on to keep this collector\'s `output` in --save-vitals even without the '
+                        'global --include-output; no/0/false/off omits it unless the global switch is on.',
+            default_description='yes' if self.include_output_default else 'unset (omitted unless --include-output)',
+        )
+        return params
 
     def set_store_output(self, enabled: bool) -> None:
         """Collector-wide: whether put() retains diagnostic entries."""
