@@ -207,3 +207,8 @@ v1.14
   * OSSupportAnalyzer: check OS vs Scylla version by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/292
   * Include shard to CPU mapping in vitals by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/314
   * Add DiskPerformanceExceededCollector and DiskPerformanceExceededAnalyzer by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/317
+
+v1.14.1:
+* Fixes:
+  * Keep output-only collectors' output in vitals by default; store DESC SCHEMA in data by @vreniers in https://github.com/scylladb/scylla-doctor/pull/325
+  * ScyllaConfigurationConsistencyAnalyzer: coerce scylla.yaml strings to system.config types by @vreniers in https://github.com/scylladb/scylla-doctor/pull/326

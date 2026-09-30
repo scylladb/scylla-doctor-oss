@@ -45,8 +45,9 @@ make clean_tgz
 
 # How publish a new release
 1. Update version files `dist/common/{major,minor}` in the `master` branch.
-2. Create a new release with a tag according to values set in (1), e.g. `v4.2`.
+2. Create a new release with a tag according to values set in (1), e.g. `scylla-doctor-v4.2`.
 3. The moment a new release is published new versioned artifacts are going to be uploaded
-   to ScyllaDB's S3 bucket and on downloads.scylladb.com.
+   to ScyllaDB's S3 bucket and on downloads.scylladb.com. The publish workflows verify
+   that the release tag matches `dist/common/{major,minor}` before publishing anything.
 
 

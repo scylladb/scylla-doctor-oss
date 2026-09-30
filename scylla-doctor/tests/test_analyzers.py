@@ -2990,6 +2990,42 @@ def test_ScyllaConfigurationConsistencyAnalyzer_bool_normalization():
             ], initial_vitals=vitals)
 
 
+def test_ScyllaConfigurationConsistencyAnalyzer_yaml_string_scalars():
+    """
+    Quoted scylla.yaml scalars (e.g. `auto_bootstrap: "true"`) and an unquoted `1e-05` are strings for PyYAML,
+    while Scylla converts them to the option's type. They must not be reported as divergent.
+    """
+    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer({})
+    scylla_config_vitals = {
+        'SystemConfigCollector': CollectorResult(CollectorStatus.PASSED, {
+            'auto_bootstrap': {'value': True, 'source': 'config', 'type': 'bool'},
+            'start_rpc': {'value': False, 'source': 'config', 'type': 'bool'},
+            'native_transport_port_ssl': {'value': 9142, 'source': 'config', 'type': 'integer'},
+            'tablets_initial_scale_factor': {'value': 1e-05, 'source': 'config', 'type': 'double'},
+            'hinted_handoff_enabled': {'value': 'false', 'source': 'config', 'type': 'hinted handoff enabled'},
+            'client_encryption_options': {'value': {'enabled': 'true'}, 'source': 'config', 'type': 'string map'},
+        }, Output(), '')
+    }
+    good_yaml = {
+        'auto_bootstrap': 'true',
+        'start_rpc': 'false',
+        'native_transport_port_ssl': '9142',
+        'tablets_initial_scale_factor': '1e-05',
+        'hinted_handoff_enabled': 'false',
+        'client_encryption_options': {'enabled': 'true'},
+    }
+
+    check_analyzer(analyzer, "ScyllaConfigurationFileCollector", [
+        ({'pure_scylla_yaml': good_yaml},
+         AnalyzerResult(AnalyzerStatus.PASSED, "Scylla configuration is consistent")),
+        ({'pure_scylla_yaml': {**good_yaml, 'auto_bootstrap': 'false', 'native_transport_port_ssl': '9143',
+                               'tablets_initial_scale_factor': 'not-a-number',
+                               'client_encryption_options': {'enabled': 'false'}}},
+         AnalyzerResult(AnalyzerStatus.FAILED, "keys: ['auto_bootstrap', 'client_encryption_options', "
+                                               "'native_transport_port_ssl', 'tablets_initial_scale_factor']")),
+    ], initial_vitals=scylla_config_vitals)
+
+
 def test_ScyllaConfigurationConsistencyAnalyzer_values_test():
     """
     Test the validation of configuration values

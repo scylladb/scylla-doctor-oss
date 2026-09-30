@@ -1800,6 +1800,7 @@ def test_ScyllaClusterSchemaDescriptionCollector(doctor_factory, await_scylla_st
     result = doctor.vitals['ScyllaClusterSchemaDescriptionCollector']
     assert result.status == CollectorStatus.PASSED, result.message
     assert_output_gathered(result, OutputEntryType.CQL, "DESC SCHEMA", value_content="test_keyspace")
+    assert "test_keyspace" in result.data['schema']
 
 
 def test_ScyllaClusterSystemKeyspacesCollector(doctor_factory, await_scylla_start):

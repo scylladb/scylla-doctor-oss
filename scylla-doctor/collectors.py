@@ -308,6 +308,10 @@ class ClientConnectionCollector(Collector):
 
 class FirewallRulesCollector(Collector):
     @property
+    def include_output_default(self) -> bool:
+        return True
+
+    @property
     def name(self) -> str:
         return "Gather firewall rules"
 
@@ -442,6 +446,10 @@ class InfrastructureProviderCollector(Collector):
 
 class IPAddressesCollector(Collector):
     @property
+    def include_output_default(self) -> bool:
+        return True
+
+    @property
     def name(self) -> str:
         return "Network interface controller addresses"
 
@@ -470,6 +478,10 @@ class IPAddressesCollector(Collector):
 
 
 class KernelRingBufferCollector(Collector):
+    @property
+    def include_output_default(self) -> bool:
+        return True
+
     @property
     def name(self) -> str:
         return "Kernel ring buffer (dmesg)"
@@ -1389,6 +1401,10 @@ class CqlshCollector(Collector):
 
 class ScyllaClusterSchemaDescriptionCollector(Collector):
     @property
+    def include_output_default(self) -> bool:
+        return True
+
+    @property
     def name(self) -> str:
         return "Cluster schema description"
 
@@ -1413,6 +1429,9 @@ class ScyllaClusterSchemaDescriptionCollector(Collector):
             self._message = "Cannot retrieve schema description"
             return
 
+        # Raw `DESC SCHEMA` text is consumed programmatically (e.g. to recreate a schema), so it lives in `data`
+        # as well as in the diagnostic output.
+        self._data['schema'] = output.stdout
         self._output.put(OutputEntryType.CQL, command, output.stdout, level=Level.VERBOSE)
         self.status = CollectorStatus.PASSED
 
@@ -3281,6 +3300,10 @@ class SwapCollector(Collector):
 
 class TCPConnectionsCollector(Collector):
     @property
+    def include_output_default(self) -> bool:
+        return True
+
+    @property
     def name(self) -> str:
         return "TCP connections"
 
@@ -3358,6 +3381,10 @@ class HypervisorTypeCollector(Collector):
 
 
 class ProcInterruptsCollector(Collector):
+    @property
+    def include_output_default(self) -> bool:
+        return True
+
     """
     Collect the content of /proc/interrupts
     """
@@ -3373,6 +3400,10 @@ class ProcInterruptsCollector(Collector):
 
 
 class LSPCICollector(Collector):
+    @property
+    def include_output_default(self) -> bool:
+        return True
+
     """
     Collect the output of 'lspci -vvv'
     """
@@ -3419,6 +3450,10 @@ class SeastarCPUMapCollector(Collector):
 
 
 class NodetoolCFStatsCollector(Collector):
+    @property
+    def include_output_default(self) -> bool:
+        return True
+
     @property
     def name(self) -> str:
         return "nodetool cfstats"

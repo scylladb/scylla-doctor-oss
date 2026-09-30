@@ -3646,6 +3646,27 @@ class ScyllaConfigurationConsistencyAnalyzer(Analyzer):
             ),
         }
 
+    @staticmethod
+    def __coerce_yaml_type(config_type: Optional[str], value: Any) -> Any:
+        """
+        Scylla (yaml-cpp) converts a scalar to the option's type, so `auto_bootstrap: "true"` or
+        `native_transport_port_ssl: "9142"` are valid. PyYAML keeps quoted scalars as strings, and so is an unquoted
+        `1e-05` (YAML 1.1 floats require a dot). Convert such strings to the type reported by system.config and leave
+        the value unchanged when it doesn't parse, so a real mismatch is still reported.
+        """
+        if not isinstance(value, str):
+            return value
+        try:
+            if config_type == 'bool':
+                return {'true': True, 'false': False}[value.lower()]
+            if config_type == 'integer':
+                return int(value)
+            if config_type in ('float', 'double'):
+                return float(value)
+        except (KeyError, ValueError):
+            pass  # not a literal of that type: keep the string so the value check reports the mismatch
+        return value
+
     def __validate_config_source(self, vitals: DictView) -> Tuple[List[str], Set[str]]:
         """
         Check that every key that is not present in scylla.yaml has a 'default' or 'internal' as a source and every one
@@ -3728,9 +3749,11 @@ class ScyllaConfigurationConsistencyAnalyzer(Analyzer):
             elif scylla_config_values_dict[tri_state_key] in [True, 1, 'true', '1']:
                 scylla_config_values_dict[tri_state_key] = '1'
 
-        # hinted_handoff_enabled can get a string or a boolean value
-        if scylla_config_values_dict.get('hinted_handoff_enabled') == 'false':
-            scylla_config_values_dict['hinted_handoff_enabled'] = False
+        # hinted_handoff_enabled can get a string or a boolean value, in scylla.yaml as well as in system.config
+        for config_dict in (scylla_yaml_dict, scylla_config_values_dict):
+            hinted_handoff = config_dict.get('hinted_handoff_enabled')
+            if isinstance(hinted_handoff, str) and hinted_handoff.lower() in ('true', 'false'):
+                config_dict['hinted_handoff_enabled'] = hinted_handoff.lower() == 'true'
 
         # max_memory_for_unlimited_query is an alias for max_memory_for_unlimited_query_hard_limit
         if 'max_memory_for_unlimited_query' in scylla_yaml_dict:
@@ -3746,11 +3769,13 @@ class ScyllaConfigurationConsistencyAnalyzer(Analyzer):
 
         def to_bool(val: Any) -> bool:
             """
-            Convert a value from system.config to bool, handling string representations.
+            Convert a scylla.yaml or system.config value to bool, handling string representations.
             """
             if isinstance(val, str):
                 return val.lower() in ('1', 'true', 'yes')
             return bool(val)
+
+        config_types = {key: value.get('type') for key, value in vitals[self.__scylla_config_collector].data.items()}
 
         divergent_keys = []
         for k, v in scylla_yaml_dict.items():
@@ -3759,6 +3784,9 @@ class ScyllaConfigurationConsistencyAnalyzer(Analyzer):
             if (k in {"client_encryption_options", "system_info_encryption", "user_info_encryption"} and
                     k in scylla_config_values_dict and 'enabled' in scylla_config_values_dict[k]):
                 scylla_config_values_dict[k]['enabled'] = to_bool(scylla_config_values_dict[k]['enabled'])
+                # scylla.yaml may quote it as well, e.g. `enabled: "true"`
+                if isinstance(v, dict) and 'enabled' in v:
+                    v['enabled'] = to_bool(v['enabled'])
 
             if k == "kms_hosts" and k in scylla_config_values_dict:
                 for sub_key in ["aws_use_ec2_credentials", "aws_use_ec2_region"]:
@@ -3771,7 +3799,7 @@ class ScyllaConfigurationConsistencyAnalyzer(Analyzer):
             if k not in scylla_config_values_dict or k in skip_keys:
                 continue
 
-            if scylla_config_values_dict[k] != v:
+            if scylla_config_values_dict[k] != self.__coerce_yaml_type(config_types[k], v):
                 divergent_keys.append(k)
 
         return sorted(divergent_keys), user_skip_keys
