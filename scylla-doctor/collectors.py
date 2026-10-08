@@ -1420,6 +1420,13 @@ class ScyllaClusterSchemaDescriptionCollector(Collector):
     def depends_on(self) -> Set[str]:
         return {self.__collector_cql, self.__collector_config}
 
+    @property
+    def mask(self) -> Sequence[Union[str, Iterable]]:
+        # `DESC SCHEMA` emits statements in a non-deterministic per-node order, so a raw-text diff flags identical
+        # schemas as inconsistent; exclude it from the cluster diff (agreement is checked by
+        # ScyllaClusterSchemaAnalyzer).
+        return ['schema']
+
     def _collect(self, vitals: DictView) -> None:
         command = "DESC SCHEMA"
         output = Executor.cqlsh(command, vitals[self.__collector_config].data)
@@ -3178,6 +3185,17 @@ class StorageConfigurationCollector(Collector):
     def name(self) -> str:
         return "Storage configuration"
 
+    @staticmethod
+    def _is_network_backed(device: str) -> bool:
+        # AWS Nitro instances expose EBS volumes as nvme* devices, see
+        # https://docs.aws.amazon.com/ebs/latest/userguide/nvme-ebs-volumes.html
+        disk = re.sub(r'p\d+$', '', device)
+        try:
+            model = Executor.read_file_content(f"/sys/block/{disk}/device/model")[0]
+        except (OSError, IndexError):
+            return False
+        return "elastic block store" in model.lower()
+
     @property
     def __collector_platform(self) -> str:
         return "NodePlatformCollector"
@@ -3236,6 +3254,14 @@ class StorageConfigurationCollector(Collector):
                 non_nvme = Executor.search_string("Setting non-NVMe disks", output.stdout.split("\n"))
                 non_nvme_devices = sorted(set(non_nvme[0].split(":")[1].strip()[:-3].split(", ")) if non_nvme else set())  # noqa: E501
 
+                # 'nvme'/'non_nvme' above are perftune's name-based split and say nothing about where
+                # a device physically lives. 'network_backed' is an independent locality axis over both
+                # lists: it names the devices we could positively identify as network-attached (today only
+                # AWS EBS, which Nitro exposes as nvme*). It is best-effort - not being listed is not proof
+                # of local storage, e.g. an NVMe-over-fabrics target is indistinguishable here.
+                network_backed_devices = sorted(device for device in nvme_devices + non_nvme_devices
+                                                if self._is_network_backed(device))
+
                 # Check storage filesystem and size
                 command = "df -T {}".format(path)
                 output = Executor.run_command(command)
@@ -3264,7 +3290,8 @@ class StorageConfigurationCollector(Collector):
                 self._data[dir][path] = {
                     'devices': {
                         'nvme': nvme_devices,
-                        'non_nvme': non_nvme_devices
+                        'non_nvme': non_nvme_devices,
+                        'network_backed': network_backed_devices
                     },
                     'filesystem': filesystem,
                     'mountpoint': mountpoint,

@@ -2375,9 +2375,11 @@ class ScyllaClusterSystemKeyspacesReplicationAnalyzer(Analyzer):
         """
         Check that system keyspaces use NetworkTopologyStrategy and have sufficient replication factor.
         system_auth is skipped for System-auth-2 (Consistent Topology done, or system_auth_v2 present).
+        Replication factor 0 in a DC only warns; the DC should be removed from the keyspace instead.
         """
         node_count = len(vitals[self.__collector_nodes].data['up']) + len(vitals[self.__collector_nodes].data['down'])
         errors = []
+        warnings = []
         keyspaces = dict(self.__keyspaces)
         if system_auth_managed_by_raft(vitals[self.__collector_keyspaces].data,
                                        vitals[self.__collector_topology].data):
@@ -2393,14 +2395,24 @@ class ScyllaClusterSystemKeyspacesReplicationAnalyzer(Analyzer):
             if self.__strategy not in replication['class']:
                 errors.append(f"{keyspace} keyspace is not using '{self.__strategy}' strategy")
 
-            if settings.get("check_replication_factor", True):
-                for dc in replication.keys():
-                    if dc != "class" and int(replication[dc]) < min(3, node_count):
-                        errors.append(f"{keyspace} keyspace has replication factor {replication[dc]} in {dc}")
+            for dc in replication.keys():
+                if dc == "class":
+                    continue
+                rf = int(replication[dc])
+                if rf == 0:
+                    warnings.append(
+                        f"{keyspace} keyspace has replication factor 0 in {dc}; "
+                        "remove the DC from the replication settings"
+                    )
+                elif settings.get("check_replication_factor", True) and rf < min(3, node_count):
+                    errors.append(f"{keyspace} keyspace has replication factor {replication[dc]} in {dc}")
 
         if errors:
             self.status = AnalyzerStatus.FAILED
-            self.message = ";".join(errors)
+            self.message = ";".join(errors + warnings)
+        elif warnings:
+            self.status = AnalyzerStatus.WARNING
+            self.message = ";".join(warnings)
         else:
             self.status = AnalyzerStatus.PASSED
             self.message = "All system keyspaces are ok"
@@ -2446,8 +2458,10 @@ class ScyllaKeyspacesReplicationAnalyzer(Analyzer):
         """
         Check that all keyspaces except for a few known ones use NetworkTopologyStrategy.
         Leftover system_auth is skipped for System-auth-2 (Consistent Topology done, or system_auth_v2 present).
+        Warns if a NetworkTopologyStrategy DC has replication factor 0.
         """
         errors = []
+        warnings = []
         keyspaces_schema = vitals[self.__collector_keyspaces].data
         skip_legacy_auth = system_auth_managed_by_raft(keyspaces_schema,
                                                        vitals[self.__collector_topology].data)
@@ -2460,10 +2474,24 @@ class ScyllaKeyspacesReplicationAnalyzer(Analyzer):
 
             if expected_replication not in replication:
                 errors.append(f"'{keyspace}' is using '{replication}', expected '{expected_replication}'")
+                continue
+
+            if self.__network_topology_strategy in replication:
+                for dc, rf in replication_config.items():
+                    if dc == "class":
+                        continue
+                    if int(rf) == 0:
+                        warnings.append(
+                            f"{keyspace} keyspace has replication factor 0 in {dc}; "
+                            "remove the DC from the replication settings"
+                        )
 
         if errors:
             self.status = AnalyzerStatus.FAILED
-            self.message = ";".join(errors)
+            self.message = ";".join(errors + warnings)
+        elif warnings:
+            self.status = AnalyzerStatus.WARNING
+            self.message = ";".join(warnings)
         else:
             self.status = AnalyzerStatus.PASSED
             self.message = "All keyspaces are ok"
@@ -3375,12 +3403,22 @@ class StorageTypeAnalyzer(Analyzer):
 
     def _analyze(self, vitals: DictView) -> None:
         """
-        Check that all data-related directories settle on NVME disks.
+        Check that all data-related directories settle on local NVME disks (storage detected as
+        network-attached, such as AWS EBS, counts as non-NVMe).
         """
-        nvme_devices_count = sum([len(dir_stats['devices']['nvme'])
-                                  for dir_stats in vitals[self.__collector].data['data_file_directories'].values()])
-        non_nvme_devices_count = sum([len(dir_stats['devices']['non_nvme'])
-                                      for dir_stats in vitals[self.__collector].data['data_file_directories'].values()])
+        data_dirs = vitals[self.__collector].data['data_file_directories'].values()
+
+        # A network-attached volume (e.g. AWS EBS) is named nvme* on AWS Nitro but gives none of the
+        # latency guarantees of a local NVMe, so it is counted on the non-NVMe side here.
+        nvme_devices_count = 0
+        non_nvme_devices_count = 0
+        network_backed_count = 0
+        for dir_stats in data_dirs:
+            devices = dir_stats['devices']
+            network_backed = set(devices.get('network_backed', []))
+            nvme_devices_count += len(set(devices['nvme']) - network_backed)
+            non_nvme_devices_count += len(set(devices['non_nvme']) | (set(devices['nvme']) & network_backed))
+            network_backed_count += len(network_backed)
 
         if not nvme_devices_count and not non_nvme_devices_count:
             self.status = AnalyzerStatus.FAILED
@@ -3397,8 +3435,10 @@ class StorageTypeAnalyzer(Analyzer):
             self.status = AnalyzerStatus.PASSED
             disk_type = "NVME"
 
-        storage_size = sum([dir_stats['storage_size_kb'] for dir_stats
-                            in vitals[self.__collector].data['data_file_directories'].values()])
+        if network_backed_count:
+            disk_type += ", incl. network-attached storage (e.g. AWS EBS)"
+
+        storage_size = sum([dir_stats['storage_size_kb'] for dir_stats in data_dirs])
         storage_unit = HumanBytesUnitFormat.get_format_for_kib(storage_size)
         self.message = (f"{self.format_float(storage_unit.translate_kib(storage_size))} {storage_unit} "
                         f"detected ({disk_type})")

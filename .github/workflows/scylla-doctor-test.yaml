@@ -63,3 +63,17 @@ jobs:
       - name: Test
         working-directory: scylla-doctor
         run: python3 -m pytest --cov=. -vv
+
+  # The runner removes the job container with `docker rm --force` (no -v), orphaning the
+  # anonymous volume for the image's VOLUME /var/lib/scylla (~600 MB per run). Volumes still
+  # attached to a container are never pruned.
+  # ponytail: relies on cleanup landing on the host that ran `all`, which holds while the repo
+  #           has one self-hosted runner. With more runners, move the prune into a runner job hook.
+  cleanup:
+    needs: all
+    if: always() && github.repository_owner == 'scylladb'
+    runs-on:
+      - self-hosted
+    steps:
+      - name: Remove orphaned anonymous Docker volumes
+        run: docker volume prune -f --filter label=com.docker.volume.anonymous
