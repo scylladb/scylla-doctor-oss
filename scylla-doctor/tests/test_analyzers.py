@@ -1314,6 +1314,26 @@ def test_StorageTypeAnalyzer():
         ({'data_file_directories': {'/my/path': {'devices': {'nvme': {'some'}, 'non_nvme': {'more'}},
                                                  'storage_size_kb': 1024}}},
          AnalyzerResult(AnalyzerStatus.WARNING, "detected (NVME + non-NVME)")),
+        # nvme* devices that are network-backed (e.g. AWS EBS) count as non-NVME
+        ({'data_file_directories': {'/my/path': {'devices': {'nvme': ['nvme0n1'], 'non_nvme': [],
+                                                             'network_backed': ['nvme0n1']},
+                                                 'storage_size_kb': 1024}}},
+         AnalyzerResult(AnalyzerStatus.WARNING, "detected (non-NVME, incl. network-attached storage (e.g. AWS EBS))")),
+        ({'data_file_directories': {'/my/path': {'devices': {'nvme': ['nvme0n1', 'nvme1n1'], 'non_nvme': [],
+                                                             'network_backed': ['nvme0n1']},
+                                                 'storage_size_kb': 1024}}},
+         AnalyzerResult(AnalyzerStatus.WARNING,
+                        "detected (NVME + non-NVME, incl. network-attached storage (e.g. AWS EBS))")),
+        ({'data_file_directories': {'/my/path': {'devices': {'nvme': ['nvme0n1'], 'non_nvme': [],
+                                                             'network_backed': []},
+                                                 'storage_size_kb': 1024}}},
+         AnalyzerResult(AnalyzerStatus.PASSED, "detected (NVME)")),
+        # a network-backed non-NVMe device is already on the non-NVMe side, so it must not be counted twice
+        ({'data_file_directories': {'/my/path': {'devices': {'nvme': ['nvme0n1'], 'non_nvme': ['sda'],
+                                                             'network_backed': ['sda']},
+                                                 'storage_size_kb': 1024}}},
+         AnalyzerResult(AnalyzerStatus.WARNING,
+                        "detected (NVME + non-NVME, incl. network-attached storage (e.g. AWS EBS))")),
     ])
 
 
@@ -1518,6 +1538,14 @@ def test_ScyllaClusterSystemKeyspacesReplicationAnalyzer():
     bad_replication['us-central1_us'] = '1'
     bad_keyspaces_with_audit = dict(good_keyspaces, **{"audit": {'replication': repr(bad_replication)}})
 
+    zero_rf_replication = copy.deepcopy(replication)
+    zero_rf_replication['us-central1_us'] = '0'
+    zero_rf_keyspaces = copy.deepcopy(good_keyspaces)
+    zero_rf_keyspaces['system_auth']['replication'] = repr(zero_rf_replication)
+
+    traces_zero_rf = copy.deepcopy(good_keyspaces)
+    traces_zero_rf['system_traces']['replication'] = repr(zero_rf_replication)
+
     broken_keyspaces = copy.deepcopy(good_keyspaces)
     replication['class'] = "SimpleStrategy"
     broken_keyspaces[random.choice(list(broken_keyspaces.keys()))]['replication'] = repr(replication)
@@ -1533,6 +1561,10 @@ def test_ScyllaClusterSystemKeyspacesReplicationAnalyzer():
          AnalyzerResult(AnalyzerStatus.PASSED, "All system keyspaces")),
         (bad_keyspaces_with_audit,
          AnalyzerResult(AnalyzerStatus.FAILED, "audit keyspace has replication factor 1")),
+        (zero_rf_keyspaces,
+         AnalyzerResult(AnalyzerStatus.WARNING, "system_auth keyspace has replication factor 0")),
+        (traces_zero_rf,
+         AnalyzerResult(AnalyzerStatus.WARNING, "system_traces keyspace has replication factor 0")),
     ], initial_vitals=vitals)
 
 
@@ -4394,3 +4426,24 @@ def test_ScyllaKeyspacesReplicationAnalyzer_system_auth_v2_wrong_strategy():
                                "system_auth_v2",
                                "org.apache.cassandra.locator.NetworkTopologyStrategy",
                                "LocalStrategy"))
+
+
+def test_ScyllaKeyspacesReplicationAnalyzer_rf_zero():
+    """
+    NetworkTopologyStrategy with RF 0 in a DC only warns; the DC should be removed instead.
+    """
+    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    schema = {
+        "my_ks": {
+            "replication": (
+                "{'class': 'org.apache.cassandra.locator.NetworkTopologyStrategy', "
+                "'asia-southeast1': '0', 'dc1': '3'}"
+            )
+        },
+    }
+    analyzer.analyze(_make_ks_replication_vitals(schema))
+    assert_analyzer_result(
+        analyzer, AnalyzerStatus.WARNING,
+        "my_ks keyspace has replication factor 0 in asia-southeast1; "
+        "remove the DC from the replication settings",
+    )

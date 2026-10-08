@@ -1327,6 +1327,98 @@ def test_StorageConfigurationCollector(doctor_factory, provider_identify_shorten
             assert (len(dir_stats['mount_options']) > 0)
 
 
+def test_StorageConfigurationCollector_is_network_backed(monkeypatch):
+    models = {
+        '/sys/block/nvme0n1/device/model': ['Amazon Elastic Block Store              \n'],
+        '/sys/block/nvme1n1/device/model': ['Amazon EC2 NVMe Instance Storage        \n'],
+    }
+
+    def fake_read(path):
+        try:
+            return models[path]
+        except KeyError:
+            raise FileNotFoundError(path)
+
+    monkeypatch.setattr(collectors.Executor, 'read_file_content', fake_read)
+
+    assert collectors.StorageConfigurationCollector._is_network_backed('nvme0n1') is True
+    # partition names resolve to the parent disk
+    assert collectors.StorageConfigurationCollector._is_network_backed('nvme0n1p1') is True
+    assert collectors.StorageConfigurationCollector._is_network_backed('nvme1n1') is False
+    # unknown device (no model file) is not treated as network-backed
+    assert collectors.StorageConfigurationCollector._is_network_backed('sda') is False
+
+
+def test_StorageConfigurationCollector_collect_wires_network_backed(doctor_factory, monkeypatch):
+    """
+    _collect() must expose _is_network_backed()'s verdict through devices['network_backed'],
+    not just the standalone helper. The locality check spans both the nvme and the non_nvme list.
+    """
+    doctor = doctor_factory(collectors=[collectors.StorageConfigurationCollector])
+    collector = doctor.collectors['StorageConfigurationCollector']
+
+    perftune_stdout = (
+        "Setting NVMe disks: nvme0n1, nvme1n1XXX\n"
+        "Setting non-NVMe disks: sdaXXX\n"
+    )
+    mount_stdout = "/dev/nvme0n1 on /var/lib/scylla/data type xfs (rw,noatime)\n"
+    df_stdout = (
+        "Filesystem   Type 1K-blocks Used Available Use% Mounted on\n"
+        "/dev/nvme0n1 xfs  100       10   90        10%  /var/lib/scylla/data\n"
+    )
+
+    def fake_run_command(command, *args, **kwargs):
+        if "perftune.py" in command:
+            stdout = perftune_stdout
+        elif command == "mount":
+            stdout = mount_stdout
+        elif command.startswith("df -T"):
+            stdout = df_stdout
+        else:
+            raise AssertionError(f"unexpected command: {command}")
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout=stdout)
+
+    models = {
+        '/sys/block/nvme0n1/device/model': ['Amazon Elastic Block Store              \n'],
+        '/sys/block/nvme1n1/device/model': ['Amazon EC2 NVMe Instance Storage        \n'],
+        '/sys/block/sda/device/model': ['Amazon Elastic Block Store              \n'],
+    }
+
+    def fake_read_file_content(path):
+        try:
+            return models[path]
+        except KeyError:
+            raise FileNotFoundError(path)
+
+    fake_statvfs = os.statvfs_result((4096, 4096, 1000, 900, 900, 0, 0, 0, 0, 255))
+
+    monkeypatch.setattr(collectors.Executor, 'run_command', fake_run_command)
+    monkeypatch.setattr(collectors.Executor, 'read_file_content', fake_read_file_content)
+    monkeypatch.setattr(collectors.os, 'statvfs', lambda path: fake_statvfs)
+
+    vitals = {
+        'SystemConfigCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {
+                'workdir,W': {'value': ''},
+                'data_file_directories': {'value': ['/var/lib/scylla/data']},
+                'commitlog_directory': {'value': '/var/lib/scylla/commitlog'},
+                'hints_directory': {'value': '/var/lib/scylla/hints'},
+                'view_hints_directory': {'value': '/var/lib/scylla/view_hints'},
+            },
+            Output(), '',
+        ),
+    }
+
+    collector._collect(vitals)
+
+    assert collector.status == CollectorStatus.PASSED
+    devices = collector._data['data_file_directories']['/var/lib/scylla/data']['devices']
+    assert devices['nvme'] == ['nvme0n1', 'nvme1n1']
+    assert devices['non_nvme'] == ['sda']
+    assert devices['network_backed'] == ['nvme0n1', 'sda']
+
+
 def test_RAIDSetupCollector(doctor_factory):
     doctor = doctor_factory(collectors=[collectors.RAIDSetupCollector])
     doctor.run()
@@ -1801,6 +1893,21 @@ def test_ScyllaClusterSchemaDescriptionCollector(doctor_factory, await_scylla_st
     assert result.status == CollectorStatus.PASSED, result.message
     assert_output_gathered(result, OutputEntryType.CQL, "DESC SCHEMA", value_content="test_keyspace")
     assert "test_keyspace" in result.data['schema']
+
+
+def test_ScyllaClusterSchemaDescriptionCollector_masks_schema(doctor_factory):
+    """The schema text is masked, so `strip()` drops it before the cluster diff."""
+    doctor = doctor_factory(collectors=[collectors.ScyllaClusterSchemaDescriptionCollector])
+    collector = doctor.collectors['ScyllaClusterSchemaDescriptionCollector']
+    vitals = {'ScyllaConfigurationFileCollector': Mock(data={'rpc_address': 'localhost'})}
+
+    with patch.object(Executor, 'cqlsh', return_value=Mock(stdout="CREATE KEYSPACE a...;")):
+        collector._collect(vitals)
+
+    result = collector.result
+    assert result.data['schema']           # collected into data ...
+    result.strip()
+    assert 'schema' not in result.data     # ... but masked out before diffing
 
 
 def test_ScyllaClusterSystemKeyspacesCollector(doctor_factory, await_scylla_start):

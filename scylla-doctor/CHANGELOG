@@ -208,7 +208,13 @@ v1.14
   * Include shard to CPU mapping in vitals by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/314
   * Add DiskPerformanceExceededCollector and DiskPerformanceExceededAnalyzer by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/317
 
-v1.14.1:
+v1.14.1
 * Fixes:
   * Keep output-only collectors' output in vitals by default; store DESC SCHEMA in data by @vreniers in https://github.com/scylladb/scylla-doctor/pull/325
   * ScyllaConfigurationConsistencyAnalyzer: coerce scylla.yaml strings to system.config types by @vreniers in https://github.com/scylladb/scylla-doctor/pull/326
+
+v1.14.2
+* Fixes:
+  * DOCTOR-198: Detect network-backed NVMe (AWS EBS) as non-NVMe storage by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/330
+  * Fail when a keyspace DC has replication factor 0 by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/316
+  * scylla-doctor: Mask DESC SCHEMA text from the cluster diff by @igorribeiroduarte in https://github.com/scylladb/scylla-doctor/pull/329
