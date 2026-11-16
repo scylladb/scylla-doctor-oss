@@ -24,6 +24,7 @@ from collections import OrderedDict
 from typing import Tuple, Optional, Type
 
 import scylla_doctor
+import tests.helpers
 
 
 @pytest.fixture(scope='session')
@@ -42,8 +43,7 @@ def doctor_factory():
                 config_options=()):
 
         doctor_env = scylla_doctor.DoctorEnvironment([])
-        scylla_doctor.Executor.cql_config = doctor_env.get_config_section("CQL")
-        scylla_doctor.Executor.cql_config = doctor_env.get_config_section("Paths")
+        tests.helpers.bind_executor(doctor_env)
         for option in config_options:
             doctor_env.set_config_parameter(*option)
         doctor = scylla_doctor.Doctor(doctor_env)
@@ -81,10 +81,16 @@ def provider_identify_shorten_timeout_options():
 @pytest.fixture(scope="session")
 def await_scylla_start():
     attempts, delay = 120, 1
-    for i in range(0, attempts):
-        if subprocess.run("cqlsh localhost -e 'SELECT now() from system.local'",
-                          check=False, shell=True).returncode == 0:
-            return
+    # With client_encryption_options enabled Scylla serves 9042 as TLS only ("Starting listening for
+    # CQL clients on 127.0.0.1:9042 (encrypted ...)"), so the plaintext probe never succeeds there.
+    probes = [
+        "cqlsh localhost -e 'SELECT now() from system.local'",
+        "cqlsh localhost --ssl -e 'SELECT now() from system.local'",
+    ]
+    for _ in range(0, attempts):
+        for probe in probes:
+            if subprocess.run(probe, check=False, shell=True).returncode == 0:
+                return
         time.sleep(delay)
     assert False, 'Scylla did not start!'
 

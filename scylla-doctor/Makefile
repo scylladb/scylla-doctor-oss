@@ -3,11 +3,20 @@ SHELL=/bin/bash
 # Determine whether to use podman or docker
 CONTAINER_ENGINE := $(shell if command -v podman &> /dev/null; then echo podman; else echo docker; fi)
 
+# SSL=1 starts Scylla with client-to-node encryption (see ci/run_scylla_with_client_ssl.sh)
+SSL ?= 0
+
 .PHONY: container-build
 container-build: version
 	$(CONTAINER_ENGINE) build -t scylla-doctor-test -f Dockerfile.test .
 	$(CONTAINER_ENGINE) rm -f scylla-doctor-test || true
+ifeq ($(SSL),1)
+	$(CONTAINER_ENGINE) run --privileged -d --name scylla-doctor-test --cap-add=NET_ADMIN \
+		--entrypoint /doctor/ci/run_scylla_with_client_ssl.sh \
+		scylla-doctor-test --listen-address 127.0.0.1
+else
 	$(CONTAINER_ENGINE) run --privileged -d --name scylla-doctor-test --cap-add=NET_ADMIN scylla-doctor-test --listen-address 127.0.0.1
+endif
 
 .PHONY: container-enter
 container-enter: container-build
@@ -69,13 +78,15 @@ full:
 
 .PHONY: copy_stripped
 copy_stripped: version
-	cp scylla_doctor.py common.py collectors.py utils.py collectors_base.py analyzers_base.py version $(DEST_DIR)
-	cp -r models $(DEST_DIR)
+	cp scylla_doctor.py common.py utils.py collectors_base.py analyzers_base.py version $(DEST_DIR)
+	cp -r models collectors $(DEST_DIR)
+	find $(DEST_DIR)/models $(DEST_DIR)/collectors -name __pycache__ -prune -exec rm -rf {} +
 
 .PHONY: copy_all
 copy_all:
 	$(MAKE) copy_stripped
-	cp analyzers.py $(DEST_DIR)
+	cp -r analyzers $(DEST_DIR)
+	find $(DEST_DIR)/analyzers -name __pycache__ -prune -exec rm -rf {} +
 
 .PHONY: clean
 clean:

@@ -20,15 +20,32 @@ import shutil
 import zipapp
 import subprocess
 
+import pytest
 
-def test_portable_launch():
+
+# Stripped (make portable) and full (make full) builds
+@pytest.mark.parametrize('packages', [["models", "collectors"], ["models", "collectors", "analyzers"]])
+def test_portable_launch(packages):
     tmpdir_src = tempfile.TemporaryDirectory()
     tmpdir_dst = tempfile.TemporaryDirectory()
-    for f in ["scylla_doctor.py", "common.py", "utils.py", "collectors.py", "analyzers_base.py", "collectors_base.py"]:
+    for f in ["scylla_doctor.py", "common.py", "utils.py", "analyzers_base.py", "collectors_base.py"]:
         shutil.copy(f, tmpdir_src.name)
-    shutil.copytree("models", f"{tmpdir_src.name}/models")
+    for package in packages:
+        shutil.copytree(package, f"{tmpdir_src.name}/{package}")
     zipapp.create_archive(tmpdir_src.name, f"{tmpdir_dst.name}/scylla_doctor.pyz", "/opt/scylladb/python3/bin/python3",
                           "scylla_doctor:main")
-    output = subprocess.run(f"{tmpdir_dst.name}/scylla_doctor.pyz", capture_output=True)
+    output = subprocess.run(f"{tmpdir_dst.name}/scylla_doctor.pyz", capture_output=True, text=True)
     assert output.returncode == 0, output.stderr
     assert not output.stderr
+    # A zipapp whose package walk finds nothing still exits 0, so check collectors were discovered inside it
+    assert "SDVersionCollector" in output.stdout
+    assert "ClockSourceCollector" in output.stdout
+
+    # The --help epilog lists every discovered class, so it shows whether analyzers were found inside the zipapp
+    output = subprocess.run([f"{tmpdir_dst.name}/scylla_doctor.pyz", "--help"], capture_output=True, text=True)
+    assert output.returncode == 0, output.stderr
+    assert "ClockSourceCollector" in output.stdout
+    if "analyzers" in packages:
+        assert "ClockSourceAnalyzer" in output.stdout
+    else:
+        assert "Analyzers:" not in output.stdout

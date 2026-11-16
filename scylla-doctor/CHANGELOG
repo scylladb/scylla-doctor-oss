@@ -218,3 +218,21 @@ v1.14.2
   * DOCTOR-198: Detect network-backed NVMe (AWS EBS) as non-NVMe storage by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/330
   * Fail when a keyspace DC has replication factor 0 by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/316
   * scylla-doctor: Mask DESC SCHEMA text from the cluster diff by @igorribeiroduarte in https://github.com/scylladb/scylla-doctor/pull/329
+
+v1.15
+ * Fixes:
+   * scylla-doctor: read system.cluster_status with a server-side timeout by @vreniers in https://github.com/scylladb/scylla-doctor/pull/343
+   * scylla-doctor: redact credentials from the collected Scylla configuration by @vreniers in https://github.com/scylladb/scylla-doctor/pull/344
+   * SystemTabletsCollector: retry without base_table when the column is missing (DOCTOR-120) by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/324
+   * Drop ChronyServicesCollector and ChronyServicesAnalyzer by @igorribeiroduarte in https://github.com/scylladb/scylla-doctor/pull/348
+ * Enhancements:
+   * analyzers: Update Obsolete Driver API Endpoint by @igorribeiroduarte in https://github.com/scylladb/scylla-doctor/pull/334
+   * Add automated PR code review and comment-resolver bots by @ManjotS and @vreniers in https://github.com/scylladb/scylla-doctor/pull/336, https://github.com/scylladb/scylla-doctor/pull/337, https://github.com/scylladb/scylla-doctor/pull/338, https://github.com/scylladb/scylla-doctor/pull/339, https://github.com/scylladb/scylla-doctor/pull/341, https://github.com/scylladb/scylla-doctor/pull/342, https://github.com/scylladb/scylla-doctor/pull/345
+   * DOCTOR-131: add ClientCQLTimeoutAnalyzer for client vs server request timeouts by @vreniers in https://github.com/scylladb/scylla-doctor/pull/331
+   * CI: run workflows on GitHub-hosted runners by @vreniers in https://github.com/scylladb/scylla-doctor/pull/333
+   * Add NitroDetailedStatsCollector for AWS Nitro detailed NVMe/EBS stats by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/319
+   * Add CI coverage for client-to-node SSL by @ManjotS in https://github.com/scylladb/scylla-doctor/pull/305
+   * scylla-doctor: skip collectors a container or missing tool cannot support instead of failing (DOCTOR-139, DOCTOR-140) by @vreniers in https://github.com/scylladb/scylla-doctor/pull/335
+   * scylla-doctor: split collectors.py and analyzers.py into category packages, one module per category by @vreniers in https://github.com/scylladb/scylla-doctor/pull/340
+   * ScyllaSSTablesCollector: nest the file list by directory and sstable stem by @vreniers in https://github.com/scylladb/scylla-doctor/pull/323
+   * Record when the vitals were collected by @vreniers in https://github.com/scylladb/scylla-doctor/pull/346

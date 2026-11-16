@@ -17,6 +17,7 @@
 
 import copy
 import json
+import pkgutil
 import pytest
 import random
 
@@ -24,11 +25,15 @@ import scylla_doctor
 from models.output_entry import OutputEntryType
 from utils import Executor
 from unittest.mock import patch
+import analyzers
+import collectors
+from analyzers_base import Analyzer
 from collectors_base import UnableToReadScyllaRestApi, UnsupportedRestApiEndpoint, CollectorStatus, CollectorResult, \
     Collector
 from tests.helpers import DummyBaseCollector, DummyCollector, DummyFailedCollector, \
     DummyDependsOnFailedCollector, DummyCycle1Collector, DummyCycle2Collector, DummyRaisesCollector, \
-    DummySkippedCollector, DummyDependsOnSkippedCollector, assert_output_gathered, DummyScyllaRestAPIAwareCollector
+    DummySkippedCollector, DummyDependsOnSkippedCollector, assert_output_gathered, DummyScyllaRestAPIAwareCollector, \
+    DummyMissingCommandCollector, DummyMissingFileCollector, DummySkippedInContainerCollector
 
 
 def test_dependencies(doctor_factory):
@@ -62,8 +67,20 @@ def test_dependencies(doctor_factory):
     # Verify that DummyDependsOnSkippedCollector has the information about both failed and skipped dependencies
     assert (f"Required {DummyFailedCollector.name} Collector has not run successfully" in
             doctor.vitals['DummyDependsOnSkippedCollector'].message)
-    assert (f"Required {DummySkippedCollector.name} Collector was skipped" in
+    assert (f"Required {DummySkippedCollector.name} Collector was skipped: Skipped on purpose" in
             doctor.vitals['DummyDependsOnSkippedCollector'].message)
+
+
+@pytest.mark.parametrize("message,expected", [
+    ("Skipped on purpose", "Skipped on purpose"),
+    ("Required ACollector Collector was skipped: Skipped on purpose", "Skipped on purpose"),
+    ("Required ACollector Collector was skipped: Required BCollector Collector was skipped: 'mount' not installed",
+     "'mount' not installed"),
+    ("Required BCollector Collector was skipped: x, Required CCollector Collector was skipped: y", "x, y"),
+    (None, ""),
+])
+def test_skip_reason(message, expected):
+    assert CollectorResult(CollectorStatus.SKIPPED, {}, None, message).skip_reason == expected  # type: ignore[arg-type]
 
 
 def test_config_skip(doctor_factory):
@@ -94,6 +111,38 @@ def test_discover_classes_is_cached():
         assert issubclass(cls, Collector)
 
 
+@pytest.mark.parametrize('package, base', [(collectors, Collector), (analyzers, Analyzer)])
+def test_classes_in_package_walks_the_package(package, base):
+    """
+    Discovery walks every module of the package: sorted by name, no duplicates, all defined in the package.
+    Every category module (all but analyzers/helpers.py) contributes a class, so none drops out of discovery.
+    """
+    found = scylla_doctor._classes_in_package(package, base)
+    names = [cls.__name__ for cls in found]
+    categories = {f'{package.__name__}.{info.name}' for info in pkgutil.iter_modules(package.__path__)
+                  if info.name != 'helpers'}
+    assert len(categories) > 10
+    assert categories == {cls.__module__ for cls in found}
+    assert names == sorted(names)
+    assert len(set(names)) == len(names)
+
+
+@pytest.mark.parametrize('missing, raises', [('analyzers', False), ('some_optional_dependency', True)])
+def test_discover_classes_tolerates_only_a_missing_analyzers_package(missing, raises):
+    """
+    A stripped build has no analyzers package; any other missing module must surface instead of dropping analyzers.
+    """
+    error = ModuleNotFoundError(f"No module named '{missing}'", name=missing)
+    # __wrapped__ bypasses the memoize cache so the patched discovery actually runs.
+    discover = scylla_doctor._discover_classes.__wrapped__
+    with patch('scylla_doctor._classes_in_package', side_effect=[[], error]):
+        if raises:
+            with pytest.raises(ModuleNotFoundError):
+                discover()
+        else:
+            assert discover()[1] == ()
+
+
 def test_collector_raises(doctor_factory):
     """
     Check that raising Collector does not break overall launch.
@@ -102,6 +151,41 @@ def test_collector_raises(doctor_factory):
     doctor.run()
     assert doctor.vitals['DummyRaisesCollector'].status == CollectorStatus.FAILED
     assert "horrible" in doctor.vitals['DummyRaisesCollector'].message
+
+
+@pytest.mark.parametrize("collector_class,expected_status,expected_message", [
+    (DummyMissingCommandCollector, CollectorStatus.SKIPPED, "'lscpu' not installed"),
+    (DummyMissingFileCollector, CollectorStatus.FAILED, "Unexpected exception"),
+])
+def test_missing_command(doctor_factory, collector_class, expected_status, expected_message):
+    """
+    A command that is not installed is a skip; any other missing file is still an unexpected failure.
+    """
+    doctor = doctor_factory(collectors=[collector_class], analyzers={})
+    doctor.run()
+
+    result = doctor.vitals[collector_class.__name__]
+    assert result.status == expected_status, result.message
+    assert expected_message in result.message
+
+
+@pytest.mark.parametrize("in_container,expected_status,expected_message", [
+    (True, CollectorStatus.SKIPPED, "Not available for containers: it reads host state"),
+    (False, CollectorStatus.PASSED, "Data collected"),
+])
+def test_skip_in_container(doctor_factory, in_container, expected_status, expected_message):
+    """
+    A collector that returns a reason from skip_in_container is skipped in a container with that reason; one that
+    returns None (the default) runs there.
+    """
+    doctor = doctor_factory(collectors=[DummySkippedInContainerCollector, DummyBaseCollector], analyzers={})
+    with patch('collectors_base.running_in_container', return_value=in_container):
+        doctor.run()
+
+    result = doctor.vitals['DummySkippedInContainerCollector']
+    assert result.status == expected_status
+    assert result.message == expected_message
+    assert doctor.vitals['DummyBaseCollector'].status == CollectorStatus.PASSED
 
 
 def test_executor_parse_config_file_yaml():

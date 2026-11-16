@@ -11,6 +11,9 @@ on:
       - '.github/workflows/**'
       - 'scylla-doctor/**'
 
+permissions:
+  contents: read
+
 defaults:
   run:
     shell: bash
@@ -18,8 +21,17 @@ defaults:
 jobs:
   all:
     if: github.repository_owner == 'scylladb'
-    runs-on:
-      - self-hosted
+    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    name: tests (client_ssl=${{ matrix.client_ssl }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # The client_ssl=true leg doubles CI time, so it runs on push (post-merge to master) and
+        # only on PRs labeled 'ci:client-ssl'. Label events deliberately do not trigger this
+        # workflow (each added/removed label would start a full run), so the label is only
+        # picked up on the next push or close/reopen of the PR.
+        client_ssl: ${{ (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'ci:client-ssl') && fromJson('[false]')) || fromJson('[false, true]') }}
     container:
       # Is kept at old Scylla version because of https://github.com/scylladb/scylla-enterprise/issues/5665
       image: scylladb/scylla:2025.4.3
@@ -31,7 +43,7 @@ jobs:
         run: |
           microdnf -y update
           microdnf -y install python3-pip
-          microdnf -y install ethtool iptables iproute net-tools gcc python3-devel which nc tar git pciutils
+          microdnf -y install ethtool iptables iproute net-tools gcc python3-devel which nc tar git pciutils openssl
 
       - name: Checkout sources
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -47,6 +59,10 @@ jobs:
           python3 -m flake8
           python3 -m mypy .
 
+      - name: Prepare client-node SSL
+        if: ${{ matrix.client_ssl }}
+        run: python3 scylla-doctor/ci/enable_client_node_ssl.py prepare
+
       - name: Launch Scylla
         run: |
           ip link add name bond0 type bond
@@ -56,24 +72,14 @@ jobs:
           do
             sleep 10
           done
-          
+
+      - name: Configure cqlsh SSL
+        if: ${{ matrix.client_ssl }}
+        run: python3 scylla-doctor/ci/enable_client_node_ssl.py configure-cqlsh
+
       - name: Generate a version file
         working-directory: scylla-doctor
         run: make version
       - name: Test
         working-directory: scylla-doctor
         run: python3 -m pytest --cov=. -vv
-
-  # The runner removes the job container with `docker rm --force` (no -v), orphaning the
-  # anonymous volume for the image's VOLUME /var/lib/scylla (~600 MB per run). Volumes still
-  # attached to a container are never pruned.
-  # ponytail: relies on cleanup landing on the host that ran `all`, which holds while the repo
-  #           has one self-hosted runner. With more runners, move the prune into a runner job hook.
-  cleanup:
-    needs: all
-    if: always() && github.repository_owner == 'scylladb'
-    runs-on:
-      - self-hosted
-    steps:
-      - name: Remove orphaned anonymous Docker volumes
-        run: docker volume prune -f --filter label=com.docker.volume.anonymous

@@ -32,28 +32,27 @@ See `scylla_doctor.py --help` for details
 | `PathsCollector`                            | Configured Scylla directory paths                                                                                                                                       |
 | `ClockSourceCollector`                      | Current clock source from `/sys/devices/system/clocksource/clocksource0/current_clocksource`                                                                            |
 | `CPUSpecificationsCollector`                | CPU flags and logical core count via `lscpu` and `/proc/cpuinfo`                                                                                                        |
-| `CPUScalingCollector`                       | CPU scaling governor value; status of CPU scaling services (cpupower, scylla-cpupower, etc.)                                                                            |
+| `CPUScalingCollector`                       | CPU scaling governor value; status of CPU scaling services (cpupower, scylla-cpupower, etc.); skipped in containers                                                     |
 | `CPUSetCollector`                           | CPU mask from `cpuset.conf`; CPU mask from `perftune.yaml`; their bitwise intersection                                                                                  |
-| `CoredumpCollector`                         | Coredump sysctl config files; status of `var-lib-systemd-coredump.mount` service                                                                                        |
+| `CoredumpCollector`                         | Coredump sysctl config files; status of `var-lib-systemd-coredump.mount` service; skipped in containers                                                                 |
 | `ClientConnectionCollector`                 | Per-client-IP rows from `system.clients`: driver name, driver version, port                                                                                             |
-| `FirewallRulesCollector`                    | Output of `iptables -L -v`                                                                                                                                              |
+| `FirewallRulesCollector`                    | Output of `iptables -L -v`; skipped in a container without `CAP_NET_ADMIN`                                                                                              |
 | `MaintenanceEventsCollector`                | Scheduled maintenance events from cloud provider metadata API                                                                                                           |
 | `InfrastructureProviderCollector`           | Cloud provider name, instance type, CPU platform (from cloud metadata API)                                                                                              |
 | `IPAddressesCollector`                      | Output of `ip addr show` for every NIC                                                                                                                                  |
-| `KernelRingBufferCollector`                 | Output of `dmesg -T`                                                                                                                                                    |
+| `KernelRingBufferCollector`                 | Output of `dmesg -T`; skipped in a container without `CAP_SYSLOG` on the host                                                                                           |
 | `NICsCollector`                             | NIC names, driver, and link speed via `ethtool`                                                                                                                         |
 | `NodePlatformCollector`                     | Node platform type: `CONTAINER`, `CLOUD`, `VM`, or `BAREMETAL`                                                                                                          |
-| `NTPStatusCollector`                        | NTP enabled and clock-synchronized flags from `timedatectl show`                                                                                                        |
-| `NTPServicesCollector`                      | Active status of NTP-related services (systemd-timesyncd, chronyd, ntpd, etc.)                                                                                          |
+| `NTPStatusCollector`                        | NTP enabled and clock-synchronized flags from `timedatectl show`; skipped in containers                                                                                 |
+| `NTPServicesCollector`                      | Active status of NTP-related services (systemd-timesyncd, chronyd, ntpd, etc.) and whether chronyd is installed; skipped in containers                                                                   |
 | `ChronyStatusCollector`                     | Chrony synchronization state from `chronyc tracking` leap status                                                                                                      |
-| `ChronyServicesCollector`                   | Active status of chrony-related services (`chronyd`, `chrony`)                                                                                                          |
 | `ComputerArchitectureCollector`             | CPU architecture and kernel version from `uname --all`                                                                                                                  |
 | `OSCollector`                               | OS distribution name and version from `/etc/os-release`                                                                                                                 |
-| `PerftuneSystemConfigurationCollector`      | `perftune.py --dry-run` recommendations (file values and sysctl params) and their actual current values                                                                 |
-| `PerftuneYamlDefaultCollector`              | Default `perftune.yaml` content and CPU mask as generated by `perftune.py --dump-options-file`                                                                          |
+| `PerftuneSystemConfigurationCollector`      | `perftune.py --dry-run` recommendations (file values and sysctl params) and their actual current values; skipped in a container without perftune.yaml                   |
+| `PerftuneYamlDefaultCollector`              | Default `perftune.yaml` content and CPU mask as generated by `perftune.py --dump-options-file`; skipped in containers                                                   |
 | `RAIDSetupCollector`                        | Parsed `/proc/mdstat`: personalities, arrays (state/level/sorted members), unused devices                                                                               |
-| `NVMeDevicesCollector`                      | NVMe namespace devices and whether each is mounted or used by an active software RAID (AWS root EBS volume excluded)                                                     |
-| `DiskPerformanceExceededCollector`          | Per-NVMe-device counters of the time IO demand exceeded the volume or the instance performance limits (`nvme amzn stats`, AWS Nitro instances only)                      |
+| `NVMeDevicesCollector`                      | NVMe namespace devices and whether each is mounted or used by an active software RAID (AWS root EBS volume excluded); skipped in containers                              |
+| `NitroDetailedStatsCollector`               | Detailed NVMe performance statistics (`nvme amzn stats --details`) for the NVMe devices used by Scylla on AWS Nitro instances; skipped off-AWS, without `nvme-cli` or when `nvme amzn stats` is unsupported |
 | `RAMCollector`                              | Total RAM from `free` and `/proc/meminfo`                                                                                                                               |
 | `RsyslogCollector`                          | Content of `/etc/rsyslog.d/scylla.conf`                                                                                                                                 |
 | `SysctlCollector`                           | Values of `fs.aio-max-nr`, `fs.file-max`, `fs.nr_open`                                                                                                                  |
@@ -65,17 +64,17 @@ See `scylla_doctor.py --help` for details
 | `ScyllaClusterStatusCollector`              | Sets of up/down/joining/leaving/moving node IPs from gossiper REST API                                                                                                  |
 | `ScyllaClusterSystemKeyspacesCollector`     | Rows of `system_schema.keyspaces`: keyspace names and replication settings                                                                                              |
 | `ScyllaClusterTablesDescriptionCollector`   | Rows of `system_schema.tables` and `system_schema.views` (materialized views, secondary indexes; CDC log tables included as regular tables): names, compaction, compression, and other schema metadata. Each row is tagged with `table_kind` (`table`/`view`) |
-| `ScyllaConfigurationFileCollector`          | Parsed `scylla.yaml` with default substitution and DNS resolution for address fields                                                                                    |
-| `ScyllaConfigurationFileNoParsingCollector` | Raw (unparsed) `scylla.yaml` values as strings                                                                                                                          |
-| `ScyllaExtraConfigurationFilesCollector`    | All files under `scylla_directory_configs`: `io.conf`, `cpuset.conf`, `perftune.yaml`, `io_properties.yaml`, etc.                                                       |
+| `ScyllaConfigurationFileCollector`          | Parsed `scylla.yaml` with default substitution and DNS resolution for address fields; credential values (AWS access keys and session token, Azure client secret, LDAP bind password, KMIP password, initial superuser password hash, any other key ending in `password` or `passwd`) are redacted, and the verbose output shows the parsed file |
+| `ScyllaConfigurationFileNoParsingCollector` | Raw (unparsed) `scylla.yaml` values as strings; credential values are redacted                                                                                          |
+| `ScyllaExtraConfigurationFilesCollector`    | All files under `scylla_directory_configs`: `io.conf`, `cpuset.conf`, `perftune.yaml`, `io_properties.yaml`, etc.; credential values and flags are redacted            |
 | `ScyllaBinaryCollector`                     | Path to the `scylla` binary                                                                                                                                             |
-| `ScyllaLimitNOFILECollector`                | `LimitNOFILE` value from `scylla-server.service` environment, as reported by systemd (a number or `infinity`)                                                           |
-| `ScyllaLogsCollector`                       | Scylla logs from `journalctl --unit=scylla-server` (saved to a compressed file)                                                                                         |
-| `ScyllaManagerAgentLogsCollector`           | Scylla Manager Agent logs from `journalctl --unit=scylla-manager-agent` (saved to a compressed file; skipped when the agent is not installed)                            |
+| `ScyllaLimitNOFILECollector`                | `LimitNOFILE` value from `scylla-server.service` environment, as reported by systemd (a number or `infinity`); skipped in containers                                    |
+| `ScyllaLogsCollector`                       | Scylla logs from `journalctl --unit=scylla-server` (saved to a compressed file); skipped in containers                                                                  |
+| `ScyllaManagerAgentLogsCollector`           | Scylla Manager Agent logs from `journalctl --unit=scylla-manager-agent` (saved to a compressed file; skipped in containers and when the agent is not installed)                            |
 | `ScyllaServicesCollector`                   | Active and autostart status of Scylla-related services                                                                                                                  |
 | `ScyllaSeedsCollector`                      | Seed addresses from `scylla.yaml`; TCP connectivity result to each seed (IPv4 and IPv6)                                                                                 |
-| `ScyllaSSTablesCollector`                   | List of all SSTable files under `scylla_directory_var/data`                                                                                                             |
-| `ScyllaSystemConfigurationFilesCollector`   | Parsed contents of `scylla-server`, `scylla-jmx`, and `scylla-housekeeping` sysconfig files                                                                             |
+| `ScyllaSSTablesCollector`                   | All files under `scylla_directory_var/data`: `data.sstables[directory][sstable stem] = [component suffixes]`, plus `data.other_files[directory] = [names without '-']` |
+| `ScyllaSystemConfigurationFilesCollector`   | Parsed contents of `scylla-server`, `scylla-jmx`, and `scylla-housekeeping` sysconfig files; credential command line flags (e.g. `--ldap-bind-passwd`) are redacted     |
 | `GossipInfoCollector`                       | Per-host gossip application state (HOST_ID, TOKENS, SCHEMA, DC, RACK, STATUS, SUPPORTED_FEATURES, CDC_GENERATION_ID, etc.) from `/failure_detector/endpoints/` REST API |
 | `TokenMetadataHostsMappingCollector`        | IP-to-host-UUID mapping from `/storage_service/host_id` REST API                                                                                                        |
 | `RaftGroup0Collector`                       | Raft Group0 ID, upgrade state, and member host IDs from `system.scylla_local` and `system.raft_state`                                                                   |
@@ -88,21 +87,25 @@ See `scylla_doctor.py --help` for details
 | `RolesCollector`                            | Role metadata from `system.roles` (`role`, `is_superuser`, `can_login`, `member_of`; `salted_hash` omitted)                                                              |
 | `ServiceLevelsCollector`                    | Service levels from `system.service_levels_v2` (keyed by `service_level`; includes `shares`, `timeout`, `workload_type`)                                                |
 | `DefaultCredentialsCollector`               | Default `cassandra` user login state: `not_verified` / `denied` / `allowed` (probe runs only for password-capable authenticators)                                        |
-| `SystemConfigCollector`                     | All Scylla runtime parameters from `system.config`: name, value, source, and type                                                                                       |
+| `SystemConfigCollector`                     | All Scylla runtime parameters from `system.config`: name, value, source, and type; credential values are redacted                                                       |
 | `ScyllaVersionCollector`                    | Scylla version string, edition (oss/enterprise/development; 2025.1+ is enterprise), installed Scylla packages                                                           |
 | `SELinuxCollector`                          | Content of `/etc/selinux/config`                                                                                                                                        |
 | `ServiceManagerCollector`                   | Service manager type (e.g. systemd)                                                                                                                                     |
-| `StorageConfigurationCollector`             | For each Scylla data directory: underlying devices (NVMe/non-NVMe, plus those detected as network-attached such as AWS EBS), filesystem type, mount point, mount options, total and free storage size                            |
+| `StorageConfigurationCollector`             | For each Scylla data directory: underlying devices (NVMe/non-NVMe, plus those detected as network-attached such as AWS EBS), filesystem type, mount point, mount options, total and free storage size; skipped in a container where perftune.py cannot see the block device nodes|
 | `SwapCollector`                             | Total swap size from `/proc/swaps`                                                                                                                                      |
 | `TCPConnectionsCollector`                   | All TCP connections from `ss --all --tcp`                                                                                                                               |
 | `SDVersionCollector`                        | Scylla Doctor version from the version file                                                                                                                             |
+| `CollectionTimeCollector`                   | Local date and time of the collection, with its UTC offset; left out of the cluster diff                                                                                |
 | `HypervisorTypeCollector`                   | Hypervisor type from `systemd-detect-virt` (e.g. `kvm`, `xen`, `none`)                                                                                                  |
-| `ProcInterruptsCollector`                   | Content of `/proc/interrupts`                                                                                                                                           |
+| `ProcInterruptsCollector`                   | Content of `/proc/interrupts`; skipped in a container where /proc/interrupts is masked                                                                                  |
 | `LSPCICollector`                            | Output of `lspci -vvv`                                                                                                                                                  |
 | `SeastarCPUMapCollector`                    | Output of `seastar-cpu-map.sh -n scylla` and the parsed shard to CPU mapping                                                                                             |
 | `NodetoolCFStatsCollector`                  | Output of `nodetool cfstats`                                                                                                                                            |
 | `ScyllaTablesCompressionInfoCollector`      | Per-table compression ratio from `/column_family/metrics/compression_ratio` REST API                                                                                    |
 | `ScyllaTablesUsedDiskCollector`             | Per-table used disk space from `/column_family/metrics/total_disk_space_used` REST API                                                                                  |
+
+A collector whose tool is not installed (`lscpu`, `ethtool`, `lspci`, `ss`, `mount`, `taskset`, `systemd-detect-virt`,
+...) is skipped with `'<tool>' not installed` instead of failing; install the package to collect it.
 
 ### Analyzers
 
@@ -119,15 +122,15 @@ See `scylla_doctor.py --help` for details
 | `GossipInfoConsistencyAnalyzer`                   | Hosts that do not support Consistent Topology have `TOKENS` and `CDC_GENERATION_ID` in their GossipInfo                                                                |
 | `TopologyConsistencyAnalyzer`                     | Host UUID sets are identical across GossipInfo, TokenMetadata, Raft Group0, `system.peers`/`system.local`, and `system.cluster_status`                                 |
 | `DriverVersionAnalyzer`                           | Connected client drivers are at or above the minimum required version; warns if below the latest version                                                               |
+| `ClientCQLTimeoutAnalyzer`                        | Connected CQL clients that report `DRIVER_CONFIG` use a request timeout (`query.defaults.request.timeout-ms`) strictly greater than the largest configured server-side request timeout in `system.config`; skipped when no client reported one |
 | `IOSetupAnalyzer`                                 | `io.conf` has `SEASTAR_IO` pointing to `io_properties.yaml`                                                                                                            |
 | `KernelVersionAnalyzer`                           | Kernel version is >= 3.15                                                                                                                                              |
 | `MemoryTuningAnalyzer`                            | `MEM_CONF` is set in `memory.conf`                                                                                                                                     |
 | `NICsAnalyzer`                                    | At least one NIC meets the recommended speed threshold (default 10 Gbps) — skipped by default on AWS and GCP; on AWS: enhanced networking and VPC are enabled          |
 | `NodeInstanceTypeAnalyzer`                        | Cloud instance type (AWS i3/i3en/i4i/i7i/i7ie/i8g/i8ge, GCP n2/n2d/z3, Azure Lsv2/Lsv3, OCI VM.DenseIO.E5.Flex) is in the recommended list                              |
 | `NTPStatusAnalyzer`                               | NTP is enabled and the system clock is synchronized (via `timedatectl`)                                                                                                |
-| `NTPServicesAnalyzer`                             | At least one NTP service (systemd-timesyncd, chronyd, ntpd, etc.) is active                                                                                            |
+| `NTPServicesAnalyzer`                             | At least one NTP service (systemd-timesyncd, chronyd, ntpd, etc.) is active; warns when chronyd is installed but another service keeps time                                                                                            |
 | `ChronyStatusAnalyzer`                            | Chrony leap status from `chronyc tracking` is not `Not synchronised`                                                                                                    |
-| `ChronyServicesAnalyzer`                          | At least one chrony service (`chronyd` or `chrony`) is active                                                                                                          |
 | `ComputerArchitectureAnalyzer`                    | CPU architecture is one of `x86_64`, `arm64`, `aarch64`, `ppc64`                                                                                                       |
 | `OSSupportAnalyzer`                               | OS distribution and version is officially supported for the running ScyllaDB version (matrix from docs.scylladb.com)                                                   |
 | `PerftuneAnalyzer`                                | All system file and sysctl values match the recommendations from `perftune.py` (based on `perftune.yaml`)                                                              |
@@ -232,6 +235,28 @@ To override this check at your own risk, use `--ignore-vitals-version`.
 Use `--version` to print the running Scylla Doctor version.
 Use `--vitals-version [/path/to/vitals.json]` to print the version stored in a vitals file.
 
+### Running inside a container
+
+A node counts as a container when `/.dockerenv`, `/run/.dockerenv` or `/run/.containerenv` exists (Docker, Podman)
+or when the `container` environment variable is set, which container managers export to the first process and the
+ScyllaDB image sets to `oci`. `NodePlatformCollector` then reports `CONTAINER`. When the environment was reset (for
+example by `sudo`), the variable is read from the first process (`/proc/1/environ`, readable as root). System
+containers that set it to `lxc`, `lxc-libvirt` or `systemd-nspawn` run their own systemd and services, so they count
+as hosts. Checks that cannot be answered from inside a container end as `SKIPPED` with the reason, never as `FAILED`.
+Collectors that depend on host state are always skipped; the dmesg, iptables, `/proc/interrupts` and `perftune.py`
+checks are skipped only when the container refuses them (see the collector table). Without `--network host`, a
+privileged container lists its own network namespace's iptables rules, not the node's.
+
+The stock ScyllaDB image ships few of the tools collectors use, so expect several `'<tool>' not installed` skips
+there. Installing the package makes the collector run, except where the container also refuses the operation.
+
+When no service manager runs in the container (for example `docker run --entrypoint scylla`), the Scylla service
+counts as active if a `scylla` process is visible, so the CQL and REST collectors still run.
+
+Collectors and analyzers that depend on a skipped collector are skipped too and repeat the reason, for example
+`Required NTPStatusCollector was skipped: Not available for containers: timedatectl needs systemd-timedated, which a
+container usually does not run`.
+
 ## Configuration file
 Configuration file must have a Microsoft Windows INI format
 Following sections are supported:
@@ -331,7 +356,7 @@ Below are parameters supported by selected Collectors/Analyzers.
 |                            | The latest driver version is the most up-to-date driver version that exists for this driver type.                             |
 |                            | If any used client driver is below the latest version a warning will be shown.                                                |
 | driver_api_endpoint        | The URL endpoint to use to retrieve minimum or latest driver versions from when not specified by the aforementioned fields.   |
-|                            | By default this is 'https://cfqlgypqmoofu6wdoojklzdzhe0lqqso.lambda-url.us-east-2.on.aws/search'                              |
+|                            | By default this is 'https://version-api.ops.scylladb.com/driverInfo'                                                          |
 
 The input JSON in the .ini file for either minimum_version or latest_version can be as follows, and must be indented properly.
 
@@ -345,6 +370,26 @@ minimum_version = {
     "Rust": "0.5",
     }
 ```
+
+#### ClientCQLTimeoutAnalyzer
+Compares each connected CQL client's request timeout with the server-side request timeouts. The client value is
+`query.defaults.request.timeout-ms` from the `DRIVER_CONFIG` STARTUP option that ScyllaDB drivers send on a
+session's control connection and that Scylla exposes in `system.clients.client_options`; the server values come
+from the in-memory `system.config`. The client timeout must be strictly greater than the largest server-side one,
+otherwise the client gives up (and typically retries) while the coordinator is still working on the request.
+Offenders are listed per application (user, driver, version, timeout) with the number of client hosts, not per host.
+`SKIPPED` when no connected client reported a driver configuration (older driver, Scylla version without
+`client_options`, or the session's control connection is on another node).
+Options absent from `system.config` are skipped and the check runs on the remaining ones; a `WARNING` naming them is
+added only when `server_timeouts` was set explicitly (a typo must not pass silently), since with the default list an
+absent option is a Scylla version difference. `FAILED` when none of them exists. Service-level `timeout` overrides are not considered yet: a role
+whose service level lowers the server-side timeout can be flagged although its client is configured correctly.
+With Scylla's default server-side timeouts (maximum 10000 ms) the Java driver 4.x default request timeout of 2 s and
+the Python driver default of 10 s fail this check by design: raise the client request timeout above the server-side ones.
+
+| Field name (default value)                                                                                                                                                | Description                                                                                                                            |
+|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
+| server_timeouts (`read_request_timeout_in_ms,write_request_timeout_in_ms,range_request_timeout_in_ms,counter_write_request_timeout_in_ms,cas_contention_timeout_in_ms,request_timeout_in_ms`) | Comma-separated `system.config` timeout options (ms) the client request timeout must exceed. `truncate_request_timeout_in_ms` (60 s) is left out by default. Options absent from `system.config` are skipped; a warning is added only when the list was set explicitly |
 
 #### InfrastructureProviderCollector
 | Field name (default value) | Description                                                               |
@@ -387,7 +432,7 @@ Collects tablet ownership from `system.tablets` into `data.tables` (one entry pe
 |----------------------------|-------------------------------------------------------------------------------------------------------------------------------|
 | threshold (`0`)            | Accumulated time (microseconds) the IO demand may exceed a disk or an instance performance limit before a warning is issued. |
 
-The `performance_exceeded_*` counters are cumulative since the instance started (attach/boot), so any historical
+The analyzer reads the `performance_exceeded_*` counters from `NitroDetailedStatsCollector` (named `DiskPerformanceExceededCollector` in v1.14, update config sections and skip rules naming the old id). They are cumulative since the instance started (attach/boot), so any historical
 exceedance keeps producing a warning on every subsequent run until a reboot or reattach. Raise `threshold` for
 long-uptime production nodes if you only care about recent limit exceedance.
 
@@ -444,7 +489,7 @@ Unless specified otherwise all following services must be both `active` and `ena
 #### ScyllaSSTablesAnalyzer
 | Field name (default value) | Description                                                                                                                                    |
 |----------------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
-| recommended_format         | Expected SSTable format. When set, takes priority over the value auto-detected from `system.config`. Defaults to `me` if neither is available. |
+| recommended_format         | Expected SSTable format, as a regular expression matched at the start of each sstable name (e.g. `md\|me`); an invalid regular expression fails the analyzer. When set, takes priority over the value auto-detected from `system.config`. Defaults to `me` if neither is available. |
 
 #### OSSupportAnalyzer
 Checks that the host OS is listed as supported for the running ScyllaDB version. The matrix is
@@ -519,7 +564,7 @@ skip_sysctls = net.core.rps_sock_flow_entries
 This analyzer performs two independent checks:
 
 1. **Source validation** — every key present in `scylla.yaml` must have `source = config` in `system.config`; every key absent from `scylla.yaml` must have `source = default` or `source = internal`.
-2. **Value validation** — every key present in `scylla.yaml` must have the same value in `system.config`. String values in `scylla.yaml` (e.g. `auto_bootstrap: "true"`, `native_transport_port_ssl: "9142"`) are converted to the `bool`, `integer`, `float` or `double` type reported by `system.config` before comparing, as Scylla does.
+2. **Value validation** — every key present in `scylla.yaml` must have the same value in `system.config`. String values in `scylla.yaml` (e.g. `auto_bootstrap: "true"`, `native_transport_port_ssl: "9142"`) are converted to the `bool`, `integer`, `float` or `double` type reported by `system.config` before comparing, as Scylla does. Credential values (AWS access keys and session token, Azure client secret, LDAP bind password, KMIP password, initial superuser password hash, any other key ending in `password` or `passwd`) are redacted on both sides, so a credential changed in `scylla.yaml` but not yet applied is not reported; only whether it is set is compared.
 
 | Field name (default value)      | Description                                                                                                  |
 |---------------------------------|--------------------------------------------------------------------------------------------------------------|

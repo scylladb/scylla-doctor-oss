@@ -27,19 +27,22 @@
 import argparse
 import configparser
 import enum
+import importlib
 import inspect
 import json
 import os
+import pkgutil
 import re
 import sys
 import zipfile
 
-from typing import Dict, Optional, Tuple, Union
+from types import ModuleType
+from typing import Dict, List, Optional, Tuple, Union
 
 from common import DictView, Paths, AbortedException, ConfigParameter
 from collectors_base import CollectorStatus, CollectorResult, Collector
 from analyzers_base import AnalyzerStatus, Analyzer
-from common import read_config_file
+from common import read_config_file, scylla_doctor_root
 
 import collectors
 from models.output_entry import Level
@@ -50,25 +53,33 @@ from utils import Executor, Formatter, memoize
 ###############################################################################
 # Class discovery cache #######################################################
 ###############################################################################
+def _classes_in_package(package: ModuleType, base: type) -> List[type]:
+    """
+    Concrete subclasses of 'base' defined in the modules of 'package' (a module per category, see AGENTS.md), sorted by
+    class name: the order inspect.getmembers() gave the flat modules, which run order and reports follow.
+    """
+    found = []
+    for info in pkgutil.walk_packages(package.__path__, f"{package.__name__}."):
+        module = importlib.import_module(info.name)
+        for _, cls in inspect.getmembers(module, predicate=inspect.isclass):
+            if cls.__module__ == module.__name__ and not inspect.isabstract(cls) and issubclass(cls, base):
+                found.append(cls)
+    return sorted(found, key=lambda cls: cls.__name__)
+
+
 @memoize
 def _discover_classes() -> Tuple[Tuple, Tuple]:
     """Discover collector/analyzer classes once per process. Returns immutable tuples."""
-    collectors_list = []
-    for _, cls in inspect.getmembers(sys.modules[__name__], predicate=inspect.isclass):
-        if not inspect.isabstract(cls) and issubclass(cls, Collector):
-            collectors_list.append(cls)
-    for _, cls in inspect.getmembers(sys.modules[collectors.__name__], predicate=inspect.isclass):
-        if not inspect.isabstract(cls) and issubclass(cls, Collector):
-            collectors_list.append(cls)
+    collectors_list = _classes_in_package(collectors, Collector)
 
-    analyzers_list = []
+    analyzers_list: List[type] = []
     try:
         import analyzers
-        for _, cls in inspect.getmembers(analyzers, predicate=inspect.isclass):
-            if not inspect.isabstract(cls) and issubclass(cls, Analyzer):
-                analyzers_list.append(cls)
-    except ModuleNotFoundError:
-        pass
+        analyzers_list = _classes_in_package(analyzers, Analyzer)
+    except ModuleNotFoundError as e:
+        # Only the stripped build (no analyzers package) is expected; any other missing module is a real error.
+        if e.name != 'analyzers':
+            raise
 
     return tuple(collectors_list), tuple(analyzers_list)
 
@@ -280,7 +291,7 @@ class Doctor:
 
     @staticmethod
     def read_tool_version() -> str:
-        script_path = os.path.dirname(collectors.__file__)
+        script_path = scylla_doctor_root()
         verfile_name = 'version'
         if zipfile.is_zipfile(script_path):
             try:

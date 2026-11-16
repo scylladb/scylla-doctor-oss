@@ -24,19 +24,22 @@ import sys
 import pytest
 
 import analyzers
+from analyzers.clients import ClientCQLTimeoutAnalyzer, DriverVersionAnalyzer
+from analyzers.hardware import RAMAnalyzer
+from analyzers.storage import ScyllaSSTablesAnalyzer
+from analyzers.tuning import PerftuneAnalyzer
 import collectors
+from collectors.cloud import InfrastructureProviderCollector
 import scylla_doctor
-from analyzers import RAMAnalyzer
-from collectors import InfrastructureProviderCollector
+from analyzers_base import Analyzer
 from collectors_base import Collector
-from common import ConfigParameter, ConfigValuesParser, DictView
+from common import ConfigParameter, DictView
 
 
 def _components_with_config_parameters():
-    for module in (collectors, analyzers):
-        for _, cls in inspect.getmembers(module, predicate=inspect.isclass):
-            if (not inspect.isabstract(cls) and issubclass(cls, ConfigValuesParser) and
-                    cls.config_parameters_definitions()):
+    for package, base in ((collectors, Collector), (analyzers, Analyzer)):
+        for cls in scylla_doctor._classes_in_package(package, base):
+            if cls.config_parameters_definitions():
                 yield cls
 
 
@@ -69,15 +72,25 @@ def test_get_config_value_uses_definition_defaults():
 
 
 def test_get_config_value_comma_separated():
-    analyzer = analyzers.PerftuneAnalyzer(DictView({
+    analyzer = PerftuneAnalyzer(DictView({
         'PerftuneAnalyzer': {'skip_files': ' /a , b '}
     }))
     assert analyzer._get_config_value('skip_files') == {'/a', 'b'}
 
 
 def test_get_config_value_fallback():
-    analyzer = analyzers.ScyllaSSTablesAnalyzer(DictView({'ScyllaSSTablesAnalyzer': {}}))
+    analyzer = ScyllaSSTablesAnalyzer(DictView({'ScyllaSSTablesAnalyzer': {}}))
     assert analyzer._get_config_value('recommended_format', fallback='md') == 'md'
+
+
+def test_get_config_default():
+    analyzer = ClientCQLTimeoutAnalyzer(DictView({'ClientCQLTimeoutAnalyzer': {'server_timeouts': 'x'}}))
+    assert analyzer._get_config_default('server_timeouts') == {
+        'read_request_timeout_in_ms', 'write_request_timeout_in_ms', 'range_request_timeout_in_ms',
+        'counter_write_request_timeout_in_ms', 'cas_contention_timeout_in_ms', 'request_timeout_in_ms'}
+    assert analyzer._get_config_value('server_timeouts') == {'x'}  # the override does not leak into the default
+    assert RAMAnalyzer(DictView({'RAMAnalyzer': {}}))._get_config_default('ram_minimum_total') == 4194304
+    assert ScyllaSSTablesAnalyzer(DictView({}))._get_config_default('recommended_format') is None
 
 
 def test_config_parameters_list_all_components(doctor_factory):
@@ -182,7 +195,7 @@ def test_config_parameters_run_cannot_be_overridden():
 
 
 def test_comma_separated_runtime_type_name():
-    param = analyzers.PerftuneAnalyzer.config_parameters_definitions()['skip_files']
+    param = PerftuneAnalyzer.config_parameters_definitions()['skip_files']
     assert param.runtime_type_name() == 'set[str]'
 
 
@@ -201,7 +214,7 @@ def _config_access_source(cls) -> str:
 def test_config_parameters_used_via_get_config_value(cls):
     source = _config_access_source(cls)
     for name in cls.config_parameters_definitions():
-        if cls is analyzers.DriverVersionAnalyzer and name in {'minimum_version', 'latest_version'}:
+        if cls is DriverVersionAnalyzer and name in {'minimum_version', 'latest_version'}:
             assert '_get_config_value(version_type' in source
             continue
         pattern = rf"_get_config_value\(\s*['\"]{re.escape(name)}['\"]"

@@ -46,7 +46,7 @@ def test_analyzer_skip_due_to_skipped_collector(doctor_factory):
         assert analyzer.status == AnalyzerStatus.SKIPPED
         # Verify that a skipped analyzer's message has the information about both failed and skipped dependencies
         assert f"Required {DummyFailedCollector.name} was not successful" in analyzer.message
-        assert f"Required {DummySkippedCollector.name} was skipped" in analyzer.message
+        assert f"Required {DummySkippedCollector.name} was skipped: Skipped on purpose" in analyzer.message
 
 
 def test_analyzer_fail_due_to_failed_collector(doctor_factory):

@@ -19,11 +19,80 @@ import dataclasses
 import copy
 import json
 import random
+import urllib.parse
 from unittest.mock import patch
 
 import pytest
 
-import analyzers
+from analyzers.clients import ClientCQLTimeoutAnalyzer, DriverVersionAnalyzer
+from analyzers.cloud import CloudCPUPlatformAnalyzer, NodeInstanceTypeAnalyzer, ScheduledMaintenanceEventAnalyzer
+from analyzers.config import (
+    ScyllaBroadcastAddressAnalyzer,
+    ScyllaBroadcastRPCAddressAnalyzer,
+    ScyllaConfigurationConsistencyAnalyzer,
+    ScyllaConfigurationFileFormatAnalyzer,
+    ScyllaDeprecatedArgumentsAnalyzer,
+    ScyllaInternodeCompressionAnalyzer,
+    ScyllaListenAddressAnalyzer,
+    ScyllaRPCAddressAnalyzer,
+    ScyllaSnitchAnalyzer,
+    ScyllaSystemConfigurationFilesAnalyzer,
+)
+from analyzers.hardware import CPUInstructionSetAnalyzer, ComputerArchitectureAnalyzer, RAMAnalyzer
+from analyzers.helpers import get_url_content
+from analyzers.install import ScyllaServicesAnalyzer, ScyllaSupportAnalyzer, ScyllaUpdateAnalyzer
+from analyzers.network import NICsAnalyzer, ScyllaSeedsAnalyzer
+from analyzers.operating_system import (
+    AIOMAXNRAnalyzer,
+    CPUScalingAnalyzer,
+    ClockSourceAnalyzer,
+    CoredumpAnalyzer,
+    FSFILEMAXAnalyzer,
+    FSNROPENAnalyzer,
+    KernelVersionAnalyzer,
+    OSSupportAnalyzer,
+    RsyslogAnalyzer,
+    SELinuxAnalyzer,
+    ScyllaLimitNOFILEAnalyzer,
+    SwapAnalyzer,
+)
+from analyzers.schema import (
+    DisabledCompactionAnalyzer,
+    STCSInSchemaAnalyzer,
+    ScyllaClusterSchemaAnalyzer,
+    ScyllaClusterSystemKeyspacesReplicationAnalyzer,
+    ScyllaKeyspacesReplicationAnalyzer,
+    ZstdCompressionLevelAnalyzer,
+)
+from analyzers.security import AuthenticationAnalyzer, BrokenRolePermissionsAnalyzer
+from analyzers.storage import (
+    DiskPerformanceExceededAnalyzer,
+    RAIDSetupAnalyzer,
+    ScyllaSSTablesAnalyzer,
+    StorageRAMRatioAnalyzer,
+    StorageTypeAnalyzer,
+    UnusedNVMeDevicesAnalyzer,
+    XFSAnalyzer,
+)
+from analyzers.time_sync import ChronyStatusAnalyzer, NTPServicesAnalyzer, NTPStatusAnalyzer
+from analyzers.topology import (
+    GossipInfoConsistencyAnalyzer,
+    RaftEnablementAnalyzer,
+    RaftTopologyEnablementAnalyzer,
+    RaftTopologyRPCStatusAnalyzer,
+    TopologyConsistencyAnalyzer,
+)
+from analyzers.tuning import (
+    AssignedNICsAnalyzer,
+    CPUSetAnalyzer,
+    DeveloperModeAnalyzer,
+    IOSetupAnalyzer,
+    MemoryTuningAnalyzer,
+    PerftuneAnalyzer,
+    PerftuneCpuMaskAnalyzer,
+    PerftuneYamlAnalyzer,
+    ScyllaNICsDisksSetupAnalyzer,
+)
 from collectors_base import Output
 from scylla_doctor import Analyzer, AnalyzerStatus, CollectorStatus, CollectorResult
 from common import DictView, NodePlatform, AbortedException, GossipInfoInvariantValues
@@ -55,7 +124,7 @@ def check_analyzer(analyzer: Analyzer, collector_name: str, testcases: List[Any]
 
 
 def test_CPUInstructionSetAnalyzer():
-    analyzer = analyzers.CPUInstructionSetAnalyzer({})
+    analyzer = CPUInstructionSetAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "Required")
 
@@ -79,7 +148,7 @@ def test_CPUInstructionSetAnalyzer():
 
 
 def test_ClockSourceAnalyzer():
-    analyzer = analyzers.ClockSourceAnalyzer({})
+    analyzer = ClockSourceAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "Required ClockSourceCollector results not found")
 
@@ -95,7 +164,7 @@ def test_ClockSourceAnalyzer():
 
 
 def test_CPUScalingAnalyzer():
-    analyzer = analyzers.CPUScalingAnalyzer({})
+    analyzer = CPUScalingAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "Required CPUScalingCollector results not found")
 
@@ -111,7 +180,7 @@ def test_CPUScalingAnalyzer():
 
 # https://github.com/scylladb/field-engineering/issues/837#issuecomment-1228662607
 def test_CoredumpAnalyzer():
-    analyzer = analyzers.CoredumpAnalyzer({})
+    analyzer = CoredumpAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "Required CoredumpCollector results not found")
 
@@ -186,7 +255,7 @@ def test_CoredumpAnalyzer():
 
 
 def test_CPUSetAnalyzer():
-    analyzer = analyzers.CPUSetAnalyzer({})
+    analyzer = CPUSetAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required CPUSetCollector results not found")
@@ -200,7 +269,7 @@ def test_CPUSetAnalyzer():
 
 
 def test_DeveloperModeAnalyzer():
-    analyzer = analyzers.DeveloperModeAnalyzer({})
+    analyzer = DeveloperModeAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ScyllaExtraConfigurationFilesCollector results not found")
@@ -240,7 +309,7 @@ def test_DriverVersionAnalyzer():
         }
     }
 
-    driver_version_analyzer = analyzers.DriverVersionAnalyzer(required_drivers_config)
+    driver_version_analyzer = DriverVersionAnalyzer(required_drivers_config)
 
     vitals = {
         'ScyllaVersionCollector': CollectorResult(
@@ -365,7 +434,7 @@ def test_DriverVersionAnalyzer_InvalidAPI():
         }
     }
 
-    driver_version_analyzer = analyzers.DriverVersionAnalyzer(required_drivers_config)
+    driver_version_analyzer = DriverVersionAnalyzer(required_drivers_config)
 
     test_vitals = {'127.0.0.1': [{'driver_name': 'github.com/gocql/gocql', 'driver_version': '1.11'}]}
     test_result = AnalyzerResult(AnalyzerStatus.FAILED,
@@ -384,7 +453,7 @@ def test_DriverVersionAnalyzer_AvailableAPI():
     }
 
     # Version number so high it should be accepted as above latest or minimum version number.
-    driver_version_analyzer = analyzers.DriverVersionAnalyzer({})
+    driver_version_analyzer = DriverVersionAnalyzer({})
     test_vitals = {'127.0.0.1': [{'driver_name': 'github.com/gocql/gocql', 'driver_version': '1000'}]}
     test_result = AnalyzerResult(AnalyzerStatus.PASSED,
                                  message="Client driver versions are within bounds.")
@@ -392,6 +461,33 @@ def test_DriverVersionAnalyzer_AvailableAPI():
     check_analyzer(driver_version_analyzer, "ClientConnectionCollector", [
         (test_vitals, test_result),
     ], initial_vitals=vitals)
+
+
+def test_DriverVersionAnalyzer_ApiResponseItems():
+    """The version API, queried exactly as the analyzer queries it, returns what the analyzer reads."""
+    responses = []
+    real_get_url_content = get_url_content
+
+    def recording_get_url_content(*args, **kwargs):
+        responses.append(real_get_url_content(*args, **kwargs))
+        return responses[-1]
+
+    driver_version_analyzer = DriverVersionAnalyzer({})
+    with patch('analyzers.clients.get_url_content', side_effect=recording_get_url_content):
+        driver_version_analyzer._get_minimum_driver_version('github.com/scylladb/gocql', '2024.1.4')
+        driver_version_analyzer._get_latest_driver_version('github.com/scylladb/gocql')
+
+    assert len(responses) == 2
+    assert None not in responses, "No response from the driver version API"
+    minimum_response, latest_response = (json.loads(response) for response in responses)
+
+    # What the analyzer reads: the versions in `recommended` (minimum) and `driverInfo` (latest). Only the shape is
+    # checked, so a change in the backend's data (e.g. dropping old Scylla versions) does not break unrelated PRs.
+    # The latest lookup is sent without scyllaVersion, so its response has no `recommended`.
+    assert isinstance(minimum_response, dict) and isinstance(minimum_response.get('recommended'), list)
+    assert isinstance(latest_response, dict) and isinstance(latest_response.get('driverInfo'), list)
+    for item in minimum_response['recommended'] + latest_response['driverInfo']:
+        assert isinstance(item, dict) and 'version' in item
 
 
 def test_DriverVersionAnalyzer_ApiUsesClientDriverName():
@@ -402,21 +498,25 @@ def test_DriverVersionAnalyzer_ApiUsesClientDriverName():
             {'version': '2024.1.4'}, Output(), '')
     }
 
-    rust_api_versions = [
-        {'version': '0.15.0'},
-        {'version': '0.13.2'},
-    ]
-    requested_driver_names = []
+    def rust_version(version):
+        return {'driver_name': 'scylla-rust-driver', 'version': version, 'release_date': '2024-10-01'}
 
-    def mock_get_url_content(url, headers=None, data=None, timeout=3):
-        driver_name = (data or {}).get('driverName')
-        requested_driver_names.append(driver_name)
-        if driver_name == 'ScyllaDB Rust Driver':
-            return json.dumps(rust_api_versions)
-        return '[]'
+    requested = set()
 
-    driver_version_analyzer = analyzers.DriverVersionAnalyzer({})
-    with patch('analyzers.get_url_content', side_effect=mock_get_url_content):
+    def mock_get_url_content(url, timeout):
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        driver_name = query['driverName'][0]
+        scylla_version = query.get('scyllaVersion', [None])[0]
+        requested.add((driver_name, scylla_version))
+        if driver_name != 'ScyllaDB Rust Driver':
+            return json.dumps({'driverInfo': []})
+        response = {'latest': rust_version('0.15.0'), 'driverInfo': [rust_version('0.15.0'), rust_version('0.13.2')]}
+        if scylla_version:
+            response['recommended'] = [rust_version('0.15.0'), rust_version('v0.13.2')]
+        return json.dumps(response)
+
+    driver_version_analyzer = DriverVersionAnalyzer({})
+    with patch('analyzers.clients.get_url_content', side_effect=mock_get_url_content):
         check_analyzer(driver_version_analyzer, "ClientConnectionCollector", [
             ({'127.0.0.1': [{'driver_name': 'ScyllaDB Rust Driver', 'driver_version': '0.12.0'}]},
              AnalyzerResult(AnalyzerStatus.FAILED,
@@ -431,14 +531,108 @@ def test_DriverVersionAnalyzer_ApiUsesClientDriverName():
                             message="Client driver versions are within bounds.")),
         ], initial_vitals=vitals)
 
-    assert requested_driver_names
-    assert set(requested_driver_names) == {'ScyllaDB Rust Driver'}
+    # Minimum is looked up for the Scylla version, latest without it.
+    assert requested == {('ScyllaDB Rust Driver', '2024.1.4'), ('ScyllaDB Rust Driver', None)}
 
 
-def test_DriverVersionAnalyzer_UnindexedDriverAPI():
+@pytest.mark.parametrize('recommended, expected', [
+    # Release lines interleave: the oldest release is not the lowest version.
+    (['3.11.5.1', '4.18.0'], '3.11.5.1'),
+    (['3.26.9-scylla', '3.29.1'], '3.26.9-scylla'),
+    # A single release line: the oldest release is the lowest version.
+    (['3.11.5.2', '3.11.5.1'], '3.11.5.1'),
+    # The same version, listed with and without the 'v' prefix.
+    (['v1.13.0', '1.13.0'], '1.13.0'),
+    # Equal X.Y.Z: the oldest release (listed last) wins.
+    (['3.11.5-1', '3.11.5'], '3.11.5'),
+    # Missing parts count as 0, as in compare_versions.
+    (['2.0', '2.0.0'], '2.0.0'),
+    (['2.0.0', '2.0'], '2.0'),
+    # Tags that are not versions, and versions compare_versions cannot parse, are skipped.
+    (['2.16.1-1', '2.16.0b'], '2.16.1-1'),
+    (['3.25.0', 'stable'], '3.25.0'),
+    (['stable', '3.24.0-scylla'], '3.24.0-scylla'),
+])
+def test_DriverVersionAnalyzer_MinimumIsLowestRecommendedVersion(recommended, expected):
+    """`recommended` is listed by release date, newest first, and can mix release lines."""
+    response = json.dumps({'recommended': [{'version': version} for version in recommended]})
+    driver_version_analyzer = DriverVersionAnalyzer({})
+    with patch('analyzers.clients.get_url_content', return_value=response):
+        minimum = driver_version_analyzer._get_minimum_driver_version('DataStax Java Driver', '2022.1.14')
+
+    assert minimum == expected
+
+
+@pytest.mark.parametrize('endpoint, expected_prefix', [
+    ('https://example.invalid/driverInfo', 'https://example.invalid/driverInfo?driverName='),
+    ('https://example.invalid/driverInfo?env=staging', 'https://example.invalid/driverInfo?env=staging&driverName='),
+])
+def test_DriverVersionAnalyzer_ApiEndpointWithQuery(endpoint, expected_prefix):
+    """The lookup parameters are appended to a driver_api_endpoint override that already has a query string."""
+    driver_version_analyzer = DriverVersionAnalyzer(
+        {'DriverVersionAnalyzer': {'driver_api_endpoint': endpoint}})
+    with patch('analyzers.clients.get_url_content', return_value=None) as mock_get_url_content:
+        driver_version_analyzer._get_latest_driver_version('DataStax Java Driver')
+
+    assert mock_get_url_content.call_args[0][0].startswith(expected_prefix)
+
+
+@pytest.mark.parametrize('releases, expected', [
+    # The newest release is not the highest version when release lines interleave.
+    (['3.11.5.20', '4.19.2.2', '3.11.5.19'], '4.19.2.2'),
+    # Tags that are not versions are skipped.
+    (['max-requests-per-conn-v2', '1.20.0', '1.19.0'], '1.20.0'),
+    (['stable', '3.29.12-scylla'], '3.29.12-scylla'),
+    # The 'v' prefix is stripped.
+    (['v1.9.0', '1.8.0'], '1.9.0'),
+    # Equal X.Y.Z: the newest release (listed first) wins.
+    (['3.11.5-1', '3.11.5'], '3.11.5-1'),
+    (['2.0', '2.0.0'], '2.0'),
+    # Dash-separated parts are ordered as compare_versions orders them: '1.10-2.3' is 1.10.3.
+    (['1.10.2', '1.10-2.3'], '1.10-2.3'),
+    # Versions compare_versions cannot parse are skipped.
+    (['2.16.2b', '2.16.2-1'], '2.16.2-1'),
+    (['cassandra-driver-parent-2.0.9', '1.0.0'], '1.0.0'),
+])
+def test_DriverVersionAnalyzer_LatestIsHighestReleasedVersion(releases, expected):
+    """`driverInfo` is listed by release date, newest first, and can mix release lines."""
+    response = json.dumps({'latest': {'version': releases[0]},
+                           'driverInfo': [{'version': version} for version in releases]})
+    driver_version_analyzer = DriverVersionAnalyzer({})
+    with patch('analyzers.clients.get_url_content', return_value=response):
+        latest = driver_version_analyzer._get_latest_driver_version('DataStax Java Driver')
+
+    assert latest == expected
+
+
+def test_DriverVersionAnalyzer_MinimumRequiresScyllaVersion():
+    """Without a Scylla version the API has no tested-with versions; that must not look like an unindexed driver."""
+    driver_version_analyzer = DriverVersionAnalyzer({})
+    with patch('analyzers.clients.get_url_content') as mock_get_url_content, pytest.raises(ValueError):
+        driver_version_analyzer._get_minimum_driver_version('github.com/scylladb/gocql', '')
+
+    mock_get_url_content.assert_not_called()
+
+
+@pytest.mark.parametrize('api_response', [
+    # Driver name unknown to the API.
+    {'driverInfo': [], 'recommended': []},
+    # Known driver, but no minimum is recorded for this Scylla version.
+    {'latest': {'driver_name': 'gocql', 'version': '1.20.0', 'release_date': '2026-10-06'},
+     'driverInfo': [{'driver_name': 'gocql', 'version': '1.20.0', 'release_date': '2026-10-06'}],
+     'recommended': []},
+    # Known driver, but the only tested-with entry is not a version.
+    {'latest': {'driver_name': 'gocql', 'version': '1.20.0', 'release_date': '2026-10-06'},
+     'driverInfo': [{'driver_name': 'gocql', 'version': '1.20.0', 'release_date': '2026-10-06'}],
+     'recommended': [{'driver_name': 'gocql', 'version': 'stable', 'release_date': '2020-01-01'}]},
+    # Known minimum, but no released version to take the latest from.
+    {'driverInfo': [{'driver_name': 'gocql', 'version': 'stable', 'release_date': '2020-01-01'}],
+     'recommended': [{'driver_name': 'gocql', 'version': '1.13.0', 'release_date': '2024-02-07'}]},
+])
+def test_DriverVersionAnalyzer_UnindexedDriverAPI(api_response):
     """
     Default (empty) minimum_version/latest_version config forces an API lookup. A driver name the
-    backend hasn't indexed yet (empty JSON list response) must degrade to a WARNING, not a hard FAILED,
+    backend hasn't indexed yet (no version data in the response) must degrade to a WARNING, not a hard FAILED,
     same as an unrecognized driver name.
     """
     vitals = {
@@ -447,19 +641,184 @@ def test_DriverVersionAnalyzer_UnindexedDriverAPI():
             {'version': '2024.1.4'}, Output(), '')
     }
 
-    driver_version_analyzer = analyzers.DriverVersionAnalyzer({})
+    driver_version_analyzer = DriverVersionAnalyzer({})
     test_vitals = {'127.0.0.1': [{'driver_name': 'ScyllaDB CPP RS Driver', 'driver_version': '1.0.0'}]}
     test_result = AnalyzerResult(AnalyzerStatus.WARNING,
                                  message="WARNING: No version data available for driver: ScyllaDB CPP RS Driver")
 
-    with patch('analyzers.get_url_content', return_value='[]'):
+    with patch('analyzers.clients.get_url_content', return_value=json.dumps(api_response)):
         check_analyzer(driver_version_analyzer, "ClientConnectionCollector", [
             (test_vitals, test_result),
         ], initial_vitals=vitals)
 
 
+# ClientCQLTimeoutAnalyzer unit tests ##################################################################################
+# Synthetic data only: RFC 1918 addresses, placeholder users, hand-written DRIVER_CONFIG.
+
+def _cql_timeout_system_config(**overrides: int) -> dict:
+    """SystemConfigCollector data with Scylla's default request timeouts (ints, as json.loads yields them)."""
+    defaults = {'read_request_timeout_in_ms': 5000, 'write_request_timeout_in_ms': 2000,
+                'range_request_timeout_in_ms': 10000, 'counter_write_request_timeout_in_ms': 5000,
+                'cas_contention_timeout_in_ms': 1000, 'request_timeout_in_ms': 10000,
+                'truncate_request_timeout_in_ms': 60000}
+    return {name: {'value': value, 'source': 'default', 'type': 'integer'}
+            for name, value in {**defaults, **overrides}.items()}
+
+
+def _cql_timeout_vitals(system_config: Optional[dict] = None) -> dict:
+    config = _cql_timeout_system_config() if system_config is None else system_config
+    return {'SystemConfigCollector': CollectorResult(CollectorStatus.PASSED, config, Output(), '')}
+
+
+def _driver_config(timeout_ms: Optional[int] = 10000) -> dict:
+    """DRIVER_CONFIG v1 as ScyllaDB drivers report it; the request object is absent when the timeout is disabled."""
+    config: dict = {'version': 1, 'connection': {'connect': {'timeout-ms': 5000}},
+                    'query': {'defaults': {'page': {'size': 5000}, 'consistency': 'LOCAL_QUORUM',
+                                           'idempotence': False}}}
+    if timeout_ms is not None:
+        config['query']['defaults']['request'] = {'timeout-ms': timeout_ms}
+    return config
+
+
+def _client_row(driver_config: Any = None, **overrides) -> dict:
+    """A system.clients row as ClientConnectionCollector stores it: all strings, client_options a Python literal."""
+    options = {'COMPRESSION': 'lz4', 'DRIVER_NAME': 'ScyllaDB Python Driver', 'DRIVER_VERSION': '3.29.0'}
+    if driver_config is not None:  # only the session's control connection carries it
+        options['DRIVER_CONFIG'] = json.dumps(driver_config) if isinstance(driver_config, dict) else driver_config
+    row = {'port': '46982', 'client_type': 'cql', 'shard_id': '0', 'connection_stage': 'READY',
+           'driver_name': 'ScyllaDB Python Driver', 'driver_version': '3.29.0', 'hostname': '',
+           'protocol_version': '4', 'ssl_cipher_suite': '', 'ssl_enabled': 'False', 'ssl_protocol': '',
+           'username': 'app_user', 'scheduling_group': 'sl:default', 'client_options': repr(options)}
+    return {**row, **overrides}
+
+
+def test_ClientCQLTimeoutAnalyzer_good_configuration():
+    """Client request timeout above every server-side timeout (Scylla defaults: max 10000 ms) -> PASSED."""
+    analyzer = ClientCQLTimeoutAnalyzer({})
+    check_analyzer(analyzer, "ClientConnectionCollector", [
+        ({'10.0.0.5': [_client_row(_driver_config(12000))]},
+         AnalyzerResult(AnalyzerStatus.PASSED, "1 client driver configuration with a request timeout above the "
+                                               "server-side 10000 ms")),
+        ({'10.0.0.5': [_client_row(_driver_config(12000))], '10.0.0.6': [_client_row(_driver_config(15000))]},
+         AnalyzerResult(AnalyzerStatus.PASSED, "2 client driver configurations with a request timeout above")),
+    ], initial_vitals=_cql_timeout_vitals())
+    assert analyzer.message.endswith("(range_request_timeout_in_ms, request_timeout_in_ms)")
+
+
+def test_ClientCQLTimeoutAnalyzer_bad_configuration():
+    """A 15 ms client request timeout (seen in the wild) is below the server-side 10000 ms -> FAILED, client named."""
+    analyzer = ClientCQLTimeoutAnalyzer({})
+    check_analyzer(analyzer, "ClientConnectionCollector", [
+        ({'10.0.0.5': [_client_row(_driver_config(15), driver_name='ScyllaDB Rust Driver', driver_version='2.0.0')]},
+         AnalyzerResult(AnalyzerStatus.FAILED, "app_user ScyllaDB Rust Driver 2.0.0: 15 ms (1 host)")),
+    ], initial_vitals=_cql_timeout_vitals())
+    assert analyzer.message.startswith("Client request timeout must be greater than the server-side 10000 ms "
+                                       "(range_request_timeout_in_ms, request_timeout_in_ms): ")
+
+
+def test_ClientCQLTimeoutAnalyzer_equal_to_server_timeout_fails():
+    """Equal is not strictly greater: the client gives up exactly when the coordinator does -> FAILED."""
+    analyzer = ClientCQLTimeoutAnalyzer({})
+    check_analyzer(analyzer, "ClientConnectionCollector", [
+        ({'10.0.0.5': [_client_row(_driver_config(10000))]},
+         AnalyzerResult(AnalyzerStatus.FAILED, "app_user ScyllaDB Python Driver 3.29.0: 10000 ms (1 host)")),
+    ], initial_vitals=_cql_timeout_vitals())
+
+
+def test_ClientCQLTimeoutAnalyzer_groups_bad_clients_per_application():
+    """
+    Offenders are listed per application (user, driver, version, timeout) with a host count, not per host or
+    connection: two hosts of the same app, a second session on one of them and its config-less connections on other
+    shards make one entry; the same driver under another user is a second entry; good clients are not named.
+    """
+    java = {'driver_name': 'ScyllaDB Java Driver', 'driver_version': '4.19.0'}
+    analyzer = ClientCQLTimeoutAnalyzer({})
+    check_analyzer(analyzer, "ClientConnectionCollector", [
+        ({'10.0.0.5': [_client_row(_driver_config(3000), **java),
+                       _client_row(_driver_config(3000), port='50000', shard_id='1', **java),
+                       _client_row(port='47010', shard_id='2', **java)],
+          '10.0.0.6': [_client_row(_driver_config(3000), **java),
+                       _client_row(_driver_config(2000), username='batch_user', **java)],
+          '10.0.0.7': [_client_row(_driver_config(12000))]},
+         AnalyzerResult(AnalyzerStatus.FAILED, "app_user ScyllaDB Java Driver 4.19.0: 3000 ms (2 hosts); "
+                                               "batch_user ScyllaDB Java Driver 4.19.0: 2000 ms (1 host)")),
+    ], initial_vitals=_cql_timeout_vitals())
+    assert '10.0.0.' not in analyzer.message
+    assert 'Python' not in analyzer.message
+
+
+@pytest.mark.parametrize("rows", [
+    pytest.param([_client_row(_driver_config(None))], id="timeout-disabled"),
+    pytest.param([{key: value for key, value in _client_row().items() if key != 'client_options'}],
+                 id="no-client_options-column"),
+    pytest.param([_client_row()], id="no-DRIVER_CONFIG"),
+    pytest.param([_client_row('{"version": 1, "query": ')], id="malformed-DRIVER_CONFIG"),
+    pytest.param([_client_row(client_options="{'DRIVER_CONFIG': '{")], id="malformed-client_options"),
+    pytest.param([_client_row(_driver_config(15), connection_stage='AUTHENTICATING')], id="not-READY"),
+    pytest.param([_client_row(_driver_config(15), client_type='alternator')], id="not-cql"),
+])
+def test_ClientCQLTimeoutAnalyzer_skips_without_evaluable_client(rows):
+    """No READY CQL client with a parseable request timeout: nothing to compare -> SKIPPED, never FAILED."""
+    analyzer = ClientCQLTimeoutAnalyzer({})
+    check_analyzer(analyzer, "ClientConnectionCollector", [
+        ({'10.0.0.5': rows},
+         AnalyzerResult(AnalyzerStatus.SKIPPED, "No connected CQL client reported its driver configuration")),
+    ], initial_vitals=_cql_timeout_vitals())
+
+
+def test_ClientCQLTimeoutAnalyzer_server_timeouts_config():
+    """server_timeouts narrows the compared options: write only (2000 ms) instead of the default max of 10000 ms."""
+    config = {'ClientCQLTimeoutAnalyzer': {'server_timeouts': 'write_request_timeout_in_ms'}}
+    analyzer = ClientCQLTimeoutAnalyzer(config)
+    check_analyzer(analyzer, "ClientConnectionCollector", [
+        ({'10.0.0.5': [_client_row(_driver_config(2500))]},
+         AnalyzerResult(AnalyzerStatus.PASSED, "server-side 2000 ms (write_request_timeout_in_ms)")),
+        ({'10.0.0.5': [_client_row(_driver_config(2000))]},
+         AnalyzerResult(AnalyzerStatus.FAILED, "server-side 2000 ms (write_request_timeout_in_ms): app_user")),
+    ], initial_vitals=_cql_timeout_vitals())
+
+
+def test_ClientCQLTimeoutAnalyzer_missing_server_timeout_options():
+    """
+    server_timeouts options absent from system.config: FAILED when none is left to compare against; a user-supplied
+    list adds a WARNING naming the missing ones (a typo must not pass silently); the default list stays quiet, since
+    an option absent there is a Scylla version difference, not a configuration error.
+    """
+    rows = {'10.0.0.5': [_client_row(_driver_config(12000))]}
+    all_unknown = {'ClientCQLTimeoutAnalyzer': {'server_timeouts': 'no_such_option,another_typo'}}
+    check_analyzer(ClientCQLTimeoutAnalyzer(all_unknown), "ClientConnectionCollector", [
+        (rows, AnalyzerResult(AnalyzerStatus.FAILED, "None of the server_timeouts options exist in system.config: "
+                                                     "another_typo, no_such_option")),
+    ], initial_vitals=_cql_timeout_vitals())
+
+    one_valid = {'ClientCQLTimeoutAnalyzer': {'server_timeouts': 'no_such_option,read_request_timeout_in_ms'}}
+    analyzer = ClientCQLTimeoutAnalyzer(one_valid)
+    check_analyzer(analyzer, "ClientConnectionCollector", [
+        (rows, AnalyzerResult(AnalyzerStatus.WARNING, "server-side 5000 ms (read_request_timeout_in_ms)")),
+        ({'10.0.0.5': [_client_row(_driver_config(15))]},  # a bad client still FAILs, the warning is appended
+         AnalyzerResult(AnalyzerStatus.FAILED, "app_user ScyllaDB Python Driver 3.29.0: 15 ms (1 host); WARNING: ")),
+    ], initial_vitals=_cql_timeout_vitals())
+    assert analyzer.message.endswith("; WARNING: server_timeouts options not found in system.config: no_such_option")
+
+    without_range = {name: entry for name, entry in _cql_timeout_system_config().items()
+                     if name != 'range_request_timeout_in_ms'}
+    analyzer = ClientCQLTimeoutAnalyzer({})
+    check_analyzer(analyzer, "ClientConnectionCollector", [
+        (rows, AnalyzerResult(AnalyzerStatus.PASSED, "10000 ms (request_timeout_in_ms)")),
+    ], initial_vitals=_cql_timeout_vitals(without_range))
+    assert 'WARNING' not in analyzer.message
+
+
+def test_ClientCQLTimeoutAnalyzer_requires_system_config():
+    analyzer = ClientCQLTimeoutAnalyzer({})
+    check_analyzer(analyzer, "ClientConnectionCollector", [
+        ({'10.0.0.5': [_client_row(_driver_config(12000))]},
+         AnalyzerResult(AnalyzerStatus.FAILED, "Required SystemConfigCollector results not found")),
+    ])
+
+
 def test_IOSetupAnalyzer():
-    analyzer = analyzers.IOSetupAnalyzer({})
+    analyzer = IOSetupAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -488,7 +847,7 @@ def test_IOSetupAnalyzer():
 
 
 def test_MemoryTuningAnalyzer():
-    analyzer = analyzers.MemoryTuningAnalyzer({})
+    analyzer = MemoryTuningAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ScyllaExtraConfigurationFilesCollector results not found")
@@ -508,7 +867,7 @@ def test_NICsAnalyzer():
         'InfrastructureProviderCollector': CollectorResult(CollectorStatus.PASSED, {'provider': None}, Output(), '')
     }
 
-    analyzer = analyzers.NICsAnalyzer({})
+    analyzer = NICsAnalyzer({})
     analyzer.analyze(vitals)
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required NICsCollector results not found")
@@ -548,7 +907,7 @@ def test_NICsAnalyzer():
     ], initial_vitals=vitals)
 
     # Explicit skip_nic_speed_check=True: speed check skipped even on non-cloud provider
-    analyzer_skip = analyzers.NICsAnalyzer({'NICsAnalyzer': {'skip_nic_speed_check': True}})
+    analyzer_skip = NICsAnalyzer({'NICsAnalyzer': {'skip_nic_speed_check': True}})
     vitals_no_nics = {
         'InfrastructureProviderCollector': CollectorResult(CollectorStatus.PASSED,
                                                            {'provider': None, 'extra': {}}, Output(), ''),
@@ -558,7 +917,7 @@ def test_NICsAnalyzer():
     assert_analyzer_result(analyzer_skip, AnalyzerStatus.PASSED, "Networking setup is ok")
 
     # Explicit skip_nic_speed_check=False on AWS: speed check IS performed despite AWS default skip
-    analyzer_no_skip = analyzers.NICsAnalyzer({'NICsAnalyzer': {'skip_nic_speed_check': False}})
+    analyzer_no_skip = NICsAnalyzer({'NICsAnalyzer': {'skip_nic_speed_check': False}})
     vitals_aws_slow = {
         'InfrastructureProviderCollector': CollectorResult(CollectorStatus.PASSED,
                                                            {'provider': "AWS", 'extra': {
@@ -573,7 +932,7 @@ def test_NICsAnalyzer():
 
 
 def test_ComputerArchitectureAnalyzer():
-    analyzer = analyzers.ComputerArchitectureAnalyzer({})
+    analyzer = ComputerArchitectureAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ComputerArchitectureCollector results not found")
@@ -589,7 +948,7 @@ def test_ComputerArchitectureAnalyzer():
 
 
 def test_KernelVersionAnalyzer():
-    analyzer = analyzers.KernelVersionAnalyzer({})
+    analyzer = KernelVersionAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ComputerArchitectureCollector results not found")
@@ -603,7 +962,7 @@ def test_KernelVersionAnalyzer():
 
 
 def test_RaftTopologyEnablementAnalyzer():
-    analyzer = analyzers.RaftTopologyEnablementAnalyzer({})
+    analyzer = RaftTopologyEnablementAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required SystemTopologyCollector results not found")
@@ -628,7 +987,7 @@ def test_RaftTopologyEnablementAnalyzer():
 
 
 def test_NTPStatusAnalyzer():
-    analyzer = analyzers.NTPStatusAnalyzer({})
+    analyzer = NTPStatusAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required NTPStatusCollector results not found")
@@ -646,7 +1005,7 @@ def test_NTPStatusAnalyzer():
 
 
 def test_NTPServicesAnalyzer():
-    analyzer = analyzers.NTPServicesAnalyzer({})
+    analyzer = NTPServicesAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required NTPServicesCollector results not found")
@@ -656,11 +1015,17 @@ def test_NTPServicesAnalyzer():
          AnalyzerResult(AnalyzerStatus.FAILED, "was not done")),
         ({'services': {'chrony': {'active': True}}},
          AnalyzerResult(AnalyzerStatus.PASSED, "was done")),
+        ({'chrony_installed': True, 'services': {'chronyd': {'active': True}, 'systemd-timesyncd': {'active': False}}},
+         AnalyzerResult(AnalyzerStatus.PASSED, "was done")),
+        ({'chrony_installed': False, 'services': {'chronyd': {'active': False}, 'systemd-timesyncd': {'active': True}}},
+         AnalyzerResult(AnalyzerStatus.PASSED, "was done")),
+        ({'chrony_installed': True, 'services': {'chronyd': {'active': False}, 'systemd-timesyncd': {'active': True}}},
+         AnalyzerResult(AnalyzerStatus.WARNING, "Chrony is installed, but time is kept by systemd-timesyncd")),
     ])
 
 
 def test_ChronyStatusAnalyzer():
-    analyzer = analyzers.ChronyStatusAnalyzer({})
+    analyzer = ChronyStatusAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ChronyStatusCollector results not found")
@@ -670,20 +1035,6 @@ def test_ChronyStatusAnalyzer():
          AnalyzerResult(AnalyzerStatus.FAILED, "The system clock is not chrony synchronized.")),
         ({'chrony_synchronized': True},
          AnalyzerResult(AnalyzerStatus.PASSED, "The system clock is chrony synchronized.")),
-    ])
-
-
-def test_ChronyServicesAnalyzer():
-    analyzer = analyzers.ChronyServicesAnalyzer({})
-    analyzer.analyze({})
-    assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
-                           "Required ChronyServicesCollector results not found")
-
-    check_analyzer(analyzer, "ChronyServicesCollector", [
-        ({'services': {'chronyd': {'active': False}, 'chrony': {'active': False}}},
-         AnalyzerResult(AnalyzerStatus.FAILED, "was not done")),
-        ({'services': {'chronyd': {'active': True}, 'chrony': {'active': False}}},
-         AnalyzerResult(AnalyzerStatus.PASSED, "was done")),
     ])
 
 
@@ -711,9 +1062,9 @@ def test_OSSupportAnalyzer(monkeypatch):
             },
         ]
     })
-    monkeypatch.setattr(analyzers, 'get_url_content',
+    monkeypatch.setattr('analyzers.operating_system.get_url_content',
                         lambda url: None if url == 'https://example.invalid/os-support.json' else matrix)
-    analyzer = analyzers.OSSupportAnalyzer({})
+    analyzer = OSSupportAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -763,8 +1114,8 @@ def test_OSSupportAnalyzer(monkeypatch):
             {'name': "ubuntu", 'version': "22", 'version_minor': "22.04"}, Output(), ''),
     })
 
-    monkeypatch.setattr(analyzers, 'get_url_content', lambda *args, **kwargs: None)
-    fetch_fail = analyzers.OSSupportAnalyzer({
+    monkeypatch.setattr('analyzers.operating_system.get_url_content', lambda *args, **kwargs: None)
+    fetch_fail = OSSupportAnalyzer({
         'OSSupportAnalyzer': {'os_support_url': 'https://example.invalid/os-support.json'}
     })
     fetch_fail.analyze({
@@ -776,8 +1127,8 @@ def test_OSSupportAnalyzer(monkeypatch):
     assert_analyzer_result(fetch_fail, AnalyzerStatus.SKIPPED, "Cannot retrieve OS support matrix")
 
     bad_entry_payload = json.dumps({"ScyllaDB Versions": [{"version": "ScyllaDB 2025.1"}]})
-    monkeypatch.setattr(analyzers, 'get_url_content', lambda url: bad_entry_payload)
-    bad_entry = analyzers.OSSupportAnalyzer({})
+    monkeypatch.setattr('analyzers.operating_system.get_url_content', lambda url: bad_entry_payload)
+    bad_entry = OSSupportAnalyzer({})
     bad_entry.analyze({
         'OSCollector': CollectorResult(
             CollectorStatus.PASSED,
@@ -788,7 +1139,7 @@ def test_OSSupportAnalyzer(monkeypatch):
 
 
 def test_PerftuneAnalyzer():
-    analyzer = analyzers.PerftuneAnalyzer({})
+    analyzer = PerftuneAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required PerftuneSystemConfigurationCollector results not found")
@@ -894,7 +1245,7 @@ def test_PerftuneAnalyzer_skip_files():
     collector = "PerftuneSystemConfigurationCollector"
 
     # skip_files causes mismatched file to be ignored -> PASSED
-    analyzer = analyzers.PerftuneAnalyzer(
+    analyzer = PerftuneAnalyzer(
         {'PerftuneAnalyzer': {'skip_files': '/sys/block/sda/queue/scheduler'}})
     check_analyzer(analyzer, collector, [
         ({'perftune': {'files': {'/sys/block/sda/queue/scheduler': 'none'}},
@@ -904,7 +1255,7 @@ def test_PerftuneAnalyzer_skip_files():
     ])
 
     # skip_files skips only the listed file; other mismatched files still reported
-    analyzer = analyzers.PerftuneAnalyzer(
+    analyzer = PerftuneAnalyzer(
         {'PerftuneAnalyzer': {'skip_files': '/sys/block/sda/queue/scheduler'}})
     check_analyzer(analyzer, collector, [
         ({'perftune': {'files': {'/sys/block/sda/queue/scheduler': 'none',
@@ -916,7 +1267,7 @@ def test_PerftuneAnalyzer_skip_files():
     ])
 
     # empty skip_files -> mismatch is still reported
-    analyzer = analyzers.PerftuneAnalyzer({'PerftuneAnalyzer': {'skip_files': ''}})
+    analyzer = PerftuneAnalyzer({'PerftuneAnalyzer': {'skip_files': ''}})
     check_analyzer(analyzer, collector, [
         ({'perftune': {'files': {'/sys/block/sda/queue/scheduler': 'none'}},
           'files': {'/sys/block/sda/queue/scheduler': 'mq-deadline kyber [bfq] none'},
@@ -925,7 +1276,7 @@ def test_PerftuneAnalyzer_skip_files():
     ])
 
     # multiple comma-separated files skipped
-    analyzer = analyzers.PerftuneAnalyzer(
+    analyzer = PerftuneAnalyzer(
         {'PerftuneAnalyzer': {'skip_files': '/sys/block/sda/queue/scheduler,/sys/some/other'}})
     check_analyzer(analyzer, collector, [
         ({'perftune': {'files': {'/sys/block/sda/queue/scheduler': 'none',
@@ -941,7 +1292,7 @@ def test_PerftuneAnalyzer_skip_sysctls():
     collector = "PerftuneSystemConfigurationCollector"
 
     # skip_sysctls causes mismatched sysctl to be ignored -> PASSED
-    analyzer = analyzers.PerftuneAnalyzer(
+    analyzer = PerftuneAnalyzer(
         {'PerftuneAnalyzer': {'skip_sysctls': 'net.core.somaxconn'}})
     check_analyzer(analyzer, collector, [
         ({'perftune': {'sysctl': {'net.core.somaxconn': '1024'}},
@@ -951,7 +1302,7 @@ def test_PerftuneAnalyzer_skip_sysctls():
     ])
 
     # skip_sysctls skips only the listed param; other mismatched params still reported
-    analyzer = analyzers.PerftuneAnalyzer(
+    analyzer = PerftuneAnalyzer(
         {'PerftuneAnalyzer': {'skip_sysctls': 'net.core.somaxconn'}})
     check_analyzer(analyzer, collector, [
         ({'perftune': {'sysctl': {'net.core.somaxconn': '1024', 'vm.swappiness': '1'}},
@@ -961,7 +1312,7 @@ def test_PerftuneAnalyzer_skip_sysctls():
     ])
 
     # empty skip_sysctls -> mismatch is still reported
-    analyzer = analyzers.PerftuneAnalyzer({'PerftuneAnalyzer': {'skip_sysctls': ''}})
+    analyzer = PerftuneAnalyzer({'PerftuneAnalyzer': {'skip_sysctls': ''}})
     check_analyzer(analyzer, collector, [
         ({'perftune': {'sysctl': {'net.core.somaxconn': '1024'}},
           'files': {},
@@ -970,7 +1321,7 @@ def test_PerftuneAnalyzer_skip_sysctls():
     ])
 
     # multiple comma-separated sysctls skipped
-    analyzer = analyzers.PerftuneAnalyzer(
+    analyzer = PerftuneAnalyzer(
         {'PerftuneAnalyzer': {'skip_sysctls': 'net.core.somaxconn,vm.swappiness'}})
     check_analyzer(analyzer, collector, [
         ({'perftune': {'sysctl': {'net.core.somaxconn': '1024', 'vm.swappiness': '1'}},
@@ -984,7 +1335,7 @@ def test_PerftuneAnalyzer_skip_files_and_sysctls():
     collector = "PerftuneSystemConfigurationCollector"
 
     # Both skip_files and skip_sysctls active -> all mismatches suppressed -> PASSED
-    analyzer = analyzers.PerftuneAnalyzer({'PerftuneAnalyzer': {
+    analyzer = PerftuneAnalyzer({'PerftuneAnalyzer': {
         'skip_files': '/sys/some/file',
         'skip_sysctls': 'net.core.somaxconn',
     }})
@@ -1001,7 +1352,7 @@ class TestPerftuneAnalyzer_compare_str_or_int16_list:
 
     @staticmethod
     def _compare(a: str, b: str) -> bool:
-        analyzer = analyzers.PerftuneAnalyzer({})  # type: ignore[arg-type]
+        analyzer = PerftuneAnalyzer({})  # type: ignore[arg-type]
         return analyzer._PerftuneAnalyzer__compare_str_or_int16_list(a, b)  # type: ignore[attr-defined]
 
     # --- Identical strings (fast path) ---
@@ -1121,7 +1472,7 @@ class TestPerftuneAnalyzer_compare_str_or_int16_list:
 
 
 def test_ScyllaSystemConfigurationFilesAnalyzer():
-    analyzer = analyzers.ScyllaSystemConfigurationFilesAnalyzer({})
+    analyzer = ScyllaSystemConfigurationFilesAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ScyllaSystemConfigurationFilesCollector results not found")
@@ -1159,7 +1510,7 @@ def test_ScyllaSystemConfigurationFilesAnalyzer():
 
 
 def test_RAMAnalyzer():
-    analyzer = analyzers.RAMAnalyzer({})
+    analyzer = RAMAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -1178,7 +1529,7 @@ def test_RAMAnalyzer():
          AnalyzerResult(AnalyzerStatus.PASSED, "detected")),
     ], initial_vitals=vitals)
 
-    analyzer = analyzers.RAMAnalyzer({
+    analyzer = RAMAnalyzer({
         'RAMAnalyzer': {
             'ram_minimum_total': '10',
             'ram_recommended_total': '5'
@@ -1200,7 +1551,7 @@ def test_RAMAnalyzer():
 
 
 def test_RsyslogAnalyzer():
-    analyzer = analyzers.RsyslogAnalyzer({})
+    analyzer = RsyslogAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -1230,7 +1581,7 @@ def test_RsyslogAnalyzer():
 
 
 def test_AIOMAXNRAnalyzer():
-    analyzer = analyzers.AIOMAXNRAnalyzer({})
+    analyzer = AIOMAXNRAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -1249,7 +1600,7 @@ def test_AIOMAXNRAnalyzer():
 
 
 def test_PerftuneYamlAnalyzer():
-    analyzer = analyzers.PerftuneYamlAnalyzer({})
+    analyzer = PerftuneYamlAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "results not found")
@@ -1276,7 +1627,7 @@ def test_PerftuneYamlAnalyzer():
 
 
 def test_PerftuneCpuMaskAnalyzer():
-    analyzer = analyzers.PerftuneCpuMaskAnalyzer({})
+    analyzer = PerftuneCpuMaskAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "results not found")
@@ -1297,7 +1648,7 @@ def test_PerftuneCpuMaskAnalyzer():
 
 
 def test_StorageTypeAnalyzer():
-    analyzer = analyzers.StorageTypeAnalyzer({})
+    analyzer = StorageTypeAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required StorageConfigurationCollector results not found")
@@ -1338,7 +1689,7 @@ def test_StorageTypeAnalyzer():
 
 
 def test_RAIDSetupAnalyzer():
-    analyzer = analyzers.RAIDSetupAnalyzer({})
+    analyzer = RAIDSetupAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -1399,7 +1750,7 @@ def test_RAIDSetupAnalyzer():
 
 
 def test_UnusedNVMeDevicesAnalyzer():
-    analyzer = analyzers.UnusedNVMeDevicesAnalyzer({})
+    analyzer = UnusedNVMeDevicesAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required NVMeDevicesCollector results not found")
@@ -1421,24 +1772,31 @@ def test_UnusedNVMeDevicesAnalyzer():
 
 
 def test_DiskPerformanceExceededAnalyzer():
-    analyzer = analyzers.DiskPerformanceExceededAnalyzer({})
+    analyzer = DiskPerformanceExceededAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
-                           "Required DiskPerformanceExceededCollector results not found")
+                           "Required NitroDetailedStatsCollector results not found")
 
-    check_analyzer(analyzer, "DiskPerformanceExceededCollector", [
-        ({'devices': {'nvme0n1': {'ec2_instance_performance_exceeded_iops': 0,
-                                  'ec2_instance_performance_exceeded_tp': 0}}},
+    check_analyzer(analyzer, "NitroDetailedStatsCollector", [
+        # Only the "performance exceeded" counters are inspected, the other statistics are ignored.
+        ({'devices': {'nvme0n1': {'total_read_ops': 100,
+                                  'ec2_instance_performance_exceeded_iops': 0,
+                                  'ec2_instance_performance_exceeded_tp': 0,
+                                  'read_io_latency_histogram': {'num_bins': 1, 'bins': []}}}},
          AnalyzerResult(AnalyzerStatus.PASSED, "No performance limits were exceeded on 1 NVMe device(s)")),
         ({'devices': {'nvme0n1': {'ec2_instance_performance_exceeded_iops': 15,
                                   'ec2_instance_performance_exceeded_tp': 0}}},
          AnalyzerResult(AnalyzerStatus.WARNING,
                         "nvme0n1: ec2_instance_performance_exceeded_iops=15 microseconds")),
+        # Statistics without any "performance exceeded" counter (e.g. an unexpected nvme-cli output shape)
+        # must not be reported as PASSED.
+        ({'devices': {'nvme0n1': {'total_read_ops': 100, 'volume_queue_length': 1}}},
+         AnalyzerResult(AnalyzerStatus.SKIPPED, "No 'performance exceeded' counters found")),
     ])
 
     # A threshold tolerates counters up to its value.
-    analyzer = analyzers.DiskPerformanceExceededAnalyzer({'DiskPerformanceExceededAnalyzer': {'threshold': '20'}})
-    check_analyzer(analyzer, "DiskPerformanceExceededCollector", [
+    analyzer = DiskPerformanceExceededAnalyzer({'DiskPerformanceExceededAnalyzer': {'threshold': '20'}})
+    check_analyzer(analyzer, "NitroDetailedStatsCollector", [
         ({'devices': {'nvme0n1': {'ec2_instance_performance_exceeded_iops': 15}}},
          AnalyzerResult(AnalyzerStatus.PASSED, "No performance limits were exceeded")),
         ({'devices': {'nvme0n1': {'ec2_instance_performance_exceeded_iops': 21}}},
@@ -1447,7 +1805,7 @@ def test_DiskPerformanceExceededAnalyzer():
 
 
 def test_AssignedNICsAnalyzer():
-    analyzer = analyzers.AssignedNICsAnalyzer({})
+    analyzer = AssignedNICsAnalyzer({})
     vitals = {
         'NICsCollector': CollectorResult(
             CollectorStatus.PASSED,
@@ -1471,7 +1829,7 @@ def test_AssignedNICsAnalyzer():
 
 
 def test_ScheduledMaintenanceEventAnalyzer():
-    analyzer = analyzers.ScheduledMaintenanceEventAnalyzer({})
+    analyzer = ScheduledMaintenanceEventAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -1486,7 +1844,7 @@ def test_ScheduledMaintenanceEventAnalyzer():
 
 
 def test_ScyllaBroadcastAddressAnalyzer():
-    analyzer = analyzers.ScyllaBroadcastAddressAnalyzer({})
+    analyzer = ScyllaBroadcastAddressAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -1509,7 +1867,7 @@ def test_ScyllaBroadcastAddressAnalyzer():
 
 
 def test_ScyllaClusterSystemKeyspacesReplicationAnalyzer():
-    analyzer = analyzers.ScyllaClusterSystemKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaClusterSystemKeyspacesReplicationAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -1569,7 +1927,7 @@ def test_ScyllaClusterSystemKeyspacesReplicationAnalyzer():
 
 
 def test_ScyllaClusterSystemKeyspacesReplicationAnalyzer_system_auth_v2():
-    analyzer = analyzers.ScyllaClusterSystemKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaClusterSystemKeyspacesReplicationAnalyzer({})
     nodes = CollectorResult(
         CollectorStatus.PASSED,
         {'up': ["127.0.0.1", "127.0.0.2", "127.0.0.3", "127.0.0.4"], 'down': []}, Output(), '')
@@ -1656,7 +2014,7 @@ def test_ScyllaClusterSystemKeyspacesReplicationAnalyzer_system_auth_v2():
 
 
 def test_ScyllaClusterSchemaAnalyzer():
-    analyzer = analyzers.ScyllaClusterSchemaAnalyzer({})
+    analyzer = ScyllaClusterSchemaAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -1669,7 +2027,7 @@ def test_ScyllaClusterSchemaAnalyzer():
 
 
 def test_ScyllaDeprecatedArgumentsAnalyzer():
-    analyzer = analyzers.ScyllaDeprecatedArgumentsAnalyzer({})
+    analyzer = ScyllaDeprecatedArgumentsAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ScyllaSystemConfigurationFilesCollector results not found")
@@ -1685,7 +2043,7 @@ def test_ScyllaDeprecatedArgumentsAnalyzer():
 
 
 def test_ScyllaLimitNOFILEAnalyzer():
-    analyzer = analyzers.ScyllaLimitNOFILEAnalyzer({})
+    analyzer = ScyllaLimitNOFILEAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ScyllaLimitNOFILECollector results not found")
@@ -1716,7 +2074,7 @@ def test_ScyllaLimitNOFILEAnalyzer():
 
 
 def test_FSFILEMAXAnalyzer():
-    analyzer = analyzers.FSFILEMAXAnalyzer({})
+    analyzer = FSFILEMAXAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -1748,7 +2106,7 @@ def test_FSFILEMAXAnalyzer():
 
 
 def test_FSNROPENAnalyzer():
-    analyzer = analyzers.FSNROPENAnalyzer({})
+    analyzer = FSNROPENAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -1780,7 +2138,7 @@ def test_FSNROPENAnalyzer():
 
 
 def test_ScyllaInternodeCompressionAnalyzer():
-    analyzer = analyzers.ScyllaInternodeCompressionAnalyzer({})
+    analyzer = ScyllaInternodeCompressionAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ScyllaConfigurationFileCollector results not found")
@@ -1795,8 +2153,8 @@ def test_ScyllaInternodeCompressionAnalyzer():
     ])
 
     # Check the case when we override the default recommended compression
-    analyzer = analyzers.ScyllaInternodeCompressionAnalyzer({'ScyllaInternodeCompressionAnalyzer':
-                                                            {'recommended_compression': 'dc'}})
+    analyzer = ScyllaInternodeCompressionAnalyzer({'ScyllaInternodeCompressionAnalyzer':
+                                                  {'recommended_compression': 'dc'}})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ScyllaConfigurationFileCollector results not found")
@@ -1812,7 +2170,7 @@ def test_ScyllaInternodeCompressionAnalyzer():
 
 
 def test_ScyllaListenAddressAnalyzer():
-    analyzer = analyzers.ScyllaListenAddressAnalyzer({})
+    analyzer = ScyllaListenAddressAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ScyllaConfigurationFileCollector results not found")
@@ -1832,7 +2190,7 @@ def test_ScyllaListenAddressAnalyzer():
 
 
 def test_ScyllaNICsDisksSetupAnalyzer():
-    analyzer = analyzers.ScyllaNICsDisksSetupAnalyzer({})
+    analyzer = ScyllaNICsDisksSetupAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ScyllaSystemConfigurationFilesCollector results not found")
@@ -1850,7 +2208,7 @@ def test_ScyllaNICsDisksSetupAnalyzer():
 
 
 def test_ScyllaRPCAddressAnalyzer():
-    analyzer = analyzers.ScyllaRPCAddressAnalyzer({})
+    analyzer = ScyllaRPCAddressAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ScyllaConfigurationFileCollector results not found")
@@ -1868,7 +2226,7 @@ def test_ScyllaRPCAddressAnalyzer():
 
 
 def test_ScyllaRPCBroadcastRPCAddressAnalyzer():
-    analyzer = analyzers.ScyllaBroadcastRPCAddressAnalyzer({})
+    analyzer = ScyllaBroadcastRPCAddressAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "Required ScyllaConfigurationFileCollector results not found")
@@ -1888,7 +2246,7 @@ def test_ScyllaRPCBroadcastRPCAddressAnalyzer():
 
 
 def test_ScyllaServicesAnalyzer():
-    analyzer = analyzers.ScyllaServicesAnalyzer({})
+    analyzer = ScyllaServicesAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED,
                            "results not found")
@@ -1955,7 +2313,7 @@ def test_ScyllaServicesAnalyzer():
         }
         vitals_no_discard.update(scylla_version_vitals)
 
-        analyzer = analyzers.ScyllaServicesAnalyzer({})
+        analyzer = ScyllaServicesAnalyzer({})
 
         check_analyzer(analyzer, "ScyllaServicesCollector", [
             (required_services,
@@ -1979,7 +2337,7 @@ def test_ScyllaServicesAnalyzer():
              AnalyzerResult(AnalyzerStatus.PASSED, "All services")),
         ], initial_vitals=vitals_no_discard)
 
-        analyzer = analyzers.ScyllaServicesAnalyzer({"ScyllaServicesAnalyzer": {
+        analyzer = ScyllaServicesAnalyzer({"ScyllaServicesAnalyzer": {
             "skip_active_check": "scylla-housekeeping-daily",
             "skip_autostarts_check": "scylla-housekeeping-daily,scylla-node-exporter",
         }})
@@ -1991,7 +2349,7 @@ def test_ScyllaServicesAnalyzer():
              AnalyzerResult(AnalyzerStatus.PASSED, "All services")),
         ], initial_vitals=vitals_no_discard)
 
-        analyzer = analyzers.ScyllaServicesAnalyzer({"ScyllaServicesAnalyzer": {
+        analyzer = ScyllaServicesAnalyzer({"ScyllaServicesAnalyzer": {
             "disable_autostarts": "scylla-server"
         }})
 
@@ -2002,7 +2360,7 @@ def test_ScyllaServicesAnalyzer():
 
 
 def test_ScyllaSeedsAnalyzer():
-    analyzer = analyzers.ScyllaSeedsAnalyzer({})
+    analyzer = ScyllaSeedsAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -2022,7 +2380,7 @@ def test_ScyllaSeedsAnalyzer():
 
 
 def test_ScyllaSnitchAnalyzer():
-    analyzer = analyzers.ScyllaSnitchAnalyzer({})
+    analyzer = ScyllaSnitchAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -2056,7 +2414,7 @@ def test_ScyllaSnitchAnalyzer():
          AnalyzerResult(AnalyzerStatus.PASSED, "is used")),
     ], initial_vitals=vitals)
 
-    analyzer = analyzers.ScyllaSnitchAnalyzer({'ScyllaSnitchAnalyzer': {'check_provider_snitch': 'no'}})
+    analyzer = ScyllaSnitchAnalyzer({'ScyllaSnitchAnalyzer': {'check_provider_snitch': 'no'}})
     check_analyzer(analyzer, "ScyllaConfigurationFileCollector", [
         ({},
          AnalyzerResult(AnalyzerStatus.FAILED, "'endpoint_snitch' is not set")),
@@ -2068,7 +2426,7 @@ def test_ScyllaSnitchAnalyzer():
 
 
 def test_ScyllaSSTablesAnalyzer():
-    analyzer = analyzers.ScyllaSSTablesAnalyzer({'ScyllaSSTablesAnalyzer': {'recommended_format': 'md'}})
+    analyzer = ScyllaSSTablesAnalyzer({'ScyllaSSTablesAnalyzer': {'recommended_format': 'md'}})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -2076,39 +2434,36 @@ def test_ScyllaSSTablesAnalyzer():
         'SystemConfigCollector': CollectorResult(CollectorStatus.PASSED, {}, Output(), '')
     }
 
+    # data.sstables = {directory: {sstable stem: [component suffixes]}}; files without '-' live in other_files
+    mc_table = {'/var/lib/scylla/data/some_table': {'mc-some': ['Data.db']}}
+    md_file = {'/var/lib/scylla/data': {'md-some-file': ['Data.db']}}
+
     # recommended_format from config drives the check when set
     check_analyzer(analyzer, "ScyllaSSTablesCollector", [
-        ({'files': []},
+        ({'sstables': {}},
          AnalyzerResult(AnalyzerStatus.PASSED, "No SSTables found")),
-        ({'files': ['/var/lib/scylla/data/some_table/mc-some-Data.db']},
+        ({'sstables': mc_table},
          AnalyzerResult(AnalyzerStatus.WARNING, "SSTable format is not 'md'")),
-        ({'files': [
-            '/var/lib/scylla/data/some_table/md-some-Data.db',
-            '/var/lib/scylla/data/some_table/mc-some-file-2-Data.db',
-            '/var/lib/scylla/data/some_table/md-some-file-3-Data.db',
-            ]},
+        ({'sstables': {'/var/lib/scylla/data/some_table': {
+            'md-some': ['Data.db'],
+            'mc-some-file-2': ['Data.db'],
+            'md-some-file-3': ['Data.db'],
+        }}},
          AnalyzerResult(AnalyzerStatus.WARNING, "SSTable format is not 'md'")),
-        ({'files': ['/var/lib/scylla/data/md-some-file-Data.db',
-                    '/var/lib/scylla/data/md-some-file-Index.db',
-                    '/var/lib/scylla/data/md-some-file-Filter.db',
-                    '/var/lib/scylla/data/md-some-file-CompressionInfo.db',
-                    '/var/lib/scylla/data/md-some-file-Summary.db',
-                    '/var/lib/scylla/data/md-some-file-Statistics.db',
-                    '/var/lib/scylla/data/md-some-file-CRC.db',
-                    '/var/lib/scylla/data/md-some-file-Scylla.db',
-                    '/var/lib/scylla/data/md-some-file-Digest.crc32',
-                    '/var/lib/scylla/data/md-some-file-Digest.adler32',
-                    '/var/lib/scylla/data/md-some-file-Digest.sha1',
-                    '/var/lib/scylla/data/md-some-file-TOC.txt',
-                    '/var/lib/scylla/data/some-file.db']},
+        ({'sstables': {'/var/lib/scylla/data': {
+            'md-some-file': ['Data.db', 'Index.db', 'Filter.db', 'CompressionInfo.db', 'Summary.db', 'Statistics.db',
+                             'CRC.db', 'Scylla.db', 'Digest.crc32', 'Digest.adler32', 'Digest.sha1', 'TOC.txt'],
+        }, '/var/lib/scylla/data/pending_delete': {
+            'sstables-5': ['9.log'],  # sstables-5-9.log, an atomic-delete log: not an sstable, ignored
+        }}},
          AnalyzerResult(AnalyzerStatus.PASSED, "SSTable format is 'md'"))
     ], initial_vitals=empty_system_config)
 
     # recommended_format takes priority over SystemConfigCollector.sstable_format
     check_analyzer(analyzer, "ScyllaSSTablesCollector", [
-        ({'files': ['/var/lib/scylla/data/some_table/mc-some-Data.db']},
+        ({'sstables': mc_table},
          AnalyzerResult(AnalyzerStatus.WARNING, "SSTable format is not 'md'")),
-        ({'files': ['/var/lib/scylla/data/md-some-file-Data.db']},
+        ({'sstables': md_file},
          AnalyzerResult(AnalyzerStatus.PASSED, "SSTable format is 'md'")),
     ], initial_vitals={
         'SystemConfigCollector': CollectorResult(CollectorStatus.PASSED,
@@ -2117,13 +2472,13 @@ def test_ScyllaSSTablesAnalyzer():
                                                  Output(), '')
     })
 
-    analyzer_no_config = analyzers.ScyllaSSTablesAnalyzer({})
+    analyzer_no_config = ScyllaSSTablesAnalyzer({})
 
     # Without recommended_format, SystemConfigCollector.sstable_format is used
     check_analyzer(analyzer_no_config, "ScyllaSSTablesCollector", [
-        ({'files': ['/var/lib/scylla/data/some_table/mc-some-Data.db']},
+        ({'sstables': mc_table},
          AnalyzerResult(AnalyzerStatus.WARNING, "SSTable format is not 'md'")),
-        ({'files': ['/var/lib/scylla/data/md-some-file-Data.db']},
+        ({'sstables': md_file},
          AnalyzerResult(AnalyzerStatus.PASSED, "SSTable format is 'md'")),
     ], initial_vitals={
         'SystemConfigCollector': CollectorResult(CollectorStatus.PASSED,
@@ -2134,15 +2489,34 @@ def test_ScyllaSSTablesAnalyzer():
 
     # Without recommended_format and sstable_format absent, fall back to 'me'
     check_analyzer(analyzer_no_config, "ScyllaSSTablesCollector", [
-        ({'files': ['/var/lib/scylla/data/me-some-file-Data.db']},
+        ({'sstables': {'/var/lib/scylla/data': {'me-some-file': ['Data.db']}}},
          AnalyzerResult(AnalyzerStatus.PASSED, "SSTable format is 'me'")),
-        ({'files': ['/var/lib/scylla/data/md-some-file-Data.db']},
+        ({'sstables': md_file},
          AnalyzerResult(AnalyzerStatus.WARNING, "SSTable format is not 'me'")),
+    ], initial_vitals=empty_system_config)
+
+    # recommended_format is a regex anchored at the stem start, so alternation is allowed
+    analyzer_regex = ScyllaSSTablesAnalyzer({'ScyllaSSTablesAnalyzer': {'recommended_format': 'md|me'}})
+    check_analyzer(analyzer_regex, "ScyllaSSTablesCollector", [
+        ({'sstables': {'/var/lib/scylla/data': {'md-some-file': ['Data.db'], 'me-other-file': ['Data.db']}}},
+         AnalyzerResult(AnalyzerStatus.PASSED, "SSTable format is 'md|me'")),
+        ({'sstables': mc_table},
+         AnalyzerResult(AnalyzerStatus.WARNING, "SSTable format is not 'md|me'")),
+    ], initial_vitals=empty_system_config)
+
+    # leading inline flags work, an invalid regex fails the analyzer instead of aborting the run
+    analyzer_flags = ScyllaSSTablesAnalyzer({'ScyllaSSTablesAnalyzer': {'recommended_format': '(?i)MD'}})
+    check_analyzer(analyzer_flags, "ScyllaSSTablesCollector", [
+        ({'sstables': md_file}, AnalyzerResult(AnalyzerStatus.PASSED, "SSTable format is '(?i)MD'")),
+    ], initial_vitals=empty_system_config)
+    analyzer_invalid = ScyllaSSTablesAnalyzer({'ScyllaSSTablesAnalyzer': {'recommended_format': '['}})
+    check_analyzer(analyzer_invalid, "ScyllaSSTablesCollector", [
+        ({'sstables': md_file}, AnalyzerResult(AnalyzerStatus.FAILED, "recommended_format '[' is not a valid")),
     ], initial_vitals=empty_system_config)
 
 
 def test_ScyllaSupportAnalyzer():
-    analyzer = analyzers.ScyllaSupportAnalyzer({'ScyllaSupportAnalyzer': {
+    analyzer = ScyllaSupportAnalyzer({'ScyllaSupportAnalyzer': {
         'oss_minimum_version': '5.0',
         'enterprise_minimum_version': '2020.1'
     }})
@@ -2164,7 +2538,7 @@ def test_ScyllaSupportAnalyzer():
 
 
 def test_ScyllaUpdateAnalyzer():
-    analyzer = analyzers.ScyllaUpdateAnalyzer({'ScyllaUpdateAnalyzer': {
+    analyzer = ScyllaUpdateAnalyzer({'ScyllaUpdateAnalyzer': {
         'oss_latest_version': "5.1",
         'enterprise_latest_version': "2022.1"
     }})
@@ -2189,13 +2563,13 @@ def test_ScyllaUpdateAnalyzer():
             {'version': "5.0.2", 'edition': 'oss'}, Output(), '')
     }
 
-    analyzer = analyzers.ScyllaUpdateAnalyzer({})
+    analyzer = ScyllaUpdateAnalyzer({})
     analyzer.analyze(vitals)
     assert analyzer.status != AnalyzerStatus.FAILED, analyzer.message
 
 
 def test_SELinuxAnalyzer():
-    analyzer = analyzers.SELinuxAnalyzer({})
+    analyzer = SELinuxAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -2212,7 +2586,7 @@ def test_SELinuxAnalyzer():
 
 
 def test_StorageRAMRatioAnalyzer():
-    analyzer = analyzers.StorageRAMRatioAnalyzer({})
+    analyzer = StorageRAMRatioAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -2230,7 +2604,7 @@ def test_StorageRAMRatioAnalyzer():
     ], initial_vitals=vitals)
 
     # Ratio supplied as a string (as configparser always returns strings) must not raise TypeError
-    analyzer = analyzers.StorageRAMRatioAnalyzer({'StorageRAMRatioAnalyzer': {'ratio': '80'}})
+    analyzer = StorageRAMRatioAnalyzer({'StorageRAMRatioAnalyzer': {'ratio': '80'}})
     check_analyzer(analyzer, "StorageConfigurationCollector", [
         ({'data_file_directories': {'/my/path': {'storage_size_kb': 70000000}}},
          AnalyzerResult(AnalyzerStatus.PASSED, "lower than recommended")),
@@ -2240,7 +2614,7 @@ def test_StorageRAMRatioAnalyzer():
 
 
 def test_SwapAnalyzer():
-    analyzer = analyzers.SwapAnalyzer({})
+    analyzer = SwapAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -2261,7 +2635,7 @@ def test_SwapAnalyzer():
 
 
 def test_SwapAnalyzer_printout():
-    analyzer = analyzers.SwapAnalyzer({})
+    analyzer = SwapAnalyzer({})
 
     vitals = {
         'RAMCollector': CollectorResult(
@@ -2287,19 +2661,19 @@ def test_SwapAnalyzer_parametrization():
             {'total': 15596284}, Output(), '')
     }
 
-    analyzer = analyzers.SwapAnalyzer({})
+    analyzer = SwapAnalyzer({})
     check_analyzer(analyzer, "SwapCollector", [
         ({'total': 5197820},
          AnalyzerResult(AnalyzerStatus.WARNING, "5076.00 MiB were detected but it is less than 5076.92 (recommended)")),
     ], initial_vitals=vitals)
 
-    analyzer = analyzers.SwapAnalyzer({'SwapAnalyzer': {'ram_swap_ratio': "3.2"}})
+    analyzer = SwapAnalyzer({'SwapAnalyzer': {'ram_swap_ratio': "3.2"}})
     check_analyzer(analyzer, "SwapCollector", [
         ({'total': 5197820},
          AnalyzerResult(AnalyzerStatus.PASSED, "4.96 GiB were detected")),
     ], initial_vitals=vitals)
 
-    analyzer = analyzers.SwapAnalyzer({'SwapAnalyzer': {'swap_minimum_total': "5197820"}})
+    analyzer = SwapAnalyzer({'SwapAnalyzer': {'swap_minimum_total': "5197820"}})
     check_analyzer(analyzer, "SwapCollector", [
         ({'total': 5197820},
          AnalyzerResult(AnalyzerStatus.PASSED, "4.96 GiB were detected")),
@@ -2307,7 +2681,7 @@ def test_SwapAnalyzer_parametrization():
 
 
 def test_XFSAnalyzer():
-    analyzer = analyzers.XFSAnalyzer({})
+    analyzer = XFSAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -2320,7 +2694,7 @@ def test_XFSAnalyzer():
 
 
 def test_NodeInstanceTypeAnalyzer():
-    analyzer = analyzers.NodeInstanceTypeAnalyzer({})
+    analyzer = NodeInstanceTypeAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -2332,6 +2706,14 @@ def test_NodeInstanceTypeAnalyzer():
         ({'provider': "AWS", 'instance_type': "i8g.metal-24xl"},
          AnalyzerResult(AnalyzerStatus.PASSED, "listed as recommended")),
         ({'provider': "AWS", 'instance_type': "i8ge.48xlarge"},
+         AnalyzerResult(AnalyzerStatus.PASSED, "listed as recommended")),
+        ({'provider': "GCP", 'instance_type': "z3-highmem-22-highlssd"},
+         AnalyzerResult(AnalyzerStatus.PASSED, "listed as recommended")),
+        ({'provider': "GCP", 'instance_type': "z3-highmem-32-highlssd"},
+         AnalyzerResult(AnalyzerStatus.PASSED, "listed as recommended")),
+        ({'provider': "GCP", 'instance_type': "z3-highmem-22-standardlssd"},
+         AnalyzerResult(AnalyzerStatus.PASSED, "listed as recommended")),
+        ({'provider': "GCP", 'instance_type': "z3-highmem-44-standardlssd"},
          AnalyzerResult(AnalyzerStatus.PASSED, "listed as recommended")),
         ({'provider': "GCP", 'instance_type': "Something fictional"},
          AnalyzerResult(AnalyzerStatus.WARNING, "not listed as recommended")),
@@ -2348,7 +2730,7 @@ def test_TokensGossipInfoConsistencyAnalyzer():
     TOKENS = GossipInfoInvariantValues.TOKENS.name                # "TOKENS"
     CDC = GossipInfoInvariantValues.CDC_GENERATION_ID.name        # "CDC_GENERATION_ID"
 
-    analyzer = analyzers.GossipInfoConsistencyAnalyzer({})
+    analyzer = GossipInfoConsistencyAnalyzer({})
 
     # Missing dependency
     analyzer.analyze({})
@@ -2435,7 +2817,7 @@ def test_TopologyConsistencyAnalyzer_verify_gossip_info_consistency():
                 Output(), ''),
         }
 
-    analyzer = analyzers.TopologyConsistencyAnalyzer({})
+    analyzer = TopologyConsistencyAnalyzer({})
 
     # Clean gossip → no consistency errors added
     analyzer.analyze(make_vitals([
@@ -2579,7 +2961,7 @@ def test_TopologyConsistencyAnalyzer(test_case_raft_enabled=True):
     if test_case_raft_enabled:
         vitals_generators['RaftGroup0Collector'] = (lambda m: gen_raft_vitals(m), "RaftGroup0")
 
-    analyzer = analyzers.TopologyConsistencyAnalyzer({})
+    analyzer = TopologyConsistencyAnalyzer({})
 
     #################################################################################################################
     # Check missing dependencies report
@@ -2702,8 +3084,8 @@ def test_CloudCPUPlatformAnalyzer_expected_cpu_platform_specified():
     good_CPU_platform = 'good CPU platform'
     bad_CPU_platform = 'bad CPU platform'
 
-    analyzer = analyzers.CloudCPUPlatformAnalyzer({'CloudCPUPlatformAnalyzer':
-                                                  {'expected_cpu_platform': good_CPU_platform}})
+    analyzer = CloudCPUPlatformAnalyzer({'CloudCPUPlatformAnalyzer':
+                                        {'expected_cpu_platform': good_CPU_platform}})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -2730,7 +3112,7 @@ def test_CloudCPUPlatformAnalyzer_expected_cpu_platform_not_specified():
     good_CPU_platform = 'good CPU platform'
     bad_CPU_platform = 'bad CPU platform'
 
-    analyzer = analyzers.CloudCPUPlatformAnalyzer({})
+    analyzer = CloudCPUPlatformAnalyzer({})
 
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
@@ -2791,7 +3173,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_ignore_unknown_values():
     # Add unknown value to scylla.yaml
     scylla_yaml_conf_pure_yaml['unknown_key'] = "some value"
 
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer({})
+    analyzer = ScyllaConfigurationConsistencyAnalyzer({})
     success_message = "Scylla configuration is consistent"
     check_analyzer(analyzer, "ScyllaConfigurationFileCollector", [
         (scylla_yaml_conf, AnalyzerResult(AnalyzerStatus.PASSED, success_message))
@@ -2821,7 +3203,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_object_storage_endpoints_skipped
         }
     }
 
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer({})
+    analyzer = ScyllaConfigurationConsistencyAnalyzer({})
     success_message = "Scylla configuration is consistent"
     check_analyzer(analyzer, "ScyllaConfigurationFileCollector", [
         (scylla_yaml_conf, AnalyzerResult(AnalyzerStatus.PASSED, success_message))
@@ -2869,7 +3251,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_properly_handle_tri_state_values
         'SystemConfigCollector': CollectorResult(CollectorStatus.PASSED, scylla_config_tri_state_false, Output(), '')
     }
 
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer({})
+    analyzer = ScyllaConfigurationConsistencyAnalyzer({})
     success_message = "Scylla configuration is consistent"
     failure_message = f"Scylla configuration differs from the one present in scylla.yaml for keys: {['tri_state']}."
 
@@ -2921,7 +3303,7 @@ def test_ScyllaConfigurationFileFormatAnalyzer_tri_state():
         'SystemConfigCollector': CollectorResult(CollectorStatus.PASSED, scylla_config_tri_state, Output(), '')
     }
 
-    analyzer = analyzers.ScyllaConfigurationFileFormatAnalyzer({})
+    analyzer = ScyllaConfigurationFileFormatAnalyzer({})
 
     allowed_values = ['true', 'false', '0', '1', 'warn']
 
@@ -2961,7 +3343,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_bool_normalization():
     Keys with 'enabled' sub-field: client_encryption_options, system_info_encryption, user_info_encryption.
     Keys with aws_use_ec2_credentials / aws_use_ec2_region sub-fields: kms_hosts.
     """
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer({})
+    analyzer = ScyllaConfigurationConsistencyAnalyzer({})
     success = "Scylla configuration is consistent"
 
     # --- client_encryption_options / system_info_encryption / user_info_encryption ---
@@ -3027,7 +3409,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_yaml_string_scalars():
     Quoted scylla.yaml scalars (e.g. `auto_bootstrap: "true"`) and an unquoted `1e-05` are strings for PyYAML,
     while Scylla converts them to the option's type. They must not be reported as divergent.
     """
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer({})
+    analyzer = ScyllaConfigurationConsistencyAnalyzer({})
     scylla_config_vitals = {
         'SystemConfigCollector': CollectorResult(CollectorStatus.PASSED, {
             'auto_bootstrap': {'value': True, 'source': 'config', 'type': 'bool'},
@@ -3062,7 +3444,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_values_test():
     """
     Test the validation of configuration values
     """
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer({})
+    analyzer = ScyllaConfigurationConsistencyAnalyzer({})
 
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
@@ -3165,7 +3547,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_source_test():
     """
     Test validation of configuration sources
     """
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer({})
+    analyzer = ScyllaConfigurationConsistencyAnalyzer({})
 
     config_values = [
         {'int_value': 1},
@@ -3284,7 +3666,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_skip_source_validation_keys():
     scylla_yaml_conf = {'pure_scylla_yaml': {'key_in_yaml': 'v'}}
 
     # Without skip_source_validation_keys both bad-source keys are flagged
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer({})
+    analyzer = ScyllaConfigurationConsistencyAnalyzer({})
     check_analyzer(analyzer, "ScyllaConfigurationFileCollector", [
         (scylla_yaml_conf,
          AnalyzerResult(AnalyzerStatus.FAILED,
@@ -3293,7 +3675,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_skip_source_validation_keys():
 
     # With skip_source_validation_keys both keys are suppressed (whitespace around comma is stripped)
     # and the success message names the skipped keys.
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer(
+    analyzer = ScyllaConfigurationConsistencyAnalyzer(
         {'ScyllaConfigurationConsistencyAnalyzer': {
             'skip_source_validation_keys': 'key_not_in_yaml, another_bad_key'
         }}
@@ -3307,7 +3689,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_skip_source_validation_keys():
 
     # Suppressing only one of the two bad keys still fails on the other;
     # the failure message also names the skipped key.
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer(
+    analyzer = ScyllaConfigurationConsistencyAnalyzer(
         {'ScyllaConfigurationConsistencyAnalyzer': {
             'skip_source_validation_keys': 'key_not_in_yaml'
         }}
@@ -3334,7 +3716,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_skip_source_validation_keys():
     scylla_yaml_conf_yaml_bad_src = {'pure_scylla_yaml': {'key_in_yaml_bad_src': 'v'}}
 
     # Without skipping: flagged because source != 'config' and key is in scylla.yaml
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer({})
+    analyzer = ScyllaConfigurationConsistencyAnalyzer({})
     check_analyzer(analyzer, "ScyllaConfigurationFileCollector", [
         (scylla_yaml_conf_yaml_bad_src,
          AnalyzerResult(AnalyzerStatus.FAILED,
@@ -3342,7 +3724,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_skip_source_validation_keys():
     ], initial_vitals=scylla_config_vitals_yaml_bad_src)
 
     # With skipping: the key is in scylla.yaml but must still be suppressed
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer(
+    analyzer = ScyllaConfigurationConsistencyAnalyzer(
         {'ScyllaConfigurationConsistencyAnalyzer': {
             'skip_source_validation_keys': 'key_in_yaml_bad_src'
         }}
@@ -3376,7 +3758,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_skip_persisted_validation_keys()
     }}
 
     # Without skip_persisted_validation_keys both mismatched keys are flagged
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer({})
+    analyzer = ScyllaConfigurationConsistencyAnalyzer({})
     check_analyzer(analyzer, "ScyllaConfigurationFileCollector", [
         (scylla_yaml_conf,
          AnalyzerResult(AnalyzerStatus.FAILED,
@@ -3386,7 +3768,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_skip_persisted_validation_keys()
 
     # With skip_persisted_validation_keys both keys are suppressed (whitespace around comma is stripped)
     # and the success message names the skipped keys.
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer(
+    analyzer = ScyllaConfigurationConsistencyAnalyzer(
         {'ScyllaConfigurationConsistencyAnalyzer': {
             'skip_persisted_validation_keys': 'key_mismatch, another_mismatch'
         }}
@@ -3400,7 +3782,7 @@ def test_ScyllaConfigurationConsistencyAnalyzer_skip_persisted_validation_keys()
 
     # Suppressing only one of the two mismatched keys still fails on the other;
     # the failure message also names the skipped key.
-    analyzer = analyzers.ScyllaConfigurationConsistencyAnalyzer(
+    analyzer = ScyllaConfigurationConsistencyAnalyzer(
         {'ScyllaConfigurationConsistencyAnalyzer': {
             'skip_persisted_validation_keys': 'key_mismatch'
         }}
@@ -3418,7 +3800,7 @@ def test_RaftEnablementAnalyzer_raft_enabled():
     """
     Tests RaftEnablementAnalyzer invocations when Raft is enabled
     """
-    analyzer = analyzers.RaftEnablementAnalyzer({})
+    analyzer = RaftEnablementAnalyzer({})
 
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
@@ -3460,7 +3842,7 @@ def test_RaftEnablementAnalyzer_raft_disabled():
     """
     Tests RaftEnablementAnalyzer invocations when Raft is disabled
     """
-    analyzer = analyzers.RaftEnablementAnalyzer({})
+    analyzer = RaftEnablementAnalyzer({})
 
     raft_disabled_config = {
         'SystemConfigCollector':
@@ -3493,7 +3875,7 @@ def test_RaftEnablementAnalyzer_pre_raft():
     """
     Tests RaftEnablementAnalyzer invocations with Scylla that doesn't have Raft implemented
     """
-    analyzer = analyzers.RaftEnablementAnalyzer({})
+    analyzer = RaftEnablementAnalyzer({})
 
     raft_missing_config = {
         'SystemConfigCollector':
@@ -3522,7 +3904,7 @@ def test_RaftEnablementAnalyzer_pre_raft():
 
 
 def test_RaftTopologyRPCStatusAnalyzer():
-    analyzer = analyzers.RaftTopologyRPCStatusAnalyzer({})
+    analyzer = RaftTopologyRPCStatusAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -3537,7 +3919,7 @@ def test_RaftTopologyRPCStatusAnalyzer():
 
 
 def test_DisabledCompactionAnalyzer():
-    analyzer = analyzers.DisabledCompactionAnalyzer({})
+    analyzer = DisabledCompactionAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -3607,8 +3989,8 @@ def _make_disabled_compaction_analyzer_ignored_tables_string(ignored_tables_list
         return ""
 
 
-def _make_disabled_compaction_analyzer(ignored_tables_list: List[str] | None) -> analyzers.DisabledCompactionAnalyzer:
-    return analyzers.DisabledCompactionAnalyzer(
+def _make_disabled_compaction_analyzer(ignored_tables_list: List[str] | None) -> DisabledCompactionAnalyzer:
+    return DisabledCompactionAnalyzer(
         DictView({"DisabledCompactionAnalyzer": {
             "ignored_tables": _make_disabled_compaction_analyzer_ignored_tables_string(ignored_tables_list)}})
     )
@@ -3722,7 +4104,7 @@ def test_DisabledCompactionAnalyzer_system_hints_always_ignored():
     must not trigger FAILED.
     """
     data = {"system": {"hints": {"compaction": "{'class': 'NullCompactionStrategy'}"}}}
-    analyzer = analyzers.DisabledCompactionAnalyzer({})
+    analyzer = DisabledCompactionAnalyzer({})
     vitals = {"ScyllaClusterTablesDescriptionCollector": CollectorResult(CollectorStatus.PASSED, data, Output(), '')}
     analyzer.analyze(vitals)
     assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, _make_disabled_compaction_analyzer_success_message())
@@ -3734,7 +4116,7 @@ def test_DisabledCompactionAnalyzer_passed_message_always_includes_system_hints(
     section, since it is unconditionally added even without any user config.
     """
     data = {"ks1": {"t1": {"compaction": "{'class': 'SizeTieredCompactionStrategy', 'enabled': 'true'}"}}}
-    analyzer = analyzers.DisabledCompactionAnalyzer({})
+    analyzer = DisabledCompactionAnalyzer({})
     vitals = {"ScyllaClusterTablesDescriptionCollector": CollectorResult(CollectorStatus.PASSED, data, Output(), '')}
     analyzer.analyze(vitals)
     assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, _make_disabled_compaction_analyzer_success_message())
@@ -3773,7 +4155,7 @@ def test_BrokenRolePermissionsAnalyzer_passes_when_all_permissions_non_null():
         {'role': 'cassandra', 'resource': 'data/ks',  'permissions': 'SELECT'},
         {'role': 'admin',     'resource': 'data/ks2', 'permissions': 'ALTER'},
     ]
-    analyzer = analyzers.BrokenRolePermissionsAnalyzer({})
+    analyzer = BrokenRolePermissionsAnalyzer({})
     analyzer.analyze(_make_role_permissions_vitals(rows))
     assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, "No null permissions")
 
@@ -3782,7 +4164,7 @@ def test_BrokenRolePermissionsAnalyzer_passes_when_table_empty():
     """
     An empty table (no rows) must yield PASSED — nothing is broken.
     """
-    analyzer = analyzers.BrokenRolePermissionsAnalyzer({})
+    analyzer = BrokenRolePermissionsAnalyzer({})
     analyzer.analyze(_make_role_permissions_vitals([]))
     assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, "No null permissions")
 
@@ -3794,7 +4176,7 @@ def test_BrokenRolePermissionsAnalyzer_fails_on_null_permissions():
     rows = [
         {'role': 'broken_role', 'resource': 'data/ks', 'permissions': ''},
     ]
-    analyzer = analyzers.BrokenRolePermissionsAnalyzer({})
+    analyzer = BrokenRolePermissionsAnalyzer({})
     analyzer.analyze(_make_role_permissions_vitals(rows))
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "broken_role")
 
@@ -3806,7 +4188,7 @@ def test_BrokenRolePermissionsAnalyzer_fails_on_missing_permissions_key():
     rows = [
         {'role': 'broken_role', 'resource': 'data/ks'},
     ]
-    analyzer = analyzers.BrokenRolePermissionsAnalyzer({})
+    analyzer = BrokenRolePermissionsAnalyzer({})
     analyzer.analyze(_make_role_permissions_vitals(rows))
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "broken_role")
 
@@ -3820,7 +4202,7 @@ def test_BrokenRolePermissionsAnalyzer_reports_all_broken_roles():
         {'role': 'role_b', 'resource': 'data/ks2', 'permissions': 'SELECT'},
         {'role': 'role_c', 'resource': 'data/ks3', 'permissions': ''},
     ]
-    analyzer = analyzers.BrokenRolePermissionsAnalyzer({})
+    analyzer = BrokenRolePermissionsAnalyzer({})
     analyzer.analyze(_make_role_permissions_vitals(rows))
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "role_a")
     assert "role_c" in analyzer.message
@@ -3846,7 +4228,7 @@ def test_AuthenticationAnalyzer_passes_when_secure():
     """
     Enabled auth, no default role, default user login denied -> PASSED.
     """
-    analyzer = analyzers.AuthenticationAnalyzer({})
+    analyzer = AuthenticationAnalyzer({})
     vitals = _make_authentication_vitals(
         'PasswordAuthenticator',
         [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
@@ -3868,7 +4250,7 @@ def test_AuthenticationAnalyzer_accepts_authenticator_name_aliases(authenticator
     Scylla resolves the authenticator by its case-insensitive short name, so FQN and short
     spellings of a password-capable authenticator must be recognized as enabled authentication.
     """
-    analyzer = analyzers.AuthenticationAnalyzer({})
+    analyzer = AuthenticationAnalyzer({})
     vitals = _make_authentication_vitals(
         authenticator,
         [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
@@ -3882,7 +4264,7 @@ def test_AuthenticationAnalyzer_fails_when_auth_disabled():
     """
     AllowAllAuthenticator is a hard failure even if default role is absent.
     """
-    analyzer = analyzers.AuthenticationAnalyzer({})
+    analyzer = AuthenticationAnalyzer({})
     vitals = _make_authentication_vitals(
         'AllowAllAuthenticator',
         [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
@@ -3896,7 +4278,7 @@ def test_AuthenticationAnalyzer_fails_when_default_role_present():
     """
     Presence of the default cassandra role fails the check.
     """
-    analyzer = analyzers.AuthenticationAnalyzer({})
+    analyzer = AuthenticationAnalyzer({})
     vitals = _make_authentication_vitals(
         'PasswordAuthenticator',
         [{'role': 'cassandra', 'is_superuser': 'True', 'can_login': 'True'}],
@@ -3911,7 +4293,7 @@ def test_AuthenticationAnalyzer_fails_when_default_user_can_log_in():
     Allowed cassandra/cassandra login fails, and subsumes the default-role finding instead of
     reporting the same problem twice.
     """
-    analyzer = analyzers.AuthenticationAnalyzer({})
+    analyzer = AuthenticationAnalyzer({})
     vitals = _make_authentication_vitals(
         'PasswordAuthenticator',
         [{'role': 'cassandra', 'is_superuser': 'True', 'can_login': 'True'}],
@@ -3931,7 +4313,7 @@ def test_AuthenticationAnalyzer_warns_on_transitional_authenticator():
     probe is skipped under transitional auth (bad passwords fall back to anonymous access), so
     ``default_user_login`` is ``not_verified`` here.
     """
-    analyzer = analyzers.AuthenticationAnalyzer({})
+    analyzer = AuthenticationAnalyzer({})
     vitals = _make_authentication_vitals(
         'com.scylladb.auth.TransitionalAuthenticator',
         [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
@@ -3947,7 +4329,7 @@ def test_AuthenticationAnalyzer_fails_on_transitional_authenticator_if_probe_eve
     Belt-and-suspenders: even if some future probe ever reports allowed under transitional auth,
     that must still be a hard FAIL, not merely a WARNING.
     """
-    analyzer = analyzers.AuthenticationAnalyzer({})
+    analyzer = AuthenticationAnalyzer({})
     vitals = _make_authentication_vitals(
         'com.scylladb.auth.TransitionalAuthenticator',
         [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
@@ -3971,7 +4353,7 @@ def test_AuthenticationAnalyzer_fails_when_authenticator_is_missing(config_data)
     An authenticator that could not be read from system.config must not be assumed to be any
     particular authenticator: the analyzer fails instead.
     """
-    analyzer = analyzers.AuthenticationAnalyzer({})
+    analyzer = AuthenticationAnalyzer({})
     vitals = {
         "SystemConfigCollector": CollectorResult(CollectorStatus.PASSED, config_data, Output(), ''),
         "RolesCollector": CollectorResult(
@@ -3996,7 +4378,7 @@ def test_AuthenticationAnalyzer_passes_for_known_non_password_authenticators(aut
     """
     Certificate-only and saslauthd authenticators enable auth without password login probes.
     """
-    analyzer = analyzers.AuthenticationAnalyzer({})
+    analyzer = AuthenticationAnalyzer({})
     vitals = _make_authentication_vitals(
         authenticator,
         [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
@@ -4010,7 +4392,7 @@ def test_AuthenticationAnalyzer_fails_on_unrecognized_authenticator():
     """
     Typos / unknown authenticator class names must not be reported as enabled authentication.
     """
-    analyzer = analyzers.AuthenticationAnalyzer({})
+    analyzer = AuthenticationAnalyzer({})
     vitals = _make_authentication_vitals(
         'MistypedAuthenticator',
         [{'role': 'admin', 'is_superuser': 'True', 'can_login': 'True'}],
@@ -4036,7 +4418,7 @@ def test_STCSInSchemaAnalyzer_no_collector():
     """
     Missing collector data results in FAILED.
     """
-    analyzer = analyzers.STCSInSchemaAnalyzer({})
+    analyzer = STCSInSchemaAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -4045,7 +4427,7 @@ def test_STCSInSchemaAnalyzer_no_stcs():
     """
     Tables using non-STCS strategies pass.
     """
-    analyzer = analyzers.STCSInSchemaAnalyzer({})
+    analyzer = STCSInSchemaAnalyzer({})
     schema = {
         "ks1": {"t1": {"compaction": "{'class': 'IncrementalCompactionStrategy'}"}},
         "ks2": {"t2": {"compaction": "{'class': 'LeveledCompactionStrategy'}"}},
@@ -4058,7 +4440,7 @@ def test_STCSInSchemaAnalyzer_stcs_detected():
     """
     A single table using STCS results in FAILED listing that table.
     """
-    analyzer = analyzers.STCSInSchemaAnalyzer({})
+    analyzer = STCSInSchemaAnalyzer({})
     schema = {
         "ks1": {"t1": {"compaction": "{'class': 'SizeTieredCompactionStrategy'}"}},
     }
@@ -4070,7 +4452,7 @@ def test_STCSInSchemaAnalyzer_mixed_tables():
     """
     Only STCS tables are reported; non-STCS tables in the same keyspace are ignored.
     """
-    analyzer = analyzers.STCSInSchemaAnalyzer({})
+    analyzer = STCSInSchemaAnalyzer({})
     schema = {
         "ks1": {"t1": {"compaction": "{'class': 'SizeTieredCompactionStrategy'}"},
                 "t2": {"compaction": "{'class': 'LeveledCompactionStrategy'}"}},
@@ -4084,7 +4466,7 @@ def test_STCSInSchemaAnalyzer_system_tables_included():
     """
     System keyspace tables using STCS are also reported.
     """
-    analyzer = analyzers.STCSInSchemaAnalyzer({})
+    analyzer = STCSInSchemaAnalyzer({})
     schema = {
         "system": {"local": {"compaction": "{'class': 'SizeTieredCompactionStrategy'}"}},
     }
@@ -4096,7 +4478,7 @@ def test_STCSInSchemaAnalyzer_stcs_view_detected():
     """
     A view (materialized view / index) using STCS is flagged like a table.
     """
-    analyzer = analyzers.STCSInSchemaAnalyzer({})
+    analyzer = STCSInSchemaAnalyzer({})
     schema = {
         "ks1": {"mv": {"table_kind": "view", "compaction": "{'class': 'SizeTieredCompactionStrategy'}"}},
     }
@@ -4108,7 +4490,7 @@ def test_STCSInSchemaAnalyzer_empty_schema():
     """
     Empty schema (no tables at all) passes.
     """
-    analyzer = analyzers.STCSInSchemaAnalyzer({})
+    analyzer = STCSInSchemaAnalyzer({})
     analyzer.analyze(_make_stcs_vitals({}))
     assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, _stcs_success_message())
 
@@ -4137,13 +4519,13 @@ def _zstd_system_config(compression_options: dict) -> dict:
 
 
 def test_ZstdCompressionLevelAnalyzer_no_collector():
-    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    analyzer = ZstdCompressionLevelAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
 
 def test_ZstdCompressionLevelAnalyzer_passes_low_zstd_levels():
-    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    analyzer = ZstdCompressionLevelAnalyzer({})
     schema = {
         "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '3'}"}},
         "ks2": {"t2": {"compression": "{'sstable_compression': 'org.apache.cassandra.io.compress.ZstdWithDictsCompressor', 'compression_level': '4'}"}},  # noqa: E501
@@ -4154,7 +4536,7 @@ def test_ZstdCompressionLevelAnalyzer_passes_low_zstd_levels():
 
 
 def test_ZstdCompressionLevelAnalyzer_warns_on_high_schema_level():
-    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    analyzer = ZstdCompressionLevelAnalyzer({})
     schema = {
         "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '6'}"}},
     }
@@ -4164,7 +4546,7 @@ def test_ZstdCompressionLevelAnalyzer_warns_on_high_schema_level():
 
 
 def test_ZstdCompressionLevelAnalyzer_warns_on_high_view_level():
-    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    analyzer = ZstdCompressionLevelAnalyzer({})
     schema = {
         "ks1": {"mv": {"table_kind": "view",
                        "compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '6'}"}},
@@ -4174,7 +4556,7 @@ def test_ZstdCompressionLevelAnalyzer_warns_on_high_view_level():
 
 
 def test_ZstdCompressionLevelAnalyzer_warns_on_high_system_config_level():
-    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    analyzer = ZstdCompressionLevelAnalyzer({})
     system_config = _zstd_system_config({
         "sstable_compression": "ZstdWithDictsCompressor",
         "compression_level": 5,
@@ -4187,7 +4569,7 @@ def test_ZstdCompressionLevelAnalyzer_warns_on_high_system_config_level():
 
 
 def test_ZstdCompressionLevelAnalyzer_warns_on_schema_and_system_config():
-    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    analyzer = ZstdCompressionLevelAnalyzer({})
     schema = {
         "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '5'}"}},
     }
@@ -4202,7 +4584,7 @@ def test_ZstdCompressionLevelAnalyzer_warns_on_schema_and_system_config():
 
 
 def test_ZstdCompressionLevelAnalyzer_ignored_tables():
-    analyzer = analyzers.ZstdCompressionLevelAnalyzer({'ZstdCompressionLevelAnalyzer': {'ignored_tables': 'ks1.t1'}})
+    analyzer = ZstdCompressionLevelAnalyzer({'ZstdCompressionLevelAnalyzer': {'ignored_tables': 'ks1.t1'}})
     schema = {
         "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '6'}"}},
         "ks2": {"t2": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '3'}"}},
@@ -4213,7 +4595,7 @@ def test_ZstdCompressionLevelAnalyzer_ignored_tables():
 
 
 def test_ZstdCompressionLevelAnalyzer_custom_max_level():
-    analyzer = analyzers.ZstdCompressionLevelAnalyzer({'ZstdCompressionLevelAnalyzer': {'max_recommended_level': '2'}})
+    analyzer = ZstdCompressionLevelAnalyzer({'ZstdCompressionLevelAnalyzer': {'max_recommended_level': '2'}})
     schema = {
         "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': '3'}"}},
     }
@@ -4222,7 +4604,7 @@ def test_ZstdCompressionLevelAnalyzer_custom_max_level():
 
 
 def test_ZstdCompressionLevelAnalyzer_zstd_default_level_passes():
-    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    analyzer = ZstdCompressionLevelAnalyzer({})
     schema = {
         "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor'}"}},
     }
@@ -4231,7 +4613,7 @@ def test_ZstdCompressionLevelAnalyzer_zstd_default_level_passes():
 
 
 def test_ZstdCompressionLevelAnalyzer_skips_non_numeric_level():
-    analyzer = analyzers.ZstdCompressionLevelAnalyzer({})
+    analyzer = ZstdCompressionLevelAnalyzer({})
     schema = {
         "ks1": {"t1": {"compression": "{'sstable_compression': 'ZstdCompressor', 'compression_level': 'fast'}"}},
     }
@@ -4269,7 +4651,7 @@ def test_ScyllaKeyspacesReplicationAnalyzer_no_collector():
     """
     Missing collector data results in FAILED.
     """
-    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaKeyspacesReplicationAnalyzer({})
     analyzer.analyze({})
     assert_analyzer_result(analyzer, AnalyzerStatus.FAILED, "results not found")
 
@@ -4278,7 +4660,7 @@ def test_ScyllaKeyspacesReplicationAnalyzer_empty_schema():
     """
     Empty schema (no keyspaces) passes.
     """
-    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaKeyspacesReplicationAnalyzer({})
     analyzer.analyze(_make_ks_replication_vitals({}))
     assert_analyzer_result(analyzer, AnalyzerStatus.PASSED, _ks_replication_success_message())
 
@@ -4288,7 +4670,7 @@ def test_ScyllaKeyspacesReplicationAnalyzer_all_ok():
     Known system keyspaces with their expected strategies and a user keyspace with
     NetworkTopologyStrategy all pass.
     """
-    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaKeyspacesReplicationAnalyzer({})
     schema = {
         "system": {"replication": "{'class': 'org.apache.cassandra.locator.LocalStrategy'}"},
         "system_schema": {"replication": "{'class': 'org.apache.cassandra.locator.LocalStrategy'}"},
@@ -4305,7 +4687,7 @@ def test_ScyllaKeyspacesReplicationAnalyzer_user_ks_wrong_strategy():
     """
     A user keyspace using SimpleStrategy instead of NetworkTopologyStrategy results in FAILED.
     """
-    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaKeyspacesReplicationAnalyzer({})
     schema = {
         "my_ks": {"replication": "{'class': 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor': '1'}"},
     }
@@ -4320,7 +4702,7 @@ def test_ScyllaKeyspacesReplicationAnalyzer_system_ks_wrong_strategy():
     A system keyspace using the wrong strategy (NetworkTopologyStrategy instead of LocalStrategy)
     results in FAILED.
     """
-    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaKeyspacesReplicationAnalyzer({})
     schema = {
         "system": {"replication": "{'class': 'org.apache.cassandra.locator.NetworkTopologyStrategy'}"},
     }
@@ -4334,7 +4716,7 @@ def test_ScyllaKeyspacesReplicationAnalyzer_missing_replication_field():
     """
     A keyspace with no replication field defaults to empty class and results in FAILED.
     """
-    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaKeyspacesReplicationAnalyzer({})
     schema = {
         "my_ks": {},
     }
@@ -4347,7 +4729,7 @@ def test_ScyllaKeyspacesReplicationAnalyzer_system_auth_v2_skips_legacy_auth():
     """
     system_auth_v2 uses LocalStrategy; leftover system_auth strategy is ignored.
     """
-    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaKeyspacesReplicationAnalyzer({})
     schema = {
         "system_auth_v2": {"replication": "{'class': 'org.apache.cassandra.locator.LocalStrategy'}"},
         "system_auth": {
@@ -4363,7 +4745,7 @@ def test_ScyllaKeyspacesReplicationAnalyzer_topology_done_leftover_system_auth()
     GA System-auth-2 has no system_auth_v2; with Consistent Topology done, leftover
     SimpleStrategy system_auth is ignored.
     """
-    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaKeyspacesReplicationAnalyzer({})
     schema = {
         "system_auth": {
             "replication": "{'class': 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor': '1'}"
@@ -4377,7 +4759,7 @@ def test_ScyllaKeyspacesReplicationAnalyzer_topology_not_done_legacy_system_auth
     """
     Consistent Topology upgrade not finished: still auth-v1, must FAIL.
     """
-    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaKeyspacesReplicationAnalyzer({})
     schema = {
         "system_auth": {
             "replication": "{'class': 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor': '1'}"
@@ -4397,7 +4779,7 @@ def test_ScyllaKeyspacesReplicationAnalyzer_no_topology_signal_legacy_system_aut
     No Consistent Topology signal (unsupported or unavailable): leftover SimpleStrategy
     system_auth still fails - version is never used as a fallback.
     """
-    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaKeyspacesReplicationAnalyzer({})
     schema = {
         "system_auth": {
             "replication": "{'class': 'org.apache.cassandra.locator.SimpleStrategy', 'replication_factor': '1'}"
@@ -4416,7 +4798,7 @@ def test_ScyllaKeyspacesReplicationAnalyzer_system_auth_v2_wrong_strategy():
     """
     system_auth_v2 must use LocalStrategy.
     """
-    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaKeyspacesReplicationAnalyzer({})
     schema = {
         "system_auth_v2": {"replication": "{'class': 'org.apache.cassandra.locator.NetworkTopologyStrategy'}"},
     }
@@ -4432,7 +4814,7 @@ def test_ScyllaKeyspacesReplicationAnalyzer_rf_zero():
     """
     NetworkTopologyStrategy with RF 0 in a DC only warns; the DC should be removed instead.
     """
-    analyzer = analyzers.ScyllaKeyspacesReplicationAnalyzer({})
+    analyzer = ScyllaKeyspacesReplicationAnalyzer({})
     schema = {
         "my_ks": {
             "replication": (

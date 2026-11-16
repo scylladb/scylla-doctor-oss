@@ -136,7 +136,7 @@ class Analyzer(ConfigValuesParser, abc.ABC):
 
             if vitals[dep].status == CollectorStatus.SKIPPED:
                 dependency_skipped = True
-                error_messages.append(f"Required {dep} was skipped")
+                error_messages.append(f"Required {dep} was skipped: {vitals[dep].skip_reason}")
             elif vitals[dep].status == CollectorStatus.FAILED:
                 dependency_failed = True
                 error_messages.append(f"Required {dep} was not successful")

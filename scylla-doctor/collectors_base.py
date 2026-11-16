@@ -17,14 +17,20 @@
 
 from common import DictView, Paths, ConfigValuesParser, ConfigParameter
 from models.output_entry import OutputEntry, OutputEntryType, Level
-from typing import Any, Dict, List, Optional, Set, Sequence, Union, Iterable, Type
+from typing import Any, Dict, List, Optional, Set, Sequence, Tuple, Union, Iterable, Type, Generic, TypeVar
 import abc
 import dataclasses
 import enum
 import json
 import os
 import pathlib
-from utils import Executor
+import re
+import shutil
+from utils import Executor, running_in_container
+
+
+# How dmesg and iptables report a missing capability, as opposed to any other failure.
+PERMISSION_REFUSED_RE = re.compile(r"Operation not permitted|Permission denied|you must be root")
 
 
 class UnableToReadScyllaRestApi(Exception):
@@ -121,6 +127,14 @@ class CollectorResult:
     #         "k2": "4"
     # }
     mask: Sequence[Union[str, Iterable]] = dataclasses.field(default_factory=list)
+
+    @property
+    def skip_reason(self) -> str:
+        """
+        The message without the "Required ... was skipped: " prefixes of dependency chains, so that dependents repeat
+        only the root reasons instead of the whole chains.
+        """
+        return re.sub(r"Required \S+ Collector was skipped: ", "", self.message or "")
 
     class Encoder(json.JSONEncoder):
         def __init__(self, *, include_output: bool = True, **kwargs):
@@ -292,6 +306,14 @@ class Collector(ConfigValuesParser, abc.ABC):
         return False
 
     @property
+    def skip_in_container(self) -> Optional[str]:
+        """
+        Why this Collector is skipped inside a container, or None if it runs there. Collectors that read host state a
+        container usually cannot see return a reason, and the base class puts it in the skip message.
+        """
+        return None
+
+    @property
     def depends_on(self) -> Set[str]:
         """Set of other Collectors id's, that must be launched before-hands"""
         return set()
@@ -414,6 +436,19 @@ class Collector(ConfigValuesParser, abc.ABC):
     def has_required_privileges(self) -> bool:
         return not self.privileged or os.getuid() == 0
 
+    def _require_tools(self, *tools: str) -> bool:
+        """
+        Check that every tool is on PATH. A missing tool is a packaging gap on this node or image, not a finding
+        about the node, so the Collector is SKIPPED and names the missing tools; it never FAILS for this.
+        :return: True when all tools are available; otherwise status and message are set and False is returned.
+        """
+        missing = [tool for tool in tools if not shutil.which(tool)]
+        if not missing:
+            return True
+        self.status = CollectorStatus.SKIPPED
+        self._message = f"{', '.join(repr(tool) for tool in missing)} not installed"
+        return False
+
     def collect(self, vitals: Dict[str, CollectorResult], available_collectors: Dict[str, Any]) -> None:
         return self._collect_recursive(vitals, available_collectors)
 
@@ -444,6 +479,13 @@ class Collector(ConfigValuesParser, abc.ABC):
             vitals[self.id] = self.result
             return
 
+        container_skip_reason = self.skip_in_container
+        if container_skip_reason is not None and running_in_container():
+            self.status = CollectorStatus.SKIPPED
+            self._message = f"Not available for containers: {container_skip_reason}"
+            vitals[self.id] = self.result
+            return
+
         available_collectors_names = set(available_collectors.keys())
         if not self.depends_on.issubset(available_collectors_names):
             missing_deps = self.depends_on - available_collectors_names
@@ -462,7 +504,7 @@ class Collector(ConfigValuesParser, abc.ABC):
                 error_messages.append(f"Required {dep} Collector has not run successfully")
             elif vitals[dep].status == CollectorStatus.SKIPPED:
                 dependency_skipped = True
-                error_messages.append(f"Required {dep} Collector was skipped")
+                error_messages.append(f"Required {dep} Collector was skipped: {vitals[dep].skip_reason}")
 
         # If any dependency was skipped - skip the current Collector as well, even if any other dependency failed.
         # Skipped status means that either the user disabled the dependency in configuration, or the HW/SW state doesn't
@@ -488,6 +530,14 @@ class Collector(ConfigValuesParser, abc.ABC):
             # We want to prevent from a Collector being marked as 'SUCCESS' if it raised an exception.
             # We bypass public 'status' getter here to avoid unnecessary sanity checks.
             if self._status is None or self._status == CollectorStatus.PASSED:
+                # subprocess raises FileNotFoundError with the bare command name; a missing file carries a path.
+                # This assumes collectors open files by absolute path: a relative one would look like a command.
+                if isinstance(e, FileNotFoundError) and isinstance(e.filename, str) and os.sep not in e.filename:
+                    # Same rule as _require_tools: a tool that is not installed is skipped, not a failure.
+                    self.status = CollectorStatus.SKIPPED
+                    self.message = f"'{e.filename}' not installed"  # type: ignore[attr-defined]
+                    vitals[self.id] = self.result
+                    return
                 self.status = CollectorStatus.FAILED
 
             self.message = f"Unexpected exception: {str(e)}"
@@ -514,6 +564,106 @@ class Collector(ConfigValuesParser, abc.ABC):
     @message.setter
     def message(self, msg: str) -> None:
         self._message = msg
+
+
+class ScyllaConfigurationCollector(Collector, abc.ABC):
+    """
+    Base of the collectors reading Scylla's configuration: scylla.yaml, the sysconfig files, the /etc/scylla.d drop-ins
+    and system.config. Credentials never reach the vitals or the verbose output (DOCTOR-130): a subclass passes what
+    it read through _redact_credentials(), which keeps the structure and replaces each credential with redacted_value.
+    """
+
+    @property
+    def secret_keys(self) -> Set[str]:
+        """
+        Configuration keys holding a credential, matched case-insensitively at any depth: the AWS keys of kms_hosts
+        and the AWS environment variables of an environment file (object_storage_endpoints takes its credentials from
+        them, not from keys of its own), and the azure_hosts client secret. A key ending in one of
+        secret_key_suffixes is one too.
+        """
+        return {'aws_access_key_id', 'aws_secret_access_key', 'aws_session_token', 'azure_client_secret'}
+
+    @property
+    def secret_key_suffixes(self) -> Tuple[str, ...]:
+        """
+        How the other credential keys end: the kmip_hosts password, ldap_bind_passwd, auth_superuser_salted_password,
+        the keystore_password of a scylla.yaml copied from Cassandra, the keyStorePassword JMX flag.
+        """
+        return ('password', 'passwd')
+
+    @property
+    def redacted_value(self) -> str:
+        return '<redacted>'
+
+    def _redact_credentials(self, config: Any) -> Any:
+        """
+        Return a copy of config with every credential redacted: the entries of a dict at any depth, and the values of
+        secret keys and flags inside a string (see _redact_credentials_in_text).
+        """
+        if isinstance(config, dict):
+            return {key: self._redact_credentials_in_entry(key, value) for key, value in config.items()}
+        if isinstance(config, list):
+            return [self._redact_credentials(value) for value in config]
+        if isinstance(config, str):
+            return self._redact_credentials_in_text(config)
+        return config
+
+    def _redact_credentials_in_entry(self, key: Any, value: Any) -> Any:
+        """
+        The value a configuration entry keeps: redacted_value for a set secret key, otherwise the value with any
+        credential inside it redacted.
+
+        :param key: the entry's key: a configuration parameter, environment variable or flag name, matched
+                    case-insensitively against secret_keys and secret_key_suffixes when it is a string.
+        :param value: the entry's value as parsed: a string, a nested dict or list, or None when unset.
+        """
+        # The last word of the key: an environment file line `export AWS_SECRET_ACCESS_KEY=x` reaches here with the
+        # key `export AWS_SECRET_ACCESS_KEY`.
+        name = key.split()[-1].lower() if isinstance(key, str) and key.strip() else None
+        is_secret_key = name is not None and (name in self.secret_keys or name.endswith(self.secret_key_suffixes))
+        # An unset secret stays as it is (None, or how YAML spells it when loaded as strings, in any case), so
+        # analyzers can still tell the credential is not configured.
+        unset = value is None or (isinstance(value, str) and value.lower() in ('', "''", '""', 'null', '~'))
+        if is_secret_key and not unset:
+            return self.redacted_value
+        return self._redact_credentials(value)
+
+    def _redact_credentials_in_text(self, text: str) -> str:
+        """
+        Replace the value of every secret key or flag in text, in both forms it comes in:
+        - a flag or an environment variable, `--ldap-bind-passwd=x` in SCYLLA_ARGS or `AWS_SECRET_ACCESS_KEY=x`: a
+          quoted value goes whole; a bare one up to the next flag, as the sysconfig parser removes double quotes;
+        - a key in JSON or flow-style YAML, `"aws_access_key_id": "x"`, also inside a JSON string such as the one
+          system.config prints for object_storage_endpoints (`\"aws_access_key_id\": \"x\"`, with two backslashes
+          once cqlsh COPY has doubled them): a quoted value goes whole, escaped quotes included; a bare one, spaces
+          included, up to the next comma, closing bracket or end of line.
+        An unset value (null, ~, empty quotes) stays, as in _redact_credentials_in_entry.
+        """
+        names = (r'(?:' + '|'.join(k.replace('_', '[_-]') for k in sorted(self.secret_keys)) +
+                 r'|[\w.-]*(?:' + '|'.join(self.secret_key_suffixes) + r'))\b')
+        key = r'\b' + names
+        # Only a flag takes its value after a space: prose such as `change the password for x` is kept.
+        flag = r'(?<![\w.-])--?' + names
+        # Empty quotes escaped with up to two backslashes too: an unset value in JSON inside a JSON string.
+        unset = r'(?!(?:null|~|\\{0,2}"\\{0,2}"|\'\')(?:[\s,}\]\\]|$))'
+        quoted = r'"(?:\\.|[^"\\])+"|\'(?:\'\'|[^\'])+\''
+        # A JSON string inside a JSON string: its quotes carry one backslash as Scylla prints it, two once cqlsh COPY
+        # (behind read_cql_table) has doubled every backslash; inside it a backslash carries twice as many and a quote
+        # three times as many backslashes as its quotes.
+        escaped = (r'\\"(?:\\{4}|\\{3}"|\\{2}[^"\\]|[^"\\])+\\"'
+                   r'|\\{2}"(?:\\{8}|\\{6}"|\\{4}[^"\\]|[^"\\])+\\{2}"')
+        # After `=` the value may start with `--` (`--ldap-bind-passwd=--x`); after a space, `--` is the next flag.
+        # A bare value stops before a word starting with `-`, so a JVM flag after it (`-Dfoo=bar`) is kept: the rest
+        # of a bare value with such a word in it (`--ldap-bind-passwd a -b`) is not redacted. A bare value stays on its
+        # line, so the lines after it in a multi-line value are kept. It does not stop at a comma: a password may hold
+        # one, so `key=value` in a comma-separated mapping loses the rest of the line (over-redaction, never a leak).
+        space = r'[^\S\n]'
+        text = re.sub(rf'({key}{space}*=(?:{space}+(?!--))?|{flag}{space}+(?!--)){unset}'
+                      rf'(?:{quoted}|\S+(?:{space}+(?!-)\S+)*)',
+                      rf'\g<1>{self.redacted_value}', text, flags=re.IGNORECASE)
+        bare = r'[^\s,}\]"\']+(?:[^\S\n]+[^\s,}\]"\']+)*'
+        return re.sub(rf'({key}(?:\\{{0,2}}["\'])?\s*:\s*){unset}(?:{escaped}|\\?(?:{quoted})|{bare})',
+                      rf'\g<1>{self.redacted_value}', text, flags=re.IGNORECASE)
 
 
 class ScyllaRestApiAwareCollector(Collector, abc.ABC):
@@ -626,3 +776,66 @@ class ScyllaRestApiAwareCollector(Collector, abc.ABC):
         self.output.put(OutputEntryType.API, url, json.dumps(parsed, indent=4), level=Level.VERBOSE)
 
         return parsed
+
+
+T = TypeVar("T")
+
+
+class ScyllaSimplePerTableRestApiCollector(ScyllaRestApiAwareCollector, Generic[T], abc.ABC):
+    """
+    Base class for Scylla REST API collectors that collect per-table information
+    where the endpoint returns a simple value (int, float, etc.).
+    The specific endpoint is defined in the subclass.
+    The collected data is a nested dictionary mapping keyspace names to table names to the collected value.
+    E.g.:
+    {
+        "keyspace1": {
+            "table1": value1,
+            "table2": value2,
+            ...
+        },
+        "keyspace2": {
+            "table3": value3,
+            ...
+        },
+        ...
+    }
+
+    The REST API endpoint is expected to be of the form: /<endpoint>/{keyspace}:{table}
+    """
+    @property
+    @abc.abstractmethod
+    def _endpoint(self) -> str:
+        pass
+
+    @abc.abstractmethod
+    def _endpoint_value_converter(self, value: str) -> T:
+        pass
+
+    @property
+    def __collector_tables_description(self) -> str:
+        return "ScyllaClusterTablesDescriptionCollector"
+
+    @property
+    def __collector_scylla_config(self) -> str:
+        return "SystemConfigCollector"
+
+    @property
+    def depends_on(self) -> Set[str]:
+        return {self.__collector_tables_description, self.__collector_scylla_config}
+
+    def _collect(self, vitals: DictView) -> None:
+        api_address = vitals[self.__collector_scylla_config].data['api_address']['value']
+        api_port = int(vitals[self.__collector_scylla_config].data['api_port']['value'])
+
+        tables_endpoint_info: Dict[str, Dict[str, T]] = {}
+        tables_description_info = vitals[self.__collector_tables_description].data
+        for keyspace, tables in tables_description_info.items():
+            for table in tables:
+                response_json = self._read_scylla_rest_api(endpoint=self._endpoint,
+                                                           endpoint_parameters=f"/{keyspace}:{table}",
+                                                           api_address=api_address, api_port=api_port)
+                tables_endpoint_info.setdefault(keyspace, {})[table] = self._endpoint_value_converter(response_json)
+
+        self._data = tables_endpoint_info
+        self.status = CollectorStatus.PASSED

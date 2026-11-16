@@ -21,7 +21,7 @@ import os
 import pytest
 
 import scylla_doctor
-import collectors
+from collectors.install import SDVersionCollector
 from collectors_base import CollectorStatus
 
 
@@ -69,7 +69,7 @@ def test_version_flag(capsys, doctor_factory, tmp_path, monkeypatch):
     monkeypatch.setattr(os.path, 'isfile', lambda p: p == str(version_file))
     monkeypatch.setattr(os.path, 'dirname', lambda _: str(tmp_path))
 
-    doctor = doctor_factory(collectors=[collectors.SDVersionCollector], analyzers=())
+    doctor = doctor_factory(collectors=[SDVersionCollector], analyzers=())
     doctor.environment = scylla_doctor.DoctorEnvironment(["--version"])
 
     with pytest.raises(SystemExit) as exc_info:
@@ -89,7 +89,7 @@ def test_vitals_version_mismatch_exits(doctor_factory, tmp_path, monkeypatch):
     monkeypatch.setattr(os.path, 'isfile', lambda p: p == str(version_file))
     monkeypatch.setattr(os.path, 'dirname', lambda _: str(tmp_path))
 
-    doctor = doctor_factory(collectors=[collectors.SDVersionCollector], analyzers=())
+    doctor = doctor_factory(collectors=[SDVersionCollector], analyzers=())
     doctor.environment = scylla_doctor.DoctorEnvironment(["--load-vitals", str(vitals_file)])
 
     with pytest.raises(SystemExit) as exc_info:
@@ -108,7 +108,7 @@ def test_ignore_vitals_version_allows_mismatch(doctor_factory, tmp_path, monkeyp
     monkeypatch.setattr(os.path, 'isfile', lambda p: p == str(version_file))
     monkeypatch.setattr(os.path, 'dirname', lambda _: str(tmp_path))
 
-    doctor = doctor_factory(collectors=[collectors.SDVersionCollector], analyzers=())
+    doctor = doctor_factory(collectors=[SDVersionCollector], analyzers=())
     doctor.environment = scylla_doctor.DoctorEnvironment(
         ["--load-vitals", str(vitals_file), "--ignore-vitals-version", "--output", "short"])
     doctor.run()
@@ -125,7 +125,7 @@ def test_vitals_version_mismatch_with_disabled_collector(doctor_factory, tmp_pat
     monkeypatch.setattr(os.path, 'isfile', lambda p: p == str(version_file))
     monkeypatch.setattr(os.path, 'dirname', lambda _: str(tmp_path))
 
-    doctor = doctor_factory(collectors=[collectors.SDVersionCollector], analyzers=(),
+    doctor = doctor_factory(collectors=[SDVersionCollector], analyzers=(),
                             config_options=[("SDVersionCollector", "run", "no")])
     doctor.environment = scylla_doctor.DoctorEnvironment(["--load-vitals", str(vitals_file)])
 
@@ -142,7 +142,7 @@ def test_version_flag_with_disabled_collector(capsys, doctor_factory, tmp_path, 
     monkeypatch.setattr(os.path, 'isfile', lambda p: p == str(version_file))
     monkeypatch.setattr(os.path, 'dirname', lambda _: str(tmp_path))
 
-    doctor = doctor_factory(collectors=[collectors.SDVersionCollector], analyzers=(),
+    doctor = doctor_factory(collectors=[SDVersionCollector], analyzers=(),
                             config_options=[("SDVersionCollector", "run", "no")])
     doctor.environment = scylla_doctor.DoctorEnvironment(["--version"])
 
