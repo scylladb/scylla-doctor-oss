@@ -13,6 +13,9 @@ on:
       - 'scylla-doctor-cluster/**'
       - 'scylla-doctor/**'
 
+permissions:
+  contents: read
+
 defaults:
   run:
     shell: bash

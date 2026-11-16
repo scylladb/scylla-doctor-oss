@@ -16,10 +16,13 @@
 # along with Scylla Doctor.  If not, see <http://www.gnu.org/licenses/>.
 
 import copy
+import datetime
+import glob
 import json
 import tests.helpers
 import numbers
 import os
+import pathlib
 import re
 import socket
 from typing import Tuple, List, Dict
@@ -29,44 +32,103 @@ import pytest
 import shutil
 import subprocess
 
-import collectors
+from collectors.clients import ClientConnectionCollector, ServiceLevelsCollector
+from collectors.cloud import (
+    HypervisorTypeCollector,
+    InfrastructureProviderCollector,
+    MaintenanceEventsCollector,
+    NodePlatformCollector,
+)
+from collectors.config import (
+    ScyllaConfigurationFileCollector,
+    ScyllaConfigurationFileNoParsingCollector,
+    ScyllaSystemConfigurationFilesCollector,
+    SystemConfigCollector,
+)
+from collectors.hardware import (
+    CPUSpecificationsCollector,
+    ComputerArchitectureCollector,
+    LSPCICollector,
+    ProcInterruptsCollector,
+    RAMCollector,
+)
+from collectors.install import (
+    CollectionTimeCollector,
+    PathsCollector,
+    SDVersionCollector,
+    ScyllaBinaryCollector,
+    ScyllaServicesCollector,
+    ScyllaVersionCollector,
+)
+from collectors.logs import KernelRingBufferCollector, ScyllaLogsCollector, ScyllaManagerAgentLogsCollector
+from collectors.network import (
+    FirewallRulesCollector,
+    IPAddressesCollector,
+    IPRoutesCollector,
+    NICsCollector,
+    ScyllaSeedsCollector,
+    TCPConnectionsCollector,
+)
+from collectors.operating_system import (
+    CPUScalingCollector,
+    ClockSourceCollector,
+    CoredumpCollector,
+    OSCollector,
+    RsyslogCollector,
+    SELinuxCollector,
+    ScyllaLimitNOFILECollector,
+    ServiceManagerCollector,
+    SwapCollector,
+    SysctlCollector,
+)
+from collectors.schema import (
+    LargePartitionsCellsRowsCollector,
+    NodetoolCFStatsCollector,
+    ScyllaClusterSchemaCollector,
+    ScyllaClusterSchemaDescriptionCollector,
+    ScyllaClusterSystemKeyspacesCollector,
+    ScyllaClusterTablesDescriptionCollector,
+    ScyllaTablesCompressionInfoCollector,
+    ScyllaTablesUsedDiskCollector,
+)
+from collectors.security import CqlshCollector, DefaultCredentialsCollector, RolePermissionsCollector, RolesCollector
+from collectors.storage import (
+    NVMeDevicesCollector,
+    NitroDetailedStatsCollector,
+    RAIDSetupCollector,
+    ScyllaSSTablesCollector,
+    StorageConfigurationCollector,
+)
+from collectors.time_sync import (
+    ChronyStatusCollector,
+    NTPServicesCollector,
+    NTPStatusCollector,
+)
+from collectors.topology import (
+    GossipInfoCollector,
+    RaftGroup0Collector,
+    RaftTopologyRPCStatusCollector,
+    ScyllaClusterStatusCollector,
+    SystemClusterStatusCollector,
+    SystemPeersLocalCollector,
+    SystemTabletsCollector,
+    SystemTopologyCollector,
+    TokenMetadataHostsMappingCollector,
+)
+from collectors.tuning import (
+    CPUSetCollector,
+    PerftuneSystemConfigurationCollector,
+    PerftuneYamlDefaultCollector,
+    ScyllaExtraConfigurationFilesCollector,
+    SeastarCPUMapCollector,
+)
 from collectors_base import Collector, CollectorStatus, CollectorResult, Output
-from common import GossipInfoInvariantValues
+from common import GossipInfoInvariantValues, NodePlatform
 from models.output_entry import OutputEntryType
-from utils import Executor
+from utils import Executor, ServiceManager, running_in_container, CQL_REQUEST_TIMEOUT_SECONDS
 import scylla_doctor
 
-from tests.helpers import assert_output_gathered, assert_output_not_gathered
-
-
-def is_podman_container():
-    """
-    Checks if the runtime environment is a Podman container.
-    Certain tests can be excluded on the basis of this.
-    """
-    if os.path.isfile("/run/.containerenv"):
-        with open("/run/.containerenv") as f:
-            for line in f:
-                if line.startswith("engine="):
-                    return "podman" in line
-    return os.getenv("container") == "podman"
-
-
-def is_docker_container():
-    """
-    Checks if the runtime environment is a Docker container.
-    Certain tests can be excluded on the basis of this.
-    """
-    return os.path.isfile("/run/.dockerenv") or os.path.isfile("/.dockerenv")
-
-
-def is_container():
-    """
-    Checks if the runtime environment is a general container.
-    Certain tests can be excluded on the basis of this.
-    """
-    return (is_podman_container() or is_docker_container() or os.getenv("container") == "oci"
-            or os.path.isfile("/run/.containerenv"))
+from tests.helpers import assert_output_gathered, assert_output_not_gathered, live_scylla_cql_config
 
 
 def monkeypatch_path(path, dir, collector_classes, monkeypatch):
@@ -81,7 +143,7 @@ def monkeypatch_path(path, dir, collector_classes, monkeypatch):
 
 
 def test_CPUSpecificationsCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.CPUSpecificationsCollector])
+    doctor = doctor_factory(collectors=[CPUSpecificationsCollector])
     doctor.run()
 
     result = doctor.vitals['CPUSpecificationsCollector']
@@ -98,17 +160,101 @@ def test_CPUSpecificationsCollector(doctor_factory):
 @pytest.mark.skipif(not shutil.which("iptables"),
                     reason="requires iptables")
 def test_FirewallRulesCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.FirewallRulesCollector])
+    doctor = doctor_factory(collectors=[FirewallRulesCollector])
     doctor.run()
 
     result = doctor.vitals['FirewallRulesCollector']
-    assert result.status == CollectorStatus.PASSED
+    # Privileged containers (CI) can run iptables, unprivileged and rootless ones are refused.
+    if running_in_container() and result.status == CollectorStatus.SKIPPED:
+        assert "iptables needs CAP_NET_ADMIN" in result.message
+        return
+    assert result.status == CollectorStatus.PASSED, result.message
     assert_output_gathered(result, OutputEntryType.STDOUT, "iptables -L -v")
 
 
+IPTABLES_REFUSED = \
+    "iptables v1.8.10 (nf_tables): Could not fetch rule set generation id: Permission denied (you must be root)\n"
+
+
+@pytest.mark.parametrize("in_container,returncode,stderr,expected_status,expected_message", [
+    (False, 0, "", CollectorStatus.PASSED, ""),
+    (True, 0, "", CollectorStatus.PASSED, "the node's only with --network host"),
+    (True, 4, IPTABLES_REFUSED, CollectorStatus.SKIPPED, "iptables needs CAP_NET_ADMIN"),
+    (False, 4, IPTABLES_REFUSED, CollectorStatus.FAILED, "`iptables` call failed"),
+    # Errors other than a refusal stay FAILED inside a container too.
+    (True, 3, "iptables v1.8.10 (legacy): can't initialize iptables table `filter': Table does not exist\n",
+     CollectorStatus.FAILED, "`iptables` call failed"),
+])
+def test_FirewallRulesCollector_refused(in_container, returncode, stderr, expected_status, expected_message):
+    collector = FirewallRulesCollector({}, {})
+    stdout = "Chain INPUT (policy ACCEPT 0 packets, 0 bytes)\n" if returncode == 0 else ""
+    completed = subprocess.CompletedProcess(["iptables", "-L", "-v"], returncode, stdout=stdout, stderr=stderr)
+
+    with patch('collectors.network.running_in_container', return_value=in_container), \
+         patch.object(Executor, 'run_command', return_value=completed) as run_command:
+        collector._collect({})
+
+    run_command.assert_called_once_with("iptables -L -v", check=False)
+    result = collector.result
+    assert result.status == expected_status, result.message
+    assert expected_message in result.message
+    if returncode != 0:
+        assert stderr.strip() in result.message
+    else:
+        assert_output_gathered(result, OutputEntryType.STDOUT, "iptables -L -v")
+
+
+@pytest.mark.parametrize("in_container", [False, True])
+def test_FirewallRulesCollector_empty_output(in_container):
+    collector = FirewallRulesCollector({}, {})
+    completed = subprocess.CompletedProcess(["iptables", "-L", "-v"], 0, stdout="", stderr="")
+
+    with patch('collectors.network.running_in_container', return_value=in_container), \
+         patch.object(Executor, 'run_command', return_value=completed):
+        collector._collect({})
+
+    result = collector.result
+    assert result.status == CollectorStatus.PASSED, result.message
+    assert ("network namespace" in result.message) == in_container
+
+
+@pytest.mark.parametrize("collector_class,tool", [
+    (FirewallRulesCollector, 'iptables'),
+    (HypervisorTypeCollector, 'systemd-detect-virt'),
+])
+def test_missing_command_at_run_time(collector_class, tool):
+    """Collectors that run their tool directly rely on the base class to skip it when it is not installed."""
+    collector = collector_class({}, {})
+    vitals: dict = {}
+    with patch('collectors_base.os.getuid', return_value=0), \
+         patch.object(Executor, 'run_command',
+                      side_effect=FileNotFoundError(2, "No such file or directory", tool)):
+        collector.collect(vitals, {})
+
+    assert vitals[collector.id].status == CollectorStatus.SKIPPED, vitals[collector.id].message
+    assert vitals[collector.id].message == f"'{tool}' not installed"
+
+
+@pytest.mark.parametrize("collector_class,tools", [
+    (NICsCollector, ['ethtool']),
+    (SeastarCPUMapCollector, ['pgrep', 'taskset']),
+    (SeastarCPUMapCollector, ['taskset']),
+])
+def test_missing_tool(collector_class, tools):
+    """A tool that is not installed skips the collector and names every missing tool, and only those."""
+    collector = collector_class({}, {})
+    with patch('collectors_base.shutil.which',
+               side_effect=lambda tool: None if tool in tools else '/usr/bin/' + tool), \
+         patch.object(Executor, 'run_command', side_effect=AssertionError("must not run")):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.SKIPPED, collector.result.message
+    assert collector.result.message == f"{', '.join(repr(tool) for tool in tools)} not installed"
+
+
 def test_InfrastructureProviderCollector(doctor_factory, provider_identify_shorten_timeout_options):
-    doctor = doctor_factory(collectors=[collectors.NICsCollector,
-                                        collectors.InfrastructureProviderCollector],
+    doctor = doctor_factory(collectors=[NICsCollector,
+                                        InfrastructureProviderCollector],
                             config_options=provider_identify_shorten_timeout_options)
     doctor.run()
     result = doctor.vitals['InfrastructureProviderCollector']
@@ -123,26 +269,34 @@ def test_InfrastructureProviderCollector(doctor_factory, provider_identify_short
     # TODO: add more stubs to test most popular cloud providers
 
 
-def test_MaintenanceEventsCollector(doctor_factory, provider_identify_shorten_timeout_options):
-    doctor = doctor_factory(collectors=[collectors.MaintenanceEventsCollector],
-                            config_options=provider_identify_shorten_timeout_options)
-    doctor.run()
+@pytest.mark.parametrize("provider,expected_status,expected_data", [
+    (None, CollectorStatus.SKIPPED, {}),
+    (Mock(scheduled_maintenance_events=[]), CollectorStatus.PASSED, {'scheduled_maintenance_events': []}),
+])
+def test_MaintenanceEventsCollector(doctor_factory, provider, expected_status, expected_data):
+    # Provider detection is patched: on real cloud hosts (e.g. GitHub-hosted runners on Azure) the scheduled
+    # events endpoint can be slow or unreachable, which made this test environment-dependent.
+    with patch('utils.InfrastructureProvider.identify', return_value=provider):
+        doctor = doctor_factory(collectors=[MaintenanceEventsCollector])
+        doctor.run()
     result = doctor.vitals['MaintenanceEventsCollector']
-    assert result.status == CollectorStatus.PASSED or result.status == CollectorStatus.SKIPPED
-    assert result.status == CollectorStatus.SKIPPED or 'scheduled_maintenance_events' in result.data
+    assert result.status == expected_status
+    assert result.data == expected_data
 
 
 def test_NodePlatformCollector(doctor_factory, monkeypatch):
-    doctor = doctor_factory(collectors=[collectors.NodePlatformCollector])
+    doctor = doctor_factory(collectors=[NodePlatformCollector])
+    # Outside a container the platform needs the provider and CPU collectors.
+    monkeypatch.setattr('collectors.cloud.running_in_container', lambda: False)
     with pytest.raises(Exception) as e:
         doctor.run()
     assert "Dependencies are not available" in str(e)
 
     doctor = doctor_factory(collectors=[
-        collectors.NodePlatformCollector,
-        collectors.NICsCollector,
-        collectors.InfrastructureProviderCollector,
-        collectors.CPUSpecificationsCollector
+        NodePlatformCollector,
+        NICsCollector,
+        InfrastructureProviderCollector,
+        CPUSpecificationsCollector
     ])
 
     def freeze_vitals(self, name, value):
@@ -158,25 +312,25 @@ def test_NodePlatformCollector(doctor_factory, monkeypatch):
     cpu_result = CollectorResult(CollectorStatus.PASSED, {'flags': []}, Output(), None)
     doctor.vitals['CPUSpecificationsCollector'] = cpu_result
 
-    monkeypatch.setattr(os.path, 'isfile', lambda x: True)
+    monkeypatch.setattr('collectors.cloud.running_in_container', lambda: True)
     doctor.run()
     result = doctor.vitals['NodePlatformCollector']
     assert result.status == CollectorStatus.PASSED
-    assert result.data['platform'] == collectors.NodePlatform.CONTAINER
+    assert result.data['platform'] == NodePlatform.CONTAINER
     del doctor.vitals['NodePlatformCollector']
 
-    monkeypatch.setattr(os.path, 'isfile', lambda x: False)
+    monkeypatch.setattr('collectors.cloud.running_in_container', lambda: False)
     doctor.run()
     result = doctor.vitals['NodePlatformCollector']
     assert result.status == CollectorStatus.PASSED
-    assert result.data['platform'] == collectors.NodePlatform.BAREMETAL
+    assert result.data['platform'] == NodePlatform.BAREMETAL
     del doctor.vitals['NodePlatformCollector']
 
     cpu_result.data['flags'] = ["hypervisor"]
     doctor.run()
     result = doctor.vitals['NodePlatformCollector']
     assert result.status == CollectorStatus.PASSED
-    assert result.data['platform'] == collectors.NodePlatform.VM
+    assert result.data['platform'] == NodePlatform.VM
     del doctor.vitals['NodePlatformCollector']
 
     infra_result = CollectorResult(CollectorStatus.PASSED,
@@ -185,20 +339,36 @@ def test_NodePlatformCollector(doctor_factory, monkeypatch):
     doctor.run()
     result = doctor.vitals['NodePlatformCollector']
     assert result.status == CollectorStatus.PASSED
-    assert result.data['platform'] == collectors.NodePlatform.CLOUD
+    assert result.data['platform'] == NodePlatform.CLOUD
+
+
+def test_NodePlatformCollector_container_without_dependencies(doctor_factory, monkeypatch):
+    """
+    In a container the platform is known from the marker file alone, so NodePlatformCollector must not depend on
+    collectors that need ethtool or lscpu (absent from the stock Scylla image).
+    """
+    doctor = doctor_factory(collectors=[NodePlatformCollector])
+    monkeypatch.setattr('collectors.cloud.running_in_container', lambda: True)
+
+    assert doctor.collectors['NodePlatformCollector'].depends_on == set()
+    doctor.run()
+
+    result = doctor.vitals['NodePlatformCollector']
+    assert result.status == CollectorStatus.PASSED, result.message
+    assert result.data['platform'] == NodePlatform.CONTAINER
 
 
 def test_ServiceManagerCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ServiceManagerCollector])
+    doctor = doctor_factory(collectors=[ServiceManagerCollector])
     doctor.run()
 
     result = doctor.vitals['ServiceManagerCollector']
     assert result.status == CollectorStatus.PASSED
-    assert isinstance(result.data['service_manager'], collectors.ServiceManager.Interface)
+    assert isinstance(result.data['service_manager'], ServiceManager.Interface)
 
 
 def test_ClockSourceCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ClockSourceCollector])
+    doctor = doctor_factory(collectors=[ClockSourceCollector])
     doctor.run()
 
     result = doctor.vitals['ClockSourceCollector']
@@ -207,30 +377,38 @@ def test_ClockSourceCollector(doctor_factory):
 
 
 def test_CPUScalingCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.CPUScalingCollector])
+    doctor = doctor_factory(collectors=[CPUScalingCollector])
     doctor.run()
 
     result = doctor.vitals['CPUScalingCollector']
-    assert result.status == CollectorStatus.PASSED
+    if running_in_container():
+        assert result.status == CollectorStatus.SKIPPED, result.message
+        assert "Not available for containers" in result.message
+        return
+    assert result.status == CollectorStatus.PASSED, result.message
     assert 'scaling_governor' in result.data
     assert len(result.data['services']) > 0
 
 
 def test_CoredumpCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.CoredumpCollector])
+    doctor = doctor_factory(collectors=[CoredumpCollector])
 
     doctor.run()
 
     result = doctor.vitals['CoredumpCollector']
-    assert result.status == CollectorStatus.PASSED
+    if running_in_container():
+        assert result.status == CollectorStatus.SKIPPED, result.message
+        assert "Not available for containers" in result.message
+        return
+    assert result.status == CollectorStatus.PASSED, result.message
     assert len(result.data['services']) > 0
     assert 'files' in result.data
 
 
 def test_ClientConnectionCollector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.ClientConnectionCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        ClientConnectionCollector])
 
     doctor.run()
 
@@ -250,11 +428,11 @@ def test_ClientConnectionCollector(doctor_factory, await_scylla_start):
 
 
 def test_GossipInfoCollector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.SystemConfigCollector,
-                                        collectors.GossipInfoCollector,
-                                        collectors.SystemPeersLocalCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        SystemConfigCollector,
+                                        GossipInfoCollector,
+                                        SystemPeersLocalCollector])
 
     doctor.run()
     result = doctor.vitals['GossipInfoCollector']
@@ -296,9 +474,9 @@ def _make_gossip_entry(host_address: str, with_tokens: bool = True, supported_fe
     return {"addrs": host_address, "application_state": states}
 
 
-def _make_gossip_info_collector(doctor_factory) -> collectors.GossipInfoCollector:
+def _make_gossip_info_collector(doctor_factory) -> GossipInfoCollector:
     """Instantiate a GossipInfoCollector without running it (no Scylla required)."""
-    doctor = doctor_factory(collectors=[collectors.GossipInfoCollector], analyzers={})
+    doctor = doctor_factory(collectors=[GossipInfoCollector], analyzers={})
     return doctor.collectors['GossipInfoCollector']
 
 
@@ -385,11 +563,11 @@ def test_GossipInfoCollectorParseEntry_MissingAddrs(doctor_factory):
 
 
 def test_TokenMetadataHostsMappingCollector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.SystemConfigCollector,
-                                        collectors.SystemPeersLocalCollector,
-                                        collectors.TokenMetadataHostsMappingCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        SystemConfigCollector,
+                                        SystemPeersLocalCollector,
+                                        TokenMetadataHostsMappingCollector])
 
     doctor.run()
     result = doctor.vitals['TokenMetadataHostsMappingCollector']
@@ -400,9 +578,9 @@ def test_TokenMetadataHostsMappingCollector(doctor_factory, await_scylla_start):
 
 
 def test_RaftGroup0Collector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.RaftGroup0Collector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        RaftGroup0Collector])
 
     doctor.run()
 
@@ -422,9 +600,9 @@ def test_RaftGroup0Collector(doctor_factory, await_scylla_start):
 
 
 def test_SystemPeersLocalCollector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.SystemPeersLocalCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        SystemPeersLocalCollector])
 
     doctor.run()
 
@@ -446,19 +624,71 @@ def test_SystemPeersLocalCollector(doctor_factory, await_scylla_start):
     assert len(result.data['hosts']['127.0.0.1']) > 0
 
 
+_SYSTEM_CLUSTER_STATUS_QUERY = f"SELECT * FROM system.cluster_status USING TIMEOUT {CQL_REQUEST_TIMEOUT_SECONDS}s"
+
+# cqlsh table output of system.cluster_status: one live node and one decommissioned node still in gossip.
+_SYSTEM_CLUSTER_STATUS_STDOUT = (
+    "\n"
+    " peer      | dc          | host_id                              | load   | owns | status | tokens | up\n"
+    "-----------+-------------+--------------------------------------+--------+------+--------+--------+-------\n"
+    " 127.0.0.1 | datacenter1 | 33ad8814-05c8-4d4d-b072-871a8dbe00b8 | 229724 | null | NORMAL |    256 |  True\n"
+    " 10.0.0.2  |        null | 7b5c1c8e-0d35-4e0f-9a2c-1f1b7e2b9a11 |   null |    0 |   LEFT |    256 | False\n"
+    "\n"
+    "(2 rows)\n")
+
+
+def _make_system_cluster_status_collector(doctor_factory):
+    doctor = doctor_factory(collectors=[SystemClusterStatusCollector], analyzers=())
+    return doctor.collectors['SystemClusterStatusCollector']
+
+
+def _make_system_cluster_status_vitals():
+    return {
+        'ScyllaConfigurationFileCollector': CollectorResult(CollectorStatus.PASSED, {'rpc_address': '127.0.0.1'},
+                                                            Output(), ''),
+        'CqlshCollector': CollectorResult(CollectorStatus.PASSED, {}, Output(), ''),
+    }
+
+
+def test_SystemClusterStatusCollector_reads_with_a_server_side_timeout(doctor_factory):
+    """
+    The virtual table is read with a SELECT carrying USING TIMEOUT (COPY cannot), parsed like COPY output:
+    'load' dropped, decommissioned (LEFT) nodes skipped; a null cell is '' as COPY printed it, not cqlsh's 'null'.
+    """
+    collector = _make_system_cluster_status_collector(doctor_factory)
+    output = Mock(returncode=0, stdout=_SYSTEM_CLUSTER_STATUS_STDOUT)
+    with patch.object(Executor, 'cqlsh', return_value=output) as mock_cqlsh:
+        collector._collect(_make_system_cluster_status_vitals())
+
+    assert collector.status == CollectorStatus.PASSED, collector._message
+    assert mock_cqlsh.call_args.args[0] == _SYSTEM_CLUSTER_STATUS_QUERY
+    assert collector._data == {'hosts': {
+        '127.0.0.1': {'dc': 'datacenter1', 'host_id': '33ad8814-05c8-4d4d-b072-871a8dbe00b8', 'owns': '',
+                      'status': 'NORMAL', 'tokens': '256', 'up': 'True'},
+    }}
+
+
+def test_SystemClusterStatusCollector_fails_when_the_read_fails(doctor_factory):
+    collector = _make_system_cluster_status_collector(doctor_factory)
+    with patch.object(Executor, 'cqlsh', return_value=None):
+        collector._collect(_make_system_cluster_status_vitals())
+
+    assert collector.status == CollectorStatus.FAILED
+    assert collector._message == f"{_SYSTEM_CLUSTER_STATUS_QUERY} failed"
+
+
 def test_SystemClusterStatusCollector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.SystemClusterStatusCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        SystemClusterStatusCollector])
 
     doctor.run()
 
     result = doctor.vitals['SystemClusterStatusCollector']
 
     # Query successful test
-    system_cluster_status_command = Executor.read_cql_table_command("system.cluster_status")
     assert result.status == CollectorStatus.PASSED, result.message
-    assert_output_gathered(result, OutputEntryType.CQL, system_cluster_status_command)
+    assert_output_gathered(result, OutputEntryType.CQL, _SYSTEM_CLUSTER_STATUS_QUERY)
 
     assert len(result.data['hosts']) > 0
     assert '127.0.0.1' in result.data['hosts']
@@ -466,10 +696,10 @@ def test_SystemClusterStatusCollector(doctor_factory, await_scylla_start):
 
 
 def test_SystemConfigCollector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.SystemConfigCollector,
-                                        collectors.SystemPeersLocalCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        SystemConfigCollector,
+                                        SystemPeersLocalCollector])
 
     doctor.run()
 
@@ -493,7 +723,7 @@ def test_SystemConfigCollector(doctor_factory, await_scylla_start):
 ###############################################################################
 
 def _make_system_config_collector(doctor_factory, config_options=()):
-    doctor = doctor_factory(collectors=[collectors.SystemConfigCollector], analyzers=(),
+    doctor = doctor_factory(collectors=[SystemConfigCollector], analyzers=(),
                             config_options=config_options)
     return doctor.collectors['SystemConfigCollector']
 
@@ -669,12 +899,12 @@ def __test_SystemTopologyCollector(doctor_factory, feature_supported: bool, feat
     :param feature_supported: If True, the collector should return that Consistent Topology is supported
     :param feature_enabled: If True, Consistent Topology is enabled and system.topology is not empty
     """
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.GossipInfoCollector,
-                                        collectors.SystemConfigCollector,
-                                        collectors.SystemPeersLocalCollector,
-                                        collectors.SystemTopologyCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        GossipInfoCollector,
+                                        SystemConfigCollector,
+                                        SystemPeersLocalCollector,
+                                        SystemTopologyCollector])
 
     doctor.run()
 
@@ -775,12 +1005,12 @@ def _make_system_topology_gossip_mock(gossip_info_override):
 
 
 def _run_system_topology_collector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.GossipInfoCollector,
-                                        collectors.SystemConfigCollector,
-                                        collectors.SystemPeersLocalCollector,
-                                        collectors.SystemTopologyCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        GossipInfoCollector,
+                                        SystemConfigCollector,
+                                        SystemPeersLocalCollector,
+                                        SystemTopologyCollector])
     doctor.run()
     return doctor.vitals['SystemTopologyCollector']
 
@@ -900,12 +1130,12 @@ def test_SystemTopologyCollectorMockSupportedEnabled_TokensSorted(doctor_factory
     monkeypatch.setattr(Executor, "get_url_content", consistent_topology_supported_get_url_mock)
     monkeypatch.setattr(Executor, "read_cql_table", return_system_topology_table_with_unsorted_tokens)
 
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.GossipInfoCollector,
-                                        collectors.SystemConfigCollector,
-                                        collectors.SystemPeersLocalCollector,
-                                        collectors.SystemTopologyCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        GossipInfoCollector,
+                                        SystemConfigCollector,
+                                        SystemPeersLocalCollector,
+                                        SystemTopologyCollector])
     doctor.run()
 
     result = doctor.vitals['SystemTopologyCollector']
@@ -919,7 +1149,7 @@ def test_SystemTopologyCollectorMockSupportedEnabled_TokensSorted(doctor_factory
 
 
 def test_ScyllaExtraConfigurationFilesCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaExtraConfigurationFilesCollector])
+    doctor = doctor_factory(collectors=[ScyllaExtraConfigurationFilesCollector])
     doctor.run()
 
     result = doctor.vitals['ScyllaExtraConfigurationFilesCollector']
@@ -933,19 +1163,75 @@ def test_ScyllaExtraConfigurationFilesCollector(doctor_factory):
 
 @pytest.mark.skipif(os.getuid() > 0,
                     reason="requires root access")
-@pytest.mark.skipif(is_podman_container(),
-                    reason="podman environment cannot read the kernel buffer")
 def test_KernelRingBufferCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.KernelRingBufferCollector])
+    doctor = doctor_factory(collectors=[KernelRingBufferCollector])
     doctor.run()
 
     result = doctor.vitals['KernelRingBufferCollector']
-    assert result.status == CollectorStatus.PASSED
+    # Unprivileged and rootless containers are refused by the kernel, privileged ones can read the buffer.
+    if running_in_container() and result.status == CollectorStatus.SKIPPED:
+        assert "dmesg needs CAP_SYSLOG" in result.message
+        return
+    assert result.status == CollectorStatus.PASSED, result.message
     assert_output_gathered(result, OutputEntryType.STDOUT, "dmesg -T")
 
 
+DMESG_REFUSED = "dmesg: read kernel buffer failed: Operation not permitted\n"
+
+
+@pytest.mark.parametrize("marker,returncode,stderr,expected_status,expected_message", [
+    (None, 0, "", CollectorStatus.PASSED, ""),
+    ("/.dockerenv", 0, "", CollectorStatus.PASSED, ""),                 # privileged Docker
+    ("/run/.containerenv", 0, "", CollectorStatus.PASSED, ""),          # privileged rootful Podman
+    ("/.dockerenv", 1, DMESG_REFUSED, CollectorStatus.SKIPPED, "dmesg needs CAP_SYSLOG"),
+    # rootless Podman
+    ("/run/.containerenv", 1, DMESG_REFUSED, CollectorStatus.SKIPPED, "dmesg needs CAP_SYSLOG"),
+    (None, 1, DMESG_REFUSED, CollectorStatus.FAILED, "Cannot collect `dmesg -T`"),
+    # Errors other than a refusal stay FAILED inside a container too.
+    ("/.dockerenv", 1, "dmesg: unrecognized option: T\n", CollectorStatus.FAILED, "Cannot collect `dmesg -T`"),
+])
+def test_KernelRingBufferCollector_refused(monkeypatch, marker, returncode, stderr, expected_status,
+                                           expected_message):
+    collector = KernelRingBufferCollector({}, {})
+    # run_command pipes stdout and stderr separately, dmesg reports the refusal on stderr.
+    stdout = "[Thu Oct 15 07:00:00 2026] Linux version 6.8.0\n" if returncode == 0 else ""
+    completed = subprocess.CompletedProcess(["dmesg", "-T"], returncode, stdout=stdout, stderr=stderr)
+    # Drive the real detection through the Docker or Podman marker file, with no container variable to fall back on.
+    monkeypatch.setattr(os.path, 'isfile', lambda path: path == marker)
+    monkeypatch.delenv("container", raising=False)
+
+    with patch('builtins.open', Mock(side_effect=PermissionError("/proc/1/environ"))), \
+         patch.object(Executor, 'run_command', return_value=completed) as run_command:
+        collector._collect({})
+
+    run_command.assert_called_once_with("dmesg -T", check=False)
+    result = collector.result
+    assert result.status == expected_status, result.message
+    assert expected_message in result.message
+    if returncode != 0:
+        assert stderr.strip() in result.message
+
+
+def test_CollectionTimeCollector(doctor_factory):
+    doctor = doctor_factory(collectors=[CollectionTimeCollector])
+    before = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    doctor.run()
+    after = datetime.datetime.now(datetime.timezone.utc)
+
+    result = doctor.vitals['CollectionTimeCollector']
+    assert result.status == CollectorStatus.PASSED
+    collected_at = datetime.datetime.fromisoformat(result.data['collected_at'])
+    assert collected_at.tzinfo is not None, "the UTC offset must be recorded"
+    assert before <= collected_at <= after
+    assert result.message == "Collection time recorded"
+    # collection times always differ between nodes: keep them out of the cluster diff
+    assert result.mask == ['*']
+    result.strip()
+    assert result.data == {}
+
+
 def test_PathsCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.PathsCollector])
+    doctor = doctor_factory(collectors=[PathsCollector])
 
     doctor.run()
 
@@ -955,7 +1241,7 @@ def test_PathsCollector(doctor_factory):
 
 
 def test_NICsCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.NICsCollector])
+    doctor = doctor_factory(collectors=[NICsCollector])
     doctor.run()
 
     result = doctor.vitals['NICsCollector']
@@ -969,7 +1255,7 @@ def test_NICsCollector(doctor_factory):
 
 def test_NICsCollector_skips_default_virtual_nics(doctor_factory):
     """Common virtual/tunnel NICs are skipped by default without calling ethtool."""
-    doctor = doctor_factory(collectors=[collectors.NICsCollector])
+    doctor = doctor_factory(collectors=[NICsCollector])
     collector = doctor.collectors['NICsCollector']
 
     def fake_run_command(command, check=True, **kwargs):
@@ -986,10 +1272,10 @@ def test_NICsCollector_skips_default_virtual_nics(doctor_factory):
             result.stdout = ""
         return result
 
-    with patch.object(collectors.shutil, 'which', return_value="/usr/sbin/ethtool"), \
-            patch.object(collectors.glob, 'glob',
+    with patch.object(shutil, 'which', return_value="/usr/sbin/ethtool"), \
+            patch.object(glob, 'glob',
                          return_value=["/sys/class/net/eth0", "/sys/class/net/erspan0"]), \
-            patch.object(collectors.pathlib.Path, 'is_symlink', return_value=True), \
+            patch.object(pathlib.Path, 'is_symlink', return_value=True), \
             patch.object(Executor, 'run_command', side_effect=fake_run_command):
         collector._collect({})
 
@@ -1002,7 +1288,7 @@ def test_NICsCollector_skips_default_virtual_nics(doctor_factory):
 def test_NICsCollector_skips_configured_nics(doctor_factory):
     """Configured skip_nics extends the built-in defaults."""
     doctor = doctor_factory(
-        collectors=[collectors.NICsCollector],
+        collectors=[NICsCollector],
         config_options=[('NICsCollector', 'skip_nics', 'dummy0')],
     )
     collector = doctor.collectors['NICsCollector']
@@ -1014,10 +1300,10 @@ def test_NICsCollector_skips_configured_nics(doctor_factory):
         result.stdout = ""
         return result
 
-    with patch.object(collectors.shutil, 'which', return_value="/usr/sbin/ethtool"), \
-            patch.object(collectors.glob, 'glob',
+    with patch.object(shutil, 'which', return_value="/usr/sbin/ethtool"), \
+            patch.object(glob, 'glob',
                          return_value=["/sys/class/net/eth0", "/sys/class/net/dummy0"]), \
-            patch.object(collectors.pathlib.Path, 'is_symlink', return_value=True), \
+            patch.object(pathlib.Path, 'is_symlink', return_value=True), \
             patch.object(Executor, 'run_command', side_effect=fake_run_command):
         collector._collect({})
 
@@ -1027,7 +1313,7 @@ def test_NICsCollector_skips_configured_nics(doctor_factory):
 
 def test_NICsCollector_fails_when_ethtool_errors_on_real_nic(doctor_factory):
     """ethtool failure on a non-skipped NIC must fail the collector."""
-    doctor = doctor_factory(collectors=[collectors.NICsCollector])
+    doctor = doctor_factory(collectors=[NICsCollector])
     collector = doctor.collectors['NICsCollector']
 
     def fake_run_command(command, check=True, **kwargs):
@@ -1038,9 +1324,9 @@ def test_NICsCollector_fails_when_ethtool_errors_on_real_nic(doctor_factory):
         result.stdout = "driver: virtio_net\n"
         return result
 
-    with patch.object(collectors.shutil, 'which', return_value="/usr/sbin/ethtool"), \
-            patch.object(collectors.glob, 'glob', return_value=["/sys/class/net/eth0"]), \
-            patch.object(collectors.pathlib.Path, 'is_symlink', return_value=True), \
+    with patch.object(shutil, 'which', return_value="/usr/sbin/ethtool"), \
+            patch.object(glob, 'glob', return_value=["/sys/class/net/eth0"]), \
+            patch.object(pathlib.Path, 'is_symlink', return_value=True), \
             patch.object(Executor, 'run_command', side_effect=fake_run_command):
         collector.collect({}, doctor.collectors)
 
@@ -1049,7 +1335,7 @@ def test_NICsCollector_fails_when_ethtool_errors_on_real_nic(doctor_factory):
 
 
 def test_IPAddressesCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.IPAddressesCollector, collectors.NICsCollector])
+    doctor = doctor_factory(collectors=[IPAddressesCollector, NICsCollector])
     doctor.run()
 
     result = doctor.vitals['IPAddressesCollector']
@@ -1059,7 +1345,7 @@ def test_IPAddressesCollector(doctor_factory):
 
 
 def test_ComputerArchitectureCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ComputerArchitectureCollector])
+    doctor = doctor_factory(collectors=[ComputerArchitectureCollector])
     doctor.run()
 
     result = doctor.vitals['ComputerArchitectureCollector']
@@ -1068,29 +1354,63 @@ def test_ComputerArchitectureCollector(doctor_factory):
         assert key in result.data
 
 
-@pytest.mark.skipif(is_container(),
-                    reason="container environment does not feature systemd and timedatectl functionality")
 def test_NTPStatusCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.NTPStatusCollector])
+    doctor = doctor_factory(collectors=[NTPStatusCollector])
     doctor.run()
 
     result = doctor.vitals['NTPStatusCollector']
-    assert result.status == CollectorStatus.PASSED
-    assert 'ntp_enabled' in result.data and 'ntp_synchronized' in result.data
+    if running_in_container():
+        assert result.status == CollectorStatus.SKIPPED, result.message
+        assert "Not available" in result.message
+    else:
+        assert result.status == CollectorStatus.PASSED, result.message
+        assert 'ntp_enabled' in result.data and 'ntp_synchronized' in result.data
+
+
+@pytest.mark.parametrize("stdout,expected_data", [
+    ("yes\n", {'ntp_enabled': True, 'ntp_synchronized': True}),
+    ("no\n", {'ntp_enabled': False, 'ntp_synchronized': False}),
+])
+def test_NTPStatusCollector_mocked(stdout, expected_data):
+    collector = NTPStatusCollector({}, {})
+    completed = subprocess.CompletedProcess(["timedatectl"], 0, stdout=stdout)
+
+    with patch.object(Executor, 'run_command', return_value=completed):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED, collector.result.message
+    assert collector.result.data == expected_data
 
 
 def test_NTPServicesCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.NTPServicesCollector])
+    doctor = doctor_factory(collectors=[NTPServicesCollector])
     doctor.run()
 
     result = doctor.vitals['NTPServicesCollector']
-    assert result.status == CollectorStatus.PASSED
+    if running_in_container():
+        assert result.status == CollectorStatus.SKIPPED, result.message
+        assert "Not available for containers" in result.message
+        return
+    assert result.status == CollectorStatus.PASSED, result.message
     assert all(['active' in result.data['services'][service] for service in result.data['services']])
+    assert isinstance(result.data['chrony_installed'], bool)
+
+
+@pytest.mark.parametrize("chronyd_path, installed", [("/usr/sbin/chronyd", True), (None, False)])
+def test_NTPServicesCollector_chrony_installed(chronyd_path, installed):
+    collector = NTPServicesCollector({}, {})
+    with patch('collectors.time_sync.ServiceManager') as mock_sm_class, \
+         patch('shutil.which', return_value=chronyd_path):
+        mock_sm_class.return_value.service_active.return_value = False
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data['chrony_installed'] is installed
 
 
 def test_ChronyStatusCollector_skipped_without_chronyc():
-    collector = collectors.ChronyStatusCollector({}, {})
-    with patch('collectors.shutil.which', return_value=None):
+    collector = ChronyStatusCollector({}, {})
+    with patch('shutil.which', return_value=None):
         collector._collect({})
 
     assert collector.status == CollectorStatus.SKIPPED
@@ -1098,8 +1418,8 @@ def test_ChronyStatusCollector_skipped_without_chronyc():
 
 
 def test_ChronyStatusCollector_skipped_when_tracking_fails():
-    collector = collectors.ChronyStatusCollector({}, {})
-    with patch('collectors.shutil.which', return_value='/usr/bin/chronyc'), \
+    collector = ChronyStatusCollector({}, {})
+    with patch('shutil.which', return_value='/usr/bin/chronyc'), \
          patch.object(Executor, 'run_command', return_value=Mock(returncode=1, stdout='506 Cannot talk to daemon\n')):
         collector._collect({})
 
@@ -1108,8 +1428,8 @@ def test_ChronyStatusCollector_skipped_when_tracking_fails():
 
 
 def test_ChronyStatusCollector_failed_without_leap_status():
-    collector = collectors.ChronyStatusCollector({}, {})
-    with patch('collectors.shutil.which', return_value='/usr/bin/chronyc'), \
+    collector = ChronyStatusCollector({}, {})
+    with patch('shutil.which', return_value='/usr/bin/chronyc'), \
          patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout='Reference ID    : CB00710F\n')):
         collector._collect({})
 
@@ -1123,8 +1443,8 @@ def test_ChronyStatusCollector_synchronized():
         "Stratum         : 2\n"
         "Leap status     : Normal\n"
     )
-    collector = collectors.ChronyStatusCollector({}, {})
-    with patch('collectors.shutil.which', return_value='/usr/bin/chronyc'), \
+    collector = ChronyStatusCollector({}, {})
+    with patch('shutil.which', return_value='/usr/bin/chronyc'), \
          patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=tracking_output)):
         collector._collect({})
 
@@ -1135,8 +1455,8 @@ def test_ChronyStatusCollector_synchronized():
 
 def test_ChronyStatusCollector_not_synchronized():
     tracking_output = "Leap status     : Not synchronised\n"
-    collector = collectors.ChronyStatusCollector({}, {})
-    with patch('collectors.shutil.which', return_value='/usr/bin/chronyc'), \
+    collector = ChronyStatusCollector({}, {})
+    with patch('shutil.which', return_value='/usr/bin/chronyc'), \
          patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=tracking_output)):
         collector._collect({})
 
@@ -1148,8 +1468,8 @@ def test_ChronyStatusCollector_not_synchronized():
 @pytest.mark.parametrize('leap_status', ['Insert second', 'Delete second'])
 def test_ChronyStatusCollector_synchronized_leap_second(leap_status):
     tracking_output = f"Leap status     : {leap_status}\n"
-    collector = collectors.ChronyStatusCollector({}, {})
-    with patch('collectors.shutil.which', return_value='/usr/bin/chronyc'), \
+    collector = ChronyStatusCollector({}, {})
+    with patch('shutil.which', return_value='/usr/bin/chronyc'), \
          patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=tracking_output)):
         collector._collect({})
 
@@ -1160,8 +1480,8 @@ def test_ChronyStatusCollector_synchronized_leap_second(leap_status):
 
 def test_ChronyStatusCollector_unknown_leap_status_treated_as_synchronized():
     tracking_output = "Leap status     : Future status\n"
-    collector = collectors.ChronyStatusCollector({}, {})
-    with patch('collectors.shutil.which', return_value='/usr/bin/chronyc'), \
+    collector = ChronyStatusCollector({}, {})
+    with patch('shutil.which', return_value='/usr/bin/chronyc'), \
          patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=tracking_output)):
         collector._collect({})
 
@@ -1169,22 +1489,38 @@ def test_ChronyStatusCollector_unknown_leap_status_treated_as_synchronized():
     assert collector._data['chrony_synchronized'] is True
 
 
-def test_ChronyServicesCollector():
-    collector = collectors.ChronyServicesCollector({}, {})
-    with patch('collectors.ServiceManager') as mock_sm_class:
-        mock_sm = mock_sm_class.return_value
-        mock_sm.service_active.side_effect = lambda name: name == 'chronyd'
-        collector._collect({})
+@pytest.mark.parametrize("collector_class", [
+    NTPStatusCollector,
+    NTPServicesCollector,
+    CoredumpCollector,
+    CPUScalingCollector,
+    NVMeDevicesCollector,
+    PerftuneYamlDefaultCollector,
+    ScyllaLimitNOFILECollector,
+    ScyllaLogsCollector,
+    ScyllaManagerAgentLogsCollector,
+])
+def test_skip_in_container_collectors(doctor_factory, collector_class):
+    """
+    These collectors read host state a container usually cannot see: in a container the base class skips them with
+    their reason, before their dependencies are resolved or _collect runs.
+    """
+    doctor = doctor_factory(collectors=[collector_class], analyzers={})
+    reason = doctor.collectors[collector_class.__name__].skip_in_container
+    assert isinstance(reason, str) and reason
 
-    assert collector.status == CollectorStatus.PASSED
-    assert collector._data['services'] == {
-        'chronyd': {'active': True},
-        'chrony': {'active': False},
-    }
+    with patch('collectors_base.running_in_container', return_value=True), \
+         patch.object(collector_class, '_collect', side_effect=AssertionError("_collect must not run")):
+        doctor.run()
+
+    result = doctor.vitals[collector_class.__name__]
+    assert result.status == CollectorStatus.SKIPPED
+    assert result.message == f"Not available for containers: {reason}"
+    assert result.data == {}
 
 
 def test_OSCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.OSCollector])
+    doctor = doctor_factory(collectors=[OSCollector])
     doctor.run()
 
     result = doctor.vitals['OSCollector']
@@ -1201,21 +1537,21 @@ def test_PerftuneSystemConfigurationCollector(doctor_factory, monkeypatch,
         f.writelines(["tune:\r\n", "  - system"])
 
     monkeypatch_path("scylla_directory_configs", "/tmp",
-                     [collectors.PerftuneSystemConfigurationCollector], monkeypatch)
+                     [PerftuneSystemConfigurationCollector], monkeypatch)
 
-    doctor = doctor_factory(collectors=[collectors.NICsCollector,
-                                        collectors.CPUSpecificationsCollector,
-                                        collectors.ScyllaExtraConfigurationFilesCollector,
-                                        collectors.CPUSetCollector,
-                                        collectors.InfrastructureProviderCollector,
-                                        collectors.NodePlatformCollector,
-                                        collectors.ScyllaConfigurationFileCollector,
-                                        collectors.StorageConfigurationCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.SystemPeersLocalCollector,
-                                        collectors.SystemConfigCollector,
-                                        collectors.HypervisorTypeCollector,
-                                        collectors.PerftuneSystemConfigurationCollector],
+    doctor = doctor_factory(collectors=[NICsCollector,
+                                        CPUSpecificationsCollector,
+                                        ScyllaExtraConfigurationFilesCollector,
+                                        CPUSetCollector,
+                                        InfrastructureProviderCollector,
+                                        NodePlatformCollector,
+                                        ScyllaConfigurationFileCollector,
+                                        StorageConfigurationCollector,
+                                        CqlshCollector,
+                                        SystemPeersLocalCollector,
+                                        SystemConfigCollector,
+                                        HypervisorTypeCollector,
+                                        PerftuneSystemConfigurationCollector],
                             config_options=provider_identify_shorten_timeout_options)
     doctor.run()
 
@@ -1224,7 +1560,7 @@ def test_PerftuneSystemConfigurationCollector(doctor_factory, monkeypatch,
 
 
 def test_ScyllaSystemConfigurationFilesCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaSystemConfigurationFilesCollector])
+    doctor = doctor_factory(collectors=[ScyllaSystemConfigurationFilesCollector])
     doctor.run()
 
     result = doctor.vitals['ScyllaSystemConfigurationFilesCollector']
@@ -1243,7 +1579,7 @@ def test_ScyllaSystemConfigurationFilesCollector(doctor_factory):
 
 
 def test_RAMCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.RAMCollector])
+    doctor = doctor_factory(collectors=[RAMCollector])
     doctor.run()
 
     result = doctor.vitals['RAMCollector']
@@ -1254,7 +1590,7 @@ def test_RAMCollector(doctor_factory):
 
 
 def test_RsyslogCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.RsyslogCollector])
+    doctor = doctor_factory(collectors=[RsyslogCollector])
     doctor.run()
 
     result = doctor.vitals['RsyslogCollector']
@@ -1263,7 +1599,7 @@ def test_RsyslogCollector(doctor_factory):
 
 
 def test_ScyllaConfigurationFileCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector])
     doctor.run()
 
     result = doctor.vitals['ScyllaConfigurationFileCollector']
@@ -1273,35 +1609,35 @@ def test_ScyllaConfigurationFileCollector(doctor_factory):
 
 
 def test_PerftuneYamlDefaultCollector(doctor_factory, provider_identify_shorten_timeout_options):
-    doctor = doctor_factory(collectors=[collectors.NICsCollector,
-                                        collectors.InfrastructureProviderCollector,
-                                        collectors.CPUSpecificationsCollector,
-                                        collectors.NodePlatformCollector,
-                                        collectors.ScyllaSystemConfigurationFilesCollector,
-                                        collectors.ScyllaExtraConfigurationFilesCollector,
-                                        collectors.PerftuneYamlDefaultCollector],
+    doctor = doctor_factory(collectors=[NICsCollector,
+                                        InfrastructureProviderCollector,
+                                        CPUSpecificationsCollector,
+                                        NodePlatformCollector,
+                                        ScyllaSystemConfigurationFilesCollector,
+                                        ScyllaExtraConfigurationFilesCollector,
+                                        PerftuneYamlDefaultCollector],
                             config_options=provider_identify_shorten_timeout_options)
     doctor.run()
 
     result = doctor.vitals['PerftuneYamlDefaultCollector']
-    if not is_container():
+    if not running_in_container():
         assert result.status == CollectorStatus.PASSED, result.message
     else:
         assert result.status == CollectorStatus.SKIPPED, result.message
-        assert "not available" in result.message
+        assert "Not available for containers" in result.message
 
 
 def test_StorageConfigurationCollector(doctor_factory, provider_identify_shorten_timeout_options, await_scylla_start):
     doctor = doctor_factory(collectors=[
-                                collectors.NodePlatformCollector,
-                                collectors.NICsCollector,
-                                collectors.InfrastructureProviderCollector,
-                                collectors.CPUSpecificationsCollector,
-                                collectors.StorageConfigurationCollector,
-                                collectors.ScyllaConfigurationFileCollector,
-                                collectors.CqlshCollector,
-                                collectors.SystemConfigCollector,
-                                collectors.SystemPeersLocalCollector],
+                                NodePlatformCollector,
+                                NICsCollector,
+                                InfrastructureProviderCollector,
+                                CPUSpecificationsCollector,
+                                StorageConfigurationCollector,
+                                ScyllaConfigurationFileCollector,
+                                CqlshCollector,
+                                SystemConfigCollector,
+                                SystemPeersLocalCollector],
                             config_options=provider_identify_shorten_timeout_options)
     doctor.run()
 
@@ -1339,14 +1675,14 @@ def test_StorageConfigurationCollector_is_network_backed(monkeypatch):
         except KeyError:
             raise FileNotFoundError(path)
 
-    monkeypatch.setattr(collectors.Executor, 'read_file_content', fake_read)
+    monkeypatch.setattr(Executor, 'read_file_content', fake_read)
 
-    assert collectors.StorageConfigurationCollector._is_network_backed('nvme0n1') is True
+    assert StorageConfigurationCollector._is_network_backed('nvme0n1') is True
     # partition names resolve to the parent disk
-    assert collectors.StorageConfigurationCollector._is_network_backed('nvme0n1p1') is True
-    assert collectors.StorageConfigurationCollector._is_network_backed('nvme1n1') is False
+    assert StorageConfigurationCollector._is_network_backed('nvme0n1p1') is True
+    assert StorageConfigurationCollector._is_network_backed('nvme1n1') is False
     # unknown device (no model file) is not treated as network-backed
-    assert collectors.StorageConfigurationCollector._is_network_backed('sda') is False
+    assert StorageConfigurationCollector._is_network_backed('sda') is False
 
 
 def test_StorageConfigurationCollector_collect_wires_network_backed(doctor_factory, monkeypatch):
@@ -1354,7 +1690,7 @@ def test_StorageConfigurationCollector_collect_wires_network_backed(doctor_facto
     _collect() must expose _is_network_backed()'s verdict through devices['network_backed'],
     not just the standalone helper. The locality check spans both the nvme and the non_nvme list.
     """
-    doctor = doctor_factory(collectors=[collectors.StorageConfigurationCollector])
+    doctor = doctor_factory(collectors=[StorageConfigurationCollector])
     collector = doctor.collectors['StorageConfigurationCollector']
 
     perftune_stdout = (
@@ -1392,9 +1728,9 @@ def test_StorageConfigurationCollector_collect_wires_network_backed(doctor_facto
 
     fake_statvfs = os.statvfs_result((4096, 4096, 1000, 900, 900, 0, 0, 0, 0, 255))
 
-    monkeypatch.setattr(collectors.Executor, 'run_command', fake_run_command)
-    monkeypatch.setattr(collectors.Executor, 'read_file_content', fake_read_file_content)
-    monkeypatch.setattr(collectors.os, 'statvfs', lambda path: fake_statvfs)
+    monkeypatch.setattr(Executor, 'run_command', fake_run_command)
+    monkeypatch.setattr(Executor, 'read_file_content', fake_read_file_content)
+    monkeypatch.setattr(os, 'statvfs', lambda path: fake_statvfs)
 
     vitals = {
         'SystemConfigCollector': CollectorResult(
@@ -1420,7 +1756,7 @@ def test_StorageConfigurationCollector_collect_wires_network_backed(doctor_facto
 
 
 def test_RAIDSetupCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.RAIDSetupCollector])
+    doctor = doctor_factory(collectors=[RAIDSetupCollector])
     doctor.run()
 
     result = doctor.vitals['RAIDSetupCollector']
@@ -1438,7 +1774,7 @@ def test_RAIDSetupCollector(doctor_factory):
 
 def test_RAIDSetupCollector_skips_when_mdstat_absent(doctor_factory):
     """When /proc/mdstat is missing (md module not loaded) the collector must SKIP, not crash."""
-    doctor = doctor_factory(collectors=[collectors.RAIDSetupCollector])
+    doctor = doctor_factory(collectors=[RAIDSetupCollector])
     collector = doctor.collectors['RAIDSetupCollector']
 
     with patch.object(Executor, 'read_file_content', side_effect=FileNotFoundError("/proc/mdstat")):
@@ -1449,7 +1785,7 @@ def test_RAIDSetupCollector_skips_when_mdstat_absent(doctor_factory):
 
 
 def test_RAIDSetupCollector_passes_when_mdstat_present(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.RAIDSetupCollector])
+    doctor = doctor_factory(collectors=[RAIDSetupCollector])
     collector = doctor.collectors['RAIDSetupCollector']
 
     mdstat_content = [
@@ -1494,8 +1830,8 @@ def test_RAIDSetupCollector_parse_sorts_members_for_comparability():
         "unused devices: <none>\n",
     ]
 
-    parsed_a = collectors.RAIDSetupCollector._parse_mdstat(content_a)
-    parsed_b = collectors.RAIDSetupCollector._parse_mdstat(content_b)
+    parsed_a = RAIDSetupCollector._parse_mdstat(content_a)
+    parsed_b = RAIDSetupCollector._parse_mdstat(content_b)
 
     assert parsed_a == parsed_b
     assert parsed_a == {
@@ -1519,7 +1855,7 @@ def test_RAIDSetupCollector_parse_inactive_and_flags():
         "unused devices: sdc1 sdd1\n",
     ]
 
-    assert collectors.RAIDSetupCollector._parse_mdstat(content) == {
+    assert RAIDSetupCollector._parse_mdstat(content) == {
         'personalities': ['raid0', 'raid1'],
         'arrays': {
             'md1': {
@@ -1546,7 +1882,7 @@ def test_RAIDSetupCollector_parse_non_raid_personality():
         "unused devices: <none>\n",
     ]
 
-    assert collectors.RAIDSetupCollector._parse_mdstat(content) == {
+    assert RAIDSetupCollector._parse_mdstat(content) == {
         'personalities': ['linear'],
         'arrays': {
             'md3': {
@@ -1602,9 +1938,9 @@ def test_NVMeDevicesCollector():
         }
         return Mock(returncode=0, stdout=mountpoints[command])
 
-    collector = collectors.NVMeDevicesCollector({}, {})
-    with patch('collectors.os.listdir', side_effect=fake_listdir), \
-         patch('collectors.os.path.isdir', side_effect=fake_isdir), \
+    collector = NVMeDevicesCollector({}, {})
+    with patch('os.listdir', side_effect=fake_listdir), \
+         patch('os.path.isdir', side_effect=fake_isdir), \
          patch.object(Executor, 'run_command', side_effect=fake_run):
         collector._collect(vitals)
 
@@ -1646,9 +1982,9 @@ def test_NVMeDevicesCollector_mounted_partition():
         }
         return Mock(returncode=0, stdout=mountpoints[command])
 
-    collector = collectors.NVMeDevicesCollector({}, {})
-    with patch('collectors.os.listdir', side_effect=fake_listdir), \
-         patch('collectors.os.path.isdir', side_effect=fake_isdir), \
+    collector = NVMeDevicesCollector({}, {})
+    with patch('os.listdir', side_effect=fake_listdir), \
+         patch('os.path.isdir', side_effect=fake_isdir), \
          patch.object(Executor, 'run_command', side_effect=fake_run):
         collector._collect(vitals)
 
@@ -1691,9 +2027,9 @@ def test_NVMeDevicesCollector_aws_root_volume_excluded(root_source):
         }
         return Mock(returncode=0, stdout=mountpoints[command])
 
-    collector = collectors.NVMeDevicesCollector({}, {})
-    with patch('collectors.os.listdir', side_effect=fake_listdir), \
-         patch('collectors.os.path.isdir', side_effect=fake_isdir), \
+    collector = NVMeDevicesCollector({}, {})
+    with patch('os.listdir', side_effect=fake_listdir), \
+         patch('os.path.isdir', side_effect=fake_isdir), \
          patch.object(Executor, 'run_command', side_effect=fake_run):
         collector._collect(vitals)
 
@@ -1702,88 +2038,424 @@ def test_NVMeDevicesCollector_aws_root_volume_excluded(root_source):
     assert collector._data['unused_nvme_devices'] == ['nvme1n1']
 
 
-# DiskPerformanceExceededCollector unit tests ################################
+###############################################################################
+# ScyllaConfigurationCollector: credential redaction (DOCTOR-130) #############
+###############################################################################
 
-_AMZN_STATS_JSON = """{
-  "total_read_ops": 100,
-  "total_write_ops": 200,
-  "ebs_volume_performance_exceeded_iops": 0,
-  "ebs_volume_performance_exceeded_tp": 0,
-  "ec2_instance_performance_exceeded_iops": 42,
-  "ec2_instance_performance_exceeded_tp": 0,
-  "volume_queue_length": 1
-}"""
+# Credentials a Scylla configuration may carry (encryption at rest KMS, Azure and KMIP hosts, LDAP role manager).
+# None of them may reach the vitals or the verbose output, and none is a substring of a key or flag name. Plain mock
+# values: a real-looking key (e.g. the AWS documentation examples) trips secret scanners on the test file.
+_REDACTED = '<redacted>'
+_SECRET_VALUES = ('mock-aws-key-id', 'mock-aws-key-secret', 'mock-ldap-pass', 'mock-azure-secret', 'mock-kmip-pass')
+_KMS_HOST = {'aws_region': 'eu-west-1', 'aws_access_key_id': _SECRET_VALUES[0],
+             'aws_secret_access_key': _SECRET_VALUES[1], 'aws_session_token': ''}
+_KMS_HOST_REDACTED = {'aws_region': 'eu-west-1', 'aws_access_key_id': _REDACTED, 'aws_secret_access_key': _REDACTED,
+                      'aws_session_token': ''}
+# A plain value, a flow-style mapping and a block scalar (the credential on a line of its own).
+_SCYLLA_YAML_WITH_SECRETS = (
+    "cluster_name: test_cluster\n"
+    "kms_hosts:\n"
+    "  prod:\n"
+    f"    aws_region: {_KMS_HOST['aws_region']}\n"
+    f"    aws_access_key_id: {_KMS_HOST['aws_access_key_id']}\n"
+    f"    aws_secret_access_key: {_KMS_HOST['aws_secret_access_key']}\n"
+    "    aws_session_token: ''\n"
+    f"azure_hosts: {{vault: {{azure_tenant_id: tenant, azure_client_secret: {_SECRET_VALUES[3]}}}}}\n"
+    "kmip_hosts:\n"
+    "  kmip1:\n"
+    "    hosts: kmip.example.com\n"
+    "    username: scylla\n"
+    "    password: |-\n"
+    f"      {_SECRET_VALUES[4]}\n"
+    f"ldap_bind_passwd: {_SECRET_VALUES[2]}\n"
+)
+_KMIP_HOST_REDACTED = {'hosts': 'kmip.example.com', 'username': 'scylla', 'password': _REDACTED}
 
 
-def _disk_performance_vitals(provider='AWS', used_devices=None):
-    return {
-        'InfrastructureProviderCollector': CollectorResult(
-            CollectorStatus.PASSED, {'provider': provider}, Output(), ''),
-        'NVMeDevicesCollector': CollectorResult(
-            CollectorStatus.PASSED,
-            {'nvme_devices': ['nvme0n1'],
-             'used_nvme_devices': ['nvme0n1'] if used_devices is None else used_devices,
-             'unused_nvme_devices': []},
-            Output(), ''),
+def _make_config_collector(doctor_factory, collector_class):
+    return doctor_factory(collectors=[collector_class], analyzers=()).collectors[collector_class.__name__]
+
+
+def _make_scylla_yaml_collector(doctor_factory, tmp_path, collector_class):
+    (tmp_path / "scylla.yaml").write_text(_SCYLLA_YAML_WITH_SECRETS)
+    collector = _make_config_collector(doctor_factory, collector_class)
+    collector._paths = {'scylla_directory_config': str(tmp_path)}
+    return collector
+
+
+def _assert_no_secret_in_output(collector):
+    for entry in collector._output:
+        for secret in _SECRET_VALUES:
+            assert secret not in str(entry.value), f"{secret} leaked into {entry.type} {entry.name}"
+
+
+@pytest.mark.parametrize("text, redacted", [
+    # Command line flags, e.g. SCYLLA_ARGS in sysconfig: a quoted value goes whole, spaces included; a bare one up to
+    # the next flag, whatever it contains (the sysconfig parser removes double quotes, so `"a b"` arrives as `a b`).
+    ("--smp 2 --ldap-bind-passwd=pass --x 1", "--smp 2 --ldap-bind-passwd=<redacted> --x 1"),
+    ("--ldap-bind-passwd pass", "--ldap-bind-passwd <redacted>"),
+    ("--smp 2 --ldap-bind-passwd='a b' --x 1", "--smp 2 --ldap-bind-passwd=<redacted> --x 1"),
+    ('--ldap-bind-passwd "a b" --x 1', "--ldap-bind-passwd <redacted> --x 1"),
+    ("--ldap-bind-passwd=a b --x 1", "--ldap-bind-passwd=<redacted> --x 1"),
+    ("--ldap-bind-passwd=pa,ss]it'sme --x 1", "--ldap-bind-passwd=<redacted> --x 1"),
+    ("--ldap-bind-passwd=--secret --x 1", "--ldap-bind-passwd=<redacted> --x 1"),
+    ("-Djavax.net.ssl.keyStorePassword=x -Dfoo=bar", "-Djavax.net.ssl.keyStorePassword=<redacted> -Dfoo=bar"),
+    # An environment file line, whatever the case.
+    ("AWS_SECRET_ACCESS_KEY=mock", "AWS_SECRET_ACCESS_KEY=<redacted>"),
+    # JSON, JSON inside a JSON string and flow-style YAML, as system.config prints object_storage_endpoints: a quoted
+    # value goes whole, escaped quotes included.
+    ('{"aws_access_key_id": "mock", "aws_region": "eu"}', '{"aws_access_key_id": <redacted>, "aws_region": "eu"}'),
+    ('{"aws_secret_access_key": "ab\\"cd", "aws_region": "eu"}',
+     '{"aws_secret_access_key": <redacted>, "aws_region": "eu"}'),
+    ('{"s3": "{\\"aws_access_key_id\\":\\"mo\\\\\\"ck\\",\\"region\\":\\"eu\\"}"}',
+     '{"s3": "{\\"aws_access_key_id\\":<redacted>,\\"region\\":\\"eu\\"}"}'),
+    # The same once cqlsh COPY, behind read_cql_table, has doubled every backslash: the form the vitals hold.
+    ('{"s3": "{ \\\\"aws_access_key_id\\\\": \\\\"mo\\\\\\\\\\\\"ck\\\\", \\\\"region\\\\": \\\\"eu\\\\" }"}',
+     '{"s3": "{ \\\\"aws_access_key_id\\\\": <redacted>, \\\\"region\\\\": \\\\"eu\\\\" }"}'),
+    ('{"s3": "{ \\\\"aws_session_token\\\\": \\\\"\\\\", \\\\"region\\\\": \\\\"eu\\\\" }"}',
+     '{"s3": "{ \\\\"aws_session_token\\\\": \\\\"\\\\", \\\\"region\\\\": \\\\"eu\\\\" }"}'),
+    ("{aws_access_key_id: mock, aws_region: eu}", "{aws_access_key_id: <redacted>, aws_region: eu}"),
+    ("{aws_access_key_id: ab cd , aws_region: eu}", "{aws_access_key_id: <redacted> , aws_region: eu}"),
+    ("aws_access_key_id: ab cd\naws_region: eu", "aws_access_key_id: <redacted>\naws_region: eu"),
+    ("{aws_access_key_id: 'it''s', aws_region: eu}", "{aws_access_key_id: <redacted>, aws_region: eu}"),
+    # A bare flag value stays on its line.
+    ("--ldap-bind-passwd=x\nkeep me", "--ldap-bind-passwd=<redacted>\nkeep me"),
+    ("--ldap-bind-passwd x y\n--smp 2", "--ldap-bind-passwd <redacted>\n--smp 2"),
+    # A bare `key=value` value does not stop at a comma (a password may hold one): the rest of a comma-separated
+    # mapping goes with it.
+    ("{name=s3, aws_secret_access_key=ABC, region=eu}", "{name=s3, aws_secret_access_key=<redacted>"),
+    # Already redacted: unchanged.
+    ("--ldap-bind-passwd=<redacted> --x 1", "--ldap-bind-passwd=<redacted> --x 1"),
+    # An unset value, and a word that only contains a secret key's name, are kept.
+    ("aws_session_token: ''", "aws_session_token: ''"),
+    ('{"aws_session_token": null, "aws_region": "eu"}', '{"aws_session_token": null, "aws_region": "eu"}'),
+    ('{"s3": "{\\"aws_access_key_id\\":\\"\\"}"}', '{"s3": "{\\"aws_access_key_id\\":\\"\\"}"}'),
+    ('{"s3": "{\\"aws_access_key_id\\":\\"\\",\\"region\\":\\"eu\\"}"}',
+     '{"s3": "{\\"aws_access_key_id\\":\\"\\",\\"region\\":\\"eu\\"}"}'),
+    ("AWS_SESSION_TOKEN=", "AWS_SESSION_TOKEN="),
+    ("--ldap-bind-passwd= --smp 2", "--ldap-bind-passwd= --smp 2"),
+    ("my_aws_secret_access_key: keep", "my_aws_secret_access_key: keep"),
+    ("--authenticator PasswordAuthenticator", "--authenticator PasswordAuthenticator"),
+    # A secret key's name followed by a space is a value only after a flag, not in prose.
+    ("Change the password for user x", "Change the password for user x"),
+    ("-keystore-password secret -x", "-keystore-password <redacted> -x"),
+])
+def test_ScyllaConfigurationCollector_redacts_text(doctor_factory, text, redacted):
+    collector = _make_config_collector(doctor_factory, ScyllaConfigurationFileCollector)
+    assert collector._redact_credentials(text) == redacted
+
+
+def test_ScyllaConfigurationCollector_redacts_entries(doctor_factory):
+    config = {
+        'kms_hosts': {'prod': _KMS_HOST},
+        'object_storage_endpoints': [{'name': 's3', 'aws_access_key_id': _SECRET_VALUES[0]}],
+        'AWS_SECRET_ACCESS_KEY': _SECRET_VALUES[1],  # sysconfig keeps the case of its keys
+        'client_encryption_options': {'keystore_password': 'x', 'keystore': '/etc/scylla/keystore'},
+        # yaml.BaseLoader keeps a null and an empty value as strings: the credential is still unset.
+        'ldap_bind_passwd': 'null', 'azure_hosts': {'vault': {'azure_client_secret': "''"}}, 'password': '~',
+        'kmip_password': 'NULL', 'keystore_password': 'Null',
+        # An environment file line written as a shell `export`.
+        'export AWS_ACCESS_KEY_ID': _SECRET_VALUES[0],
+        'num_tokens': 256, 1: 'a non-string key',
+    }
+    assert _make_config_collector(doctor_factory, ScyllaConfigurationFileCollector)._redact_credentials(config) == {
+        'kms_hosts': {'prod': _KMS_HOST_REDACTED},
+        'object_storage_endpoints': [{'name': 's3', 'aws_access_key_id': _REDACTED}],
+        'AWS_SECRET_ACCESS_KEY': _REDACTED,
+        'client_encryption_options': {'keystore_password': _REDACTED, 'keystore': '/etc/scylla/keystore'},
+        'ldap_bind_passwd': 'null', 'azure_hosts': {'vault': {'azure_client_secret': "''"}}, 'password': '~',
+        'kmip_password': 'NULL', 'keystore_password': 'Null',
+        'export AWS_ACCESS_KEY_ID': _REDACTED,
+        'num_tokens': 256, 1: 'a non-string key',
     }
 
 
-def test_DiskPerformanceExceededCollector():
-    collector = collectors.DiskPerformanceExceededCollector({}, {})
-    with patch('collectors.shutil.which', return_value='/usr/sbin/nvme'), \
-         patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=_AMZN_STATS_JSON)):
-        collector._collect(_disk_performance_vitals())
+def test_ScyllaConfigurationFileCollector_redacts_secrets(doctor_factory, tmp_path):
+    collector = _make_scylla_yaml_collector(doctor_factory, tmp_path, ScyllaConfigurationFileCollector)
+    collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED, collector._message
+    for config in (collector._data, collector._data['pure_scylla_yaml']):
+        assert config['cluster_name'] == 'test_cluster'
+        assert config['kms_hosts']['prod'] == _KMS_HOST_REDACTED
+        assert config['azure_hosts']['vault'] == {'azure_tenant_id': 'tenant', 'azure_client_secret': _REDACTED}
+        assert config['kmip_hosts']['kmip1'] == _KMIP_HOST_REDACTED
+        assert config['ldap_bind_passwd'] == _REDACTED
+    _assert_no_secret_in_output(collector)
+    # The verbose output is the parsed file, before the defaults and the resolved addresses are added.
+    parsed_file = next(entry.value for entry in collector._output if entry.type == OutputEntryType.PARSED_FILE)
+    assert parsed_file['kms_hosts']['prod'] == _KMS_HOST_REDACTED
+    assert 'pure_scylla_yaml' not in parsed_file and 'resolved' not in parsed_file
+
+
+def test_ScyllaConfigurationFileNoParsingCollector_redacts_secrets(doctor_factory, tmp_path):
+    collector = _make_scylla_yaml_collector(doctor_factory, tmp_path, ScyllaConfigurationFileNoParsingCollector)
+    collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED, collector._message
+    assert collector._data['cluster_name'] == 'test_cluster'
+    assert collector._data['kms_hosts']['prod'] == _KMS_HOST_REDACTED
+    assert collector._data['kmip_hosts']['kmip1'] == _KMIP_HOST_REDACTED
+    assert collector._data['ldap_bind_passwd'] == _REDACTED
+
+
+def test_ScyllaSystemConfigurationFilesCollector_redacts_secrets(doctor_factory, tmp_path):
+    sysconfig = tmp_path / "etc" / "sysconfig"
+    sysconfig.mkdir(parents=True)
+    # A double-quoted flag value with a space (the parser removes the quotes) and a '%' in a value (no interpolation).
+    (sysconfig / "scylla-server").write_text(
+        f'SCYLLA_ARGS="--log-to-syslog 1 --ldap-bind-passwd \\"{_SECRET_VALUES[2]} x\\" --smp 2"\n'
+        f'AWS_ACCESS_KEY_ID={_SECRET_VALUES[0]}\n'
+        f'AWS_SECRET_ACCESS_KEY={_SECRET_VALUES[1]}%(x\n'
+        'AWS_SESSION_TOKEN=\n')
+    collector = _make_config_collector(doctor_factory, ScyllaSystemConfigurationFilesCollector)
+    collector._paths = {'scylla_directory': str(tmp_path)}
+    real_isdir = os.path.isdir
+
+    # Only the per-user directory under tmp_path, never the host's /etc.
+    with patch('os.path.isdir', side_effect=lambda d: not d.startswith('/etc') and real_isdir(d)):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED, collector._message
+    assert collector._data['files']['scylla-server'] == {
+        'SCYLLA_ARGS': f'--log-to-syslog 1 --ldap-bind-passwd {_REDACTED} --smp 2', 'AWS_ACCESS_KEY_ID': _REDACTED,
+        'AWS_SECRET_ACCESS_KEY': _REDACTED, 'AWS_SESSION_TOKEN': ''}
+    _assert_no_secret_in_output(collector)
+
+
+def test_ScyllaExtraConfigurationFilesCollector_redacts_secrets(doctor_factory, tmp_path):
+    # scylla-server.service reads every /etc/scylla.d/*.conf as an environment file.
+    (tmp_path / "aws.conf").write_text(f'AWS_SECRET_ACCESS_KEY={_SECRET_VALUES[1]}\n'
+                                       f'SCYLLA_ARGS="--ldap-bind-passwd={_SECRET_VALUES[2]} --smp 2"\n')
+    (tmp_path / "cpuset.conf").write_text('CPUSET="--cpuset 0-3"\n')
+    collector = _make_config_collector(doctor_factory, ScyllaExtraConfigurationFilesCollector)
+    collector._paths = {'scylla_directory_configs': str(tmp_path)}
+    collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED, collector._message
+    assert collector._data['files'] == {
+        'aws.conf': {'AWS_SECRET_ACCESS_KEY': _REDACTED, 'SCYLLA_ARGS': f'--ldap-bind-passwd={_REDACTED} --smp 2'},
+        'cpuset.conf': {'CPUSET': '--cpuset 0-3'}}
+    _assert_no_secret_in_output(collector)
+
+
+def test_SystemConfigCollector_redacts_secrets(doctor_factory):
+    """
+    A secret parameter (ldap_bind_passwd), a secret nested in one (kms_hosts) and one inside the text value of
+    object_storage_endpoints are redacted in the data and in the printed rows. An unset secret stays empty.
+    """
+    # object_storage_endpoints as read_cql_table returns it: a JSON string inside a JSON string, every backslash
+    # doubled by cqlsh COPY. Scylla puts no credential there today; the hypothetical key proves the text path.
+    endpoints = '{"s3": "{ \\\\"type\\\\": \\\\"s3\\\\", \\\\"aws_access_key_id\\\\": \\\\"%s\\\\" }"}' % \
+        _SECRET_VALUES[0]
+    rows = [
+        {'name': 'kms_hosts', 'value': json.dumps({'prod': _KMS_HOST}), 'source': 'config', 'type': 'string map'},
+        {'name': 'ldap_bind_passwd', 'value': json.dumps(_SECRET_VALUES[2]), 'source': 'config', 'type': 'string'},
+        {'name': 'auth_superuser_salted_password', 'value': '""', 'source': 'default', 'type': 'string'},
+        {'name': 'object_storage_endpoints', 'value': endpoints, 'source': 'config', 'type': 'string'},
+        *[dict(r) for r in _SYSTEM_CONFIG_REQUIRED_ROWS],
+    ]
+
+    collector = _make_system_config_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table', return_value=('SELECT * FROM system.config', rows)):
+        collector._collect(_make_system_config_vitals())
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data['kms_hosts']['value'] == {'prod': _KMS_HOST_REDACTED}
+    assert collector._data['ldap_bind_passwd']['value'] == _REDACTED
+    assert collector._data['auth_superuser_salted_password']['value'] == ''
+    # The value is read up to its closing escaped quote, the rest is kept.
+    assert collector._data['object_storage_endpoints']['value'] == \
+        '{"s3": "{ \\\\"type\\\\": \\\\"s3\\\\", \\\\"aws_access_key_id\\\\": <redacted> }"}'
+    _assert_no_secret_in_output(collector)
+    printed_rows = next(entry.value for entry in collector._output if entry.type == OutputEntryType.CQL)
+    assert {'name': 'ldap_bind_passwd', 'value': _REDACTED, 'source': 'config', 'type': 'string'} in printed_rows
+
+
+def test_SystemConfigCollector_invalid_json_value(doctor_factory):
+    """A value that is not JSON fails the collector, naming the parameter but not its value."""
+    rows = [
+        {'name': 'ldap_bind_passwd', 'value': _SECRET_VALUES[2], 'source': 'config', 'type': 'string'},
+        *[dict(r) for r in _SYSTEM_CONFIG_REQUIRED_ROWS],
+    ]
+
+    collector = _make_system_config_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table', return_value=('SELECT * FROM system.config', rows)):
+        collector._collect(_make_system_config_vitals())
+
+    assert collector.status == CollectorStatus.FAILED
+    assert "'ldap_bind_passwd'" in collector._message
+    assert _SECRET_VALUES[2] not in collector._message
+    _assert_no_secret_in_output(collector)
+
+
+# NitroDetailedStatsCollector unit tests ##############################
+###############################################################################
+
+_AMZN_STATS_JSON = json.dumps({
+    'total_read_ops': 100,
+    'total_write_ops': 200,
+    'ebs_volume_performance_exceeded_iops': 0,
+    'ebs_volume_performance_exceeded_tp': 0,
+    'ec2_instance_performance_exceeded_iops': 42,
+    'ec2_instance_performance_exceeded_tp': 0,
+    'volume_queue_length': 1,
+    'read_io_latency_histogram': {'num_bins': 1, 'bins': [{'lower': 0, 'upper': 1, 'count': 100}]},
+})
+
+
+def _nitro_vitals(provider='AWS', used_nvme_devices=('nvme0n1', 'nvme1n1')):
+    return {
+        'InfrastructureProviderCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'provider': provider},
+            Output(),
+            '',
+        ),
+        'NVMeDevicesCollector': CollectorResult(
+            CollectorStatus.PASSED,
+            {'used_nvme_devices': list(used_nvme_devices)},
+            Output(),
+            '',
+        ),
+    }
+
+
+_AMZN_HELP = """nvme-2.11
+usage: nvme amzn <command> [<device>] [<args>]
+
+Amazon vendor specific extensions
+
+The following are all implemented sub-commands:
+  id-ctrl         Send NVMe Identify Controller
+  stats           Get EBS volume and instance store stats
+  version         Shows the program version
+  help            Display this help
+"""
+
+_AMZN_STATS_HELP = """Usage: nvme amzn stats <device> [OPTIONS]
+
+Options:
+  [  --output-format=<FMT>, -o <FMT> ]  --- Output format: normal|json|binary
+  [  --details, -d ]                    --- Detailed IO latency histograms
+"""
+
+# nvme-cli 1.16 on Ubuntu: the `amzn` plugin exists but has no `stats` sub-command, `nvme amzn stats --help`
+# fails and prints the plugin's sub-command list instead of the `stats` options.
+_AMZN_STATS_HELP_UNSUPPORTED = Mock(returncode=1, stdout="ERROR: Invalid sub-command\n" + _AMZN_HELP.replace(
+    "  stats           Get EBS volume and instance store stats\n", ""))
+
+
+# nvme-cli 1.x exits non-zero after printing the help of a supported command, the exit code must not matter.
+def _nitro_run(device_results, stats_help=Mock(returncode=234, stdout=_AMZN_STATS_HELP), calls=None):
+    """`Executor.run_command` stub: `nvme amzn stats --help` probe and `nvme amzn stats` results per device."""
+    def fake_run(command, shell=False, check=True, **kwargs):
+        if calls is not None:
+            calls.append(command)
+        if command == 'nvme amzn stats --help':
+            return stats_help
+        return device_results[command.split()[-2].replace('/dev/', '')]
+    return fake_run
+
+
+def _collect_nitro(fake_run, **vitals_kwargs):
+    collector = NitroDetailedStatsCollector({}, {})
+    with patch('shutil.which', return_value='/usr/bin/nvme'), \
+         patch.object(Executor, 'run_command', side_effect=fake_run):
+        collector._collect(_nitro_vitals(**vitals_kwargs))
+    return collector
+
+
+def test_NitroDetailedStatsCollector_collected_on_aws():
+    """Only the NVMe devices used by Scylla are queried and the complete statistics are kept."""
+    calls: List[str] = []
+    collector = _collect_nitro(_nitro_run({
+        'nvme0n1': Mock(returncode=0, stdout=_AMZN_STATS_JSON),
+        'nvme1n1': Mock(returncode=0, stdout=json.dumps({'reads': {'bytes': 200}, 'writes': {'bytes': 300}})),
+    }, calls=calls))
 
     assert collector.status == CollectorStatus.PASSED, collector.message
-    # Only the "performance exceeded" counters are stored.
-    assert collector._data['devices'] == {'nvme0n1': {'ebs_volume_performance_exceeded_iops': 0,
-                                                      'ebs_volume_performance_exceeded_tp': 0,
-                                                      'ec2_instance_performance_exceeded_iops': 42,
-                                                      'ec2_instance_performance_exceeded_tp': 0}}
+    assert collector._data['devices'] == {
+        'nvme0n1': json.loads(_AMZN_STATS_JSON),
+        'nvme1n1': {'reads': {'bytes': 200}, 'writes': {'bytes': 300}},
+    }
+    assert calls == ['nvme amzn stats --help',
+                     'nvme amzn stats --details /dev/nvme0n1 --output-format=json',
+                     'nvme amzn stats --details /dev/nvme1n1 --output-format=json']
+    assert 'devices' in collector.mask
 
 
-# Key-name variants documented by AWS for the same counters - the collector must match the
-# "performance exceeded" suffix regardless of the prefix, so each of these is picked up.
-_ALTERNATE_EXCEEDED_KEYS = [
-    'ec2_instance_ebs_performance_exceeded_iops',
-    'ec2_instance_ebs_performance_exceeded_tp',
-    'instance_store_volume_performance_exceeded_iops',
-    'instance_store_volume_performance_exceeded_tp',
-    'ebs_volume_performance_exceeded_iops',
-    'ebs_volume_performance_exceeded_tp',
-    'ec2_instance_performance_exceeded_iops',
-    'ec2_instance_performance_exceeded_tp',
-]
-
-
-@pytest.mark.parametrize('key', _ALTERNATE_EXCEEDED_KEYS)
-def test_DiskPerformanceExceededCollector_alternate_key_names(key):
-    stats_json = json.dumps({'total_read_ops': 1, key: 7, 'volume_queue_length': 1})
-    collector = collectors.DiskPerformanceExceededCollector({}, {})
-    with patch('collectors.shutil.which', return_value='/usr/sbin/nvme'), \
-         patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=stats_json)):
-        collector._collect(_disk_performance_vitals())
+def test_NitroDetailedStatsCollector_without_details():
+    """nvme-cli versions shipping `stats` but not `--details` are queried without it."""
+    calls: List[str] = []
+    collector = _collect_nitro(_nitro_run({'nvme0n1': Mock(returncode=0, stdout=_AMZN_STATS_JSON)},
+                                          stats_help=Mock(returncode=0,
+                                                          stdout=_AMZN_STATS_HELP.replace('--details', '')),
+                                          calls=calls),
+                               used_nvme_devices=('nvme0n1',))
 
     assert collector.status == CollectorStatus.PASSED, collector.message
-    # The alternate key is captured, and the non-matching counter is not.
-    assert collector._data['devices'] == {'nvme0n1': {key: 7}}
+    assert collector._data['devices'] == {'nvme0n1': json.loads(_AMZN_STATS_JSON)}
+    assert calls[-1] == 'nvme amzn stats /dev/nvme0n1 --output-format=json'
 
 
-@pytest.mark.parametrize('provider,which,used_devices,run_result,message', [
-    ('GCP', '/usr/sbin/nvme', None, Mock(returncode=0, stdout=_AMZN_STATS_JSON), "AWS Nitro instances only"),
-    ('AWS', None, None, Mock(returncode=0, stdout=_AMZN_STATS_JSON), "'nvme' utility is not installed"),
-    ('AWS', '/usr/sbin/nvme', [], Mock(returncode=0, stdout=_AMZN_STATS_JSON), "No NVMe devices in use"),
-    ('AWS', '/usr/sbin/nvme', None, Mock(returncode=1, stdout="Unknown plugin: amzn\n"), "are not reported"),
-    ('AWS', '/usr/sbin/nvme', None, Mock(returncode=0, stdout="Total Ops:\n  Read: 1\n"), "are not reported"),
+def test_NitroDetailedStatsCollector_json_with_stderr_noise():
+    """Executor merges stderr into stdout: warnings around the JSON object must not break decoding."""
+    stdout = f"Failed to read /etc/nvme/hostnqn: No such file or directory\n{_AMZN_STATS_JSON}\nwarning: foo\n"
+    collector = _collect_nitro(_nitro_run({'nvme0n1': Mock(returncode=0, stdout=stdout)}),
+                               used_nvme_devices=('nvme0n1',))
+
+    assert collector.status == CollectorStatus.PASSED, collector.message
+    assert collector._data['devices'] == {'nvme0n1': json.loads(_AMZN_STATS_JSON)}
+
+
+@pytest.mark.parametrize('result,message', [
+    (Mock(returncode=1, stdout='[ERROR] /dev/nvme1n1: Not an EC2 device'),
+     "nvme1n1: [ERROR] /dev/nvme1n1: Not an EC2 device"),
+    (Mock(returncode=0, stdout="Total Ops:\n  Read: 1\n"), "nvme1n1: output is not JSON"),
 ])
-def test_DiskPerformanceExceededCollector_skipped(provider, which, used_devices, run_result, message):
-    collector = collectors.DiskPerformanceExceededCollector({}, {})
-    with patch('collectors.shutil.which', return_value=which), \
-         patch.object(Executor, 'run_command', return_value=run_result):
-        collector._collect(_disk_performance_vitals(provider=provider, used_devices=used_devices))
+def test_NitroDetailedStatsCollector_device_failure(result, message):
+    """`stats` is supported, so a device it fails for is a FAILED collection, not a SKIPPED one."""
+    collector = _collect_nitro(_nitro_run({'nvme0n1': Mock(returncode=0, stdout=_AMZN_STATS_JSON),
+                                           'nvme1n1': result}))
+
+    assert collector.status == CollectorStatus.FAILED
+    assert message in collector.message
+    assert set(collector._data['devices']) == {'nvme0n1'}
+
+
+@pytest.mark.parametrize('stats_help', [
+    _AMZN_STATS_HELP_UNSUPPORTED,
+    # a `stats` usage without the relied upon `--output-format` option is not usable either
+    Mock(returncode=234, stdout="Usage: nvme amzn stats <device>\n"),
+])
+def test_NitroDetailedStatsCollector_stats_unsupported(stats_help):
+    """The `amzn` plugin without a usable `stats` sub-command is detected up front, no device is queried."""
+    calls: List[str] = []
+    collector = _collect_nitro(_nitro_run({}, stats_help=stats_help, calls=calls))
+
+    assert collector.status == CollectorStatus.SKIPPED
+    assert "'nvme amzn stats --help' does not list its options" in collector.message
+    assert calls == ['nvme amzn stats --help']
+
+
+@pytest.mark.parametrize('provider,which,used_devices,message', [
+    ('GCP', '/usr/bin/nvme', ('nvme0n1',), "AWS Nitro instances only"),
+    ('AWS', None, ('nvme0n1',), "'nvme' utility (nvme-cli package) is not installed"),
+    ('AWS', '/usr/bin/nvme', (), "No NVMe devices are used by Scylla"),
+])
+def test_NitroDetailedStatsCollector_skipped(provider, which, used_devices, message):
+    collector = NitroDetailedStatsCollector({}, {})
+    with patch('shutil.which', return_value=which), \
+         patch.object(Executor, 'run_command') as mock_run:
+        collector._collect(_nitro_vitals(provider=provider, used_nvme_devices=used_devices))
 
     assert collector.status == CollectorStatus.SKIPPED
     assert message in collector.message
+    mock_run.assert_not_called()
+
+
+###############################################################################
 
 
 def test_CPUSetCollector(doctor_factory, monkeypatch):
@@ -1794,11 +2466,11 @@ def test_CPUSetCollector(doctor_factory, monkeypatch):
         f.writelines(['CPUSET="--cpuset 1-7 --smp 1"'])
 
     monkeypatch_path("scylla_directory_configs", "/tmp",
-                     [collectors.CPUSetCollector, collectors.ScyllaExtraConfigurationFilesCollector],
+                     [CPUSetCollector, ScyllaExtraConfigurationFilesCollector],
                      monkeypatch)
 
-    doctor = doctor_factory(collectors=[collectors.ScyllaExtraConfigurationFilesCollector,
-                                        collectors.CPUSetCollector])
+    doctor = doctor_factory(collectors=[ScyllaExtraConfigurationFilesCollector,
+                                        CPUSetCollector])
     doctor.run()
 
     result = doctor.vitals['CPUSetCollector']
@@ -1809,8 +2481,8 @@ def test_CPUSetCollector(doctor_factory, monkeypatch):
     with open('/tmp/cpuset.conf', 'w') as f:
         f.writelines(['CPUSET="--smp 1"'])
 
-    doctor = doctor_factory(collectors=[collectors.ScyllaExtraConfigurationFilesCollector,
-                                        collectors.CPUSetCollector])
+    doctor = doctor_factory(collectors=[ScyllaExtraConfigurationFilesCollector,
+                                        CPUSetCollector])
     doctor.run()
 
     result = doctor.vitals['CPUSetCollector']
@@ -1819,11 +2491,11 @@ def test_CPUSetCollector(doctor_factory, monkeypatch):
 
 
 def test_IPRoutesCollector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.SystemConfigCollector,
-                                        collectors.SystemPeersLocalCollector,
-                                        collectors.IPRoutesCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        SystemConfigCollector,
+                                        SystemPeersLocalCollector,
+                                        IPRoutesCollector])
     doctor.run()
 
     result = doctor.vitals['IPRoutesCollector']
@@ -1834,8 +2506,8 @@ def test_IPRoutesCollector(doctor_factory, await_scylla_start):
 
 
 def test_CqlshCollector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector])
 
     doctor.run()
 
@@ -1848,11 +2520,11 @@ def test_ServiceLevelsCollector(doctor_factory, await_scylla_start):
     Executor.paths = {'scylla_directory': '/opt/scylladb'}
     created = Executor.cqlsh(
         f"CREATE SERVICE LEVEL {sl_name} WITH SHARES = 200",
-        {'rpc_address': 'localhost'}) is not None
+        live_scylla_cql_config()) is not None
     try:
-        doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                            collectors.CqlshCollector,
-                                            collectors.ServiceLevelsCollector])
+        doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                            CqlshCollector,
+                                            ServiceLevelsCollector])
         doctor.run()
 
         result = doctor.vitals['ServiceLevelsCollector']
@@ -1868,7 +2540,7 @@ def test_ServiceLevelsCollector(doctor_factory, await_scylla_start):
             assert result.data[sl_name].get('shares') == '200'
     finally:
         if created:
-            Executor.cqlsh(f"DROP SERVICE LEVEL {sl_name}", {'rpc_address': 'localhost'})
+            Executor.cqlsh(f"DROP SERVICE LEVEL {sl_name}", live_scylla_cql_config())
 
 
 @pytest.fixture(autouse=True, scope="function")
@@ -1877,16 +2549,16 @@ def setup_temp_keyspace():
     Executor.paths = {'scylla_directory': '/opt/scylladb'}
     temp_ks_existed = Executor.cqlsh("CREATE KEYSPACE test_keyspace WITH "
                                      "replication = {'class': 'SimpleStrategy', 'replication_factor': '1'} ",
-                                     {'rpc_address': 'localhost'}) is None
+                                     live_scylla_cql_config()) is None
     yield
     if not temp_ks_existed:
-        Executor.cqlsh("DROP KEYSPACE test_keyspace", {'rpc_address': 'localhost'})
+        Executor.cqlsh("DROP KEYSPACE test_keyspace", live_scylla_cql_config())
 
 
 def test_ScyllaClusterSchemaDescriptionCollector(doctor_factory, await_scylla_start, setup_temp_keyspace):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.ScyllaClusterSchemaDescriptionCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        ScyllaClusterSchemaDescriptionCollector])
     doctor.run()
 
     result = doctor.vitals['ScyllaClusterSchemaDescriptionCollector']
@@ -1897,7 +2569,7 @@ def test_ScyllaClusterSchemaDescriptionCollector(doctor_factory, await_scylla_st
 
 def test_ScyllaClusterSchemaDescriptionCollector_masks_schema(doctor_factory):
     """The schema text is masked, so `strip()` drops it before the cluster diff."""
-    doctor = doctor_factory(collectors=[collectors.ScyllaClusterSchemaDescriptionCollector])
+    doctor = doctor_factory(collectors=[ScyllaClusterSchemaDescriptionCollector])
     collector = doctor.collectors['ScyllaClusterSchemaDescriptionCollector']
     vitals = {'ScyllaConfigurationFileCollector': Mock(data={'rpc_address': 'localhost'})}
 
@@ -1911,9 +2583,9 @@ def test_ScyllaClusterSchemaDescriptionCollector_masks_schema(doctor_factory):
 
 
 def test_ScyllaClusterSystemKeyspacesCollector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.ScyllaClusterSystemKeyspacesCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        ScyllaClusterSystemKeyspacesCollector])
 
     doctor.run()
 
@@ -1924,11 +2596,11 @@ def test_ScyllaClusterSystemKeyspacesCollector(doctor_factory, await_scylla_star
 
 
 def test_ScyllaClusterStatusCollector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.SystemConfigCollector,
-                                        collectors.SystemPeersLocalCollector,
-                                        collectors.ScyllaClusterStatusCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        SystemConfigCollector,
+                                        SystemPeersLocalCollector,
+                                        ScyllaClusterStatusCollector])
 
     doctor.run()
 
@@ -1939,11 +2611,11 @@ def test_ScyllaClusterStatusCollector(doctor_factory, await_scylla_start):
 
 
 def test_ScyllaClusterSchemaCollector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.SystemConfigCollector,
-                                        collectors.SystemPeersLocalCollector,
-                                        collectors.ScyllaClusterSchemaCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        SystemConfigCollector,
+                                        SystemPeersLocalCollector,
+                                        ScyllaClusterSchemaCollector])
 
     doctor.run()
 
@@ -1958,23 +2630,23 @@ def setup_views_cdc_keyspace():
     Executor.paths = {'scylla_directory': '/opt/scylladb'}
     temp_ks_existed = Executor.cqlsh("CREATE KEYSPACE test_views_keyspace WITH "
                                      "replication = {'class': 'SimpleStrategy', 'replication_factor': '1'} ",
-                                     {'rpc_address': 'localhost'}) is None
+                                     live_scylla_cql_config()) is None
     try:
         assert Executor.cqlsh("CREATE TABLE test_views_keyspace.base (pk int PRIMARY KEY, v text) "
-                              "WITH cdc = {'enabled': true}", {'rpc_address': 'localhost'}) is not None
+                              "WITH cdc = {'enabled': true}", live_scylla_cql_config()) is not None
         assert Executor.cqlsh(
             "CREATE MATERIALIZED VIEW test_views_keyspace.mv AS SELECT * FROM test_views_keyspace.base "
-            "WHERE pk IS NOT NULL AND v IS NOT NULL PRIMARY KEY (v, pk)", {'rpc_address': 'localhost'}) is not None
+            "WHERE pk IS NOT NULL AND v IS NOT NULL PRIMARY KEY (v, pk)", live_scylla_cql_config()) is not None
         yield
     finally:
         if not temp_ks_existed:
-            Executor.cqlsh("DROP KEYSPACE test_views_keyspace", {'rpc_address': 'localhost'})
+            Executor.cqlsh("DROP KEYSPACE test_views_keyspace", live_scylla_cql_config())
 
 
 def test_ScyllaClusterTablesDescriptionCollector(doctor_factory, await_scylla_start, setup_views_cdc_keyspace):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.ScyllaClusterTablesDescriptionCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        ScyllaClusterTablesDescriptionCollector])
 
     doctor.run()
 
@@ -1994,7 +2666,7 @@ def test_ScyllaClusterTablesDescriptionCollector(doctor_factory, await_scylla_st
 
 
 def test_ScyllaClusterTablesDescriptionCollector_merges_tables_and_views(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaClusterTablesDescriptionCollector], analyzers=())
+    doctor = doctor_factory(collectors=[ScyllaClusterTablesDescriptionCollector], analyzers=())
     collector = doctor.collectors['ScyllaClusterTablesDescriptionCollector']
     vitals = {'ScyllaConfigurationFileCollector': CollectorResult(CollectorStatus.PASSED, {}, Output(), '')}
 
@@ -2019,7 +2691,7 @@ def test_ScyllaClusterTablesDescriptionCollector_merges_tables_and_views(doctor_
 def test_ScyllaClusterTablesDescriptionCollector_cql_failure(doctor_factory):
     from utils import CqlFailedException
 
-    doctor = doctor_factory(collectors=[collectors.ScyllaClusterTablesDescriptionCollector], analyzers=())
+    doctor = doctor_factory(collectors=[ScyllaClusterTablesDescriptionCollector], analyzers=())
     collector = doctor.collectors['ScyllaClusterTablesDescriptionCollector']
     vitals = {'ScyllaConfigurationFileCollector': CollectorResult(CollectorStatus.PASSED, {}, Output(), '')}
 
@@ -2031,7 +2703,7 @@ def test_ScyllaClusterTablesDescriptionCollector_cql_failure(doctor_factory):
 
 
 def test_ScyllaVersionCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaVersionCollector])
+    doctor = doctor_factory(collectors=[ScyllaVersionCollector])
     doctor.run()
 
     result = doctor.vitals['ScyllaVersionCollector']
@@ -2059,7 +2731,7 @@ def test_ScyllaVersionCollector_edition(doctor_factory, monkeypatch):
         ("development", "2026.1.dev-0.20260716.66fb4eb48e87",
          "ii  scylla 2026.1.dev-0.20260716.66fb4eb48e87-1 amd64 Scylla database metapackage"),
     ]:
-        doctor = doctor_factory(collectors=[collectors.ScyllaVersionCollector])
+        doctor = doctor_factory(collectors=[ScyllaVersionCollector])
 
         def mock_run(command, shell=True, check=False, _version=version, _packages=packages):
             if "--version" in command:
@@ -2076,17 +2748,17 @@ def test_ScyllaVersionCollector_edition(doctor_factory, monkeypatch):
 
 def test_ScyllaLimitNOFILECollector(doctor_factory, provider_identify_shorten_timeout_options):
     doctor = doctor_factory(collectors=[
-        collectors.CPUSpecificationsCollector,
-        collectors.NICsCollector,
-        collectors.InfrastructureProviderCollector,
-        collectors.NodePlatformCollector,
-        collectors.ScyllaLimitNOFILECollector],
+        CPUSpecificationsCollector,
+        NICsCollector,
+        InfrastructureProviderCollector,
+        NodePlatformCollector,
+        ScyllaLimitNOFILECollector],
         config_options=provider_identify_shorten_timeout_options)
 
     doctor.run()
 
     result = doctor.vitals['ScyllaLimitNOFILECollector']
-    if not is_container():
+    if not running_in_container():
         assert result.status == CollectorStatus.PASSED, result.message
         assert result.data['limitnofile'] == "infinity" or result.data['limitnofile'].isdigit()
     else:
@@ -2098,16 +2770,17 @@ SYSTEMCTL_SHOW_TEMPLATE = """Type=simple
 LimitNOFILE={limitnofile}
 LimitNOFILESoft={limitnofile}
 LimitNPROC=infinity
+Environment=AWS_SECRET_ACCESS_KEY=mock-aws-key-secret
 """
 
 
 def _run_limitnofile_collector(limitnofile):
-    collector = collectors.ScyllaLimitNOFILECollector({}, {})
+    collector = ScyllaLimitNOFILECollector({}, {})
     vitals = {'NodePlatformCollector': CollectorResult(
-        CollectorStatus.PASSED, {'platform': collectors.NodePlatform.BAREMETAL}, Output(), '')}
+        CollectorStatus.PASSED, {'platform': NodePlatform.BAREMETAL}, Output(), '')}
 
     with patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout="2000\n")), \
-         patch('collectors.ServiceManager') as mock_sm_class:
+         patch('collectors.operating_system.ServiceManager') as mock_sm_class:
         mock_sm_class.return_value.service_environment.return_value = \
             SYSTEMCTL_SHOW_TEMPLATE.format(limitnofile=limitnofile)
         collector._collect(vitals)
@@ -2121,6 +2794,9 @@ def test_ScyllaLimitNOFILECollector_numeric_value(limitnofile):
 
     assert collector.status == CollectorStatus.PASSED, collector._message
     assert collector._data == {'limitnofile': "800000"}
+    # Only the LimitNOFILE line is printed, not the Environment= holding a credential.
+    printed = [entry.value for entry in collector._output if entry.name.startswith("LimitNOFILE")]
+    assert printed == [f"LimitNOFILE={limitnofile}\n"]
 
 
 def test_ScyllaLimitNOFILECollector_infinity():
@@ -2140,7 +2816,7 @@ def test_ScyllaLimitNOFILECollector_unexpected_value(limitnofile):
 
 
 def test_SysctlCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.SysctlCollector])
+    doctor = doctor_factory(collectors=[SysctlCollector])
 
     doctor.run()
 
@@ -2153,7 +2829,7 @@ def test_SysctlCollector(doctor_factory):
 
 
 def test_ScyllaBinaryCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaBinaryCollector])
+    doctor = doctor_factory(collectors=[ScyllaBinaryCollector])
 
     doctor.run()
 
@@ -2163,49 +2839,34 @@ def test_ScyllaBinaryCollector(doctor_factory):
 
 
 def test_ScyllaLogsCollector(doctor_factory, provider_identify_shorten_timeout_options):
-    doctor = doctor_factory(collectors=[collectors.NICsCollector,
-                                        collectors.InfrastructureProviderCollector,
-                                        collectors.CPUSpecificationsCollector,
-                                        collectors.NodePlatformCollector,
-                                        collectors.ScyllaLogsCollector],
+    doctor = doctor_factory(collectors=[NICsCollector,
+                                        InfrastructureProviderCollector,
+                                        CPUSpecificationsCollector,
+                                        NodePlatformCollector,
+                                        ScyllaLogsCollector],
                             config_options=provider_identify_shorten_timeout_options)
 
     doctor.run()
 
     result = doctor.vitals['ScyllaLogsCollector']
-    if not is_container():
+    if not running_in_container():
         assert result.status == CollectorStatus.PASSED, result.message
     else:
         assert result.status == CollectorStatus.SKIPPED, result.message
         assert "Not available" in result.message
 
 
-def _make_manager_agent_logs_collector(doctor_factory) -> collectors.ScyllaManagerAgentLogsCollector:
+def _make_manager_agent_logs_collector(doctor_factory) -> ScyllaManagerAgentLogsCollector:
     """Instantiate a ScyllaManagerAgentLogsCollector without running it (no Scylla required)."""
-    doctor = doctor_factory(collectors=[collectors.ScyllaManagerAgentLogsCollector], analyzers={})
+    doctor = doctor_factory(collectors=[ScyllaManagerAgentLogsCollector], analyzers={})
     return doctor.collectors['ScyllaManagerAgentLogsCollector']
-
-
-def _make_node_platform_vitals(platform) -> dict:
-    return {
-        'NodePlatformCollector': CollectorResult(CollectorStatus.PASSED, {'platform': platform}, Output(), ''),
-    }
-
-
-def test_ScyllaManagerAgentLogsCollector_skips_on_container(doctor_factory):
-    collector = _make_manager_agent_logs_collector(doctor_factory)
-
-    collector._collect(_make_node_platform_vitals(collectors.NodePlatform.CONTAINER))
-
-    assert collector.status == CollectorStatus.SKIPPED
-    assert "Not available" in collector.result.message
 
 
 def test_ScyllaManagerAgentLogsCollector_skips_when_service_missing(doctor_factory):
     collector = _make_manager_agent_logs_collector(doctor_factory)
 
-    with patch.object(collectors.ServiceManager, 'service_exists', return_value=False):
-        collector._collect(_make_node_platform_vitals(collectors.NodePlatform.VM))
+    with patch.object(ServiceManager, 'service_exists', return_value=False):
+        collector._collect({})
 
     assert collector.status == CollectorStatus.SKIPPED
     assert "not installed" in collector.result.message
@@ -2214,11 +2875,11 @@ def test_ScyllaManagerAgentLogsCollector_skips_when_service_missing(doctor_facto
 def test_ScyllaManagerAgentLogsCollector_passes(doctor_factory):
     collector = _make_manager_agent_logs_collector(doctor_factory)
 
-    with patch.object(collectors.ServiceManager, 'service_exists', return_value=True), \
+    with patch.object(ServiceManager, 'service_exists', return_value=True), \
             patch.object(Executor, 'generate_output_filename',
                          return_value="scylla_manager_agent_logs_test.txt"), \
             patch.object(Executor, 'run_command', return_value=Mock()) as mock_run:
-        collector._collect(_make_node_platform_vitals(collectors.NodePlatform.BAREMETAL))
+        collector._collect({})
 
     assert collector.status == CollectorStatus.PASSED
     result = collector.result
@@ -2232,14 +2893,14 @@ def test_ScyllaManagerAgentLogsCollector_passes(doctor_factory):
 
 
 def test_ScyllaManagerAgentLogsCollector_passes_with_since_date(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaManagerAgentLogsCollector], analyzers={},
+    doctor = doctor_factory(collectors=[ScyllaManagerAgentLogsCollector], analyzers={},
                             config_options=[('ScyllaManagerAgentLogsCollector', 'since_date', '2024-01-01')])
     collector = doctor.collectors['ScyllaManagerAgentLogsCollector']
 
-    with patch.object(collectors.ServiceManager, 'service_exists', return_value=True), \
+    with patch.object(ServiceManager, 'service_exists', return_value=True), \
             patch.object(Executor, 'generate_output_filename', return_value="scylla_manager_agent_logs_test.txt"), \
             patch.object(Executor, 'run_command', return_value=Mock()) as mock_run:
-        collector._collect(_make_node_platform_vitals(collectors.NodePlatform.VM))
+        collector._collect({})
 
     assert collector.status == CollectorStatus.PASSED
     command = mock_run.call_args.args[0]
@@ -2249,17 +2910,17 @@ def test_ScyllaManagerAgentLogsCollector_passes_with_since_date(doctor_factory):
 def test_ScyllaManagerAgentLogsCollector_fails_when_no_output(doctor_factory):
     collector = _make_manager_agent_logs_collector(doctor_factory)
 
-    with patch.object(collectors.ServiceManager, 'service_exists', return_value=True), \
+    with patch.object(ServiceManager, 'service_exists', return_value=True), \
             patch.object(Executor, 'generate_output_filename', return_value="scylla_manager_agent_logs_test.txt"), \
             patch.object(Executor, 'run_command', return_value=None):
-        collector._collect(_make_node_platform_vitals(collectors.NodePlatform.VM))
+        collector._collect({})
 
     assert collector.status == CollectorStatus.FAILED
     assert "Cannot gather Scylla Manager Agent logs" in collector.result.message
 
 
 def test_ScyllaServicesCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaServicesCollector])
+    doctor = doctor_factory(collectors=[ScyllaServicesCollector])
 
     doctor.run()
 
@@ -2273,8 +2934,8 @@ def test_ScyllaServicesCollector(doctor_factory):
 
 
 def test_ScyllaSeedsCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaConfigurationFileCollector,
-                                        collectors.ScyllaSeedsCollector])
+    doctor = doctor_factory(collectors=[ScyllaConfigurationFileCollector,
+                                        ScyllaSeedsCollector])
 
     doctor.run()
 
@@ -2305,14 +2966,14 @@ def _seeds_config_vitals(seeds: str, storage_port: int = 7000) -> Dict:
     ("[::1]", "::1"),
 ])
 def test_ScyllaSeedsCollector_address_families(doctor_factory, seed, resolved_host):
-    doctor = doctor_factory(collectors=[collectors.ScyllaSeedsCollector])
+    doctor = doctor_factory(collectors=[ScyllaSeedsCollector])
     collector = doctor.collectors['ScyllaSeedsCollector']
 
     fake_sock = Mock()
     fake_sock.__enter__ = Mock(return_value=fake_sock)
     fake_sock.__exit__ = Mock(return_value=False)
 
-    with patch("collectors.socket.create_connection", return_value=fake_sock) as create_conn:
+    with patch("socket.create_connection", return_value=fake_sock) as create_conn:
         collector._collect(_seeds_config_vitals(seed))
 
     assert collector.status == CollectorStatus.PASSED
@@ -2321,10 +2982,10 @@ def test_ScyllaSeedsCollector_address_families(doctor_factory, seed, resolved_ho
 
 
 def test_ScyllaSeedsCollector_ipv6_connect_failure_errno(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaSeedsCollector])
+    doctor = doctor_factory(collectors=[ScyllaSeedsCollector])
     collector = doctor.collectors['ScyllaSeedsCollector']
 
-    with patch("collectors.socket.create_connection",
+    with patch("socket.create_connection",
                side_effect=ConnectionRefusedError(111, "Connection refused")):
         collector._collect(_seeds_config_vitals("2001:db8::1"))
 
@@ -2333,10 +2994,10 @@ def test_ScyllaSeedsCollector_ipv6_connect_failure_errno(doctor_factory):
 
 
 def test_ScyllaSeedsCollector_gaierror_unreachable(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaSeedsCollector])
+    doctor = doctor_factory(collectors=[ScyllaSeedsCollector])
     collector = doctor.collectors['ScyllaSeedsCollector']
 
-    with patch("collectors.socket.create_connection",
+    with patch("socket.create_connection",
                side_effect=socket.gaierror(socket.EAI_NONAME, "unknown host")):
         collector._collect(_seeds_config_vitals("not-a-real-host.invalid"))
 
@@ -2345,14 +3006,14 @@ def test_ScyllaSeedsCollector_gaierror_unreachable(doctor_factory):
 
 
 def test_ScyllaSeedsCollector_skips_empty_seed_entries(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaSeedsCollector])
+    doctor = doctor_factory(collectors=[ScyllaSeedsCollector])
     collector = doctor.collectors['ScyllaSeedsCollector']
 
     fake_sock = Mock()
     fake_sock.__enter__ = Mock(return_value=fake_sock)
     fake_sock.__exit__ = Mock(return_value=False)
 
-    with patch("collectors.socket.create_connection", return_value=fake_sock):
+    with patch("socket.create_connection", return_value=fake_sock):
         collector._collect(_seeds_config_vitals("2001:db8::1,"))
 
     assert collector.status == CollectorStatus.PASSED
@@ -2361,17 +3022,80 @@ def test_ScyllaSeedsCollector_skips_empty_seed_entries(doctor_factory):
 
 
 def test_ScyllaSSTablesCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ScyllaSSTablesCollector])
+    doctor = doctor_factory(collectors=[ScyllaSSTablesCollector])
 
     doctor.run()
 
     result = doctor.vitals['ScyllaSSTablesCollector']
     assert result.status == CollectorStatus.PASSED, result.message
-    assert isinstance(result.data['files'], list)
+    assert isinstance(result.data['sstables'], dict)
+    assert all(isinstance(stems, dict) for stems in result.data['sstables'].values())
+    assert isinstance(result.data['other_files'], dict)
+
+
+def test_ScyllaSSTablesCollector_stores_nested_sstables():
+    """
+    Groups flat paths into data.sstables[directory][stem] = [suffix, ...] and files without '-' into
+    data.other_files[directory] = [name, ...], sorted at every level; directories are dropped; every path is
+    recoverable.
+    """
+    table_dir = '/var/lib/scylla/data/ks1/t1-0123456789abcdef0123456789abcdef'
+    legacy_dir = '/var/lib/scylla/data/ks0/t0-abcdef0123456789abcdef0123456789'
+    snapshot_dir = f'{table_dir}/snapshots/sm_20240101000000UTC'
+    stem = 'me-3grk_0gqu_48tjk253tdghsvc1lj-big'
+    paths = [
+        f'{table_dir}/{stem}-TOC.txt',
+        f'{table_dir}/{stem}-Data.db',
+        f'{table_dir}/md-42-big-Data.db',
+        f'{table_dir}/snapshots',  # a directory: dropped
+        f'{snapshot_dir}/schema.cql',  # no '-': goes to other_files
+        f'{snapshot_dir}/manifest.json',
+        f'{snapshot_dir}/foo-Data.db',  # 'foo' (other_files), 'foo-' (suffix '') and 'foo-Data.db' stay distinct
+        f'{snapshot_dir}/foo-',
+        f'{snapshot_dir}/foo',
+        f'{snapshot_dir}/{stem}-Data.db',  # snapshot hardlink of a live sstable
+        f'{legacy_dir}/ks0-t0-ka-1-Data.db',  # legacy ka naming
+    ]
+    expected = {
+        'sstables': {
+            legacy_dir: {'ks0-t0-ka-1': ['Data.db']},
+            table_dir: {'md-42-big': ['Data.db'], stem: ['Data.db', 'TOC.txt']},
+            snapshot_dir: {'foo': ['', 'Data.db'], stem: ['Data.db']},
+        },
+        'other_files': {snapshot_dir: ['foo', 'manifest.json', 'schema.cql']},
+    }
+
+    collector = ScyllaSSTablesCollector({}, {'scylla_directory_var': '/var/lib/scylla'})
+    with patch.object(glob, 'glob', return_value=paths), \
+            patch('os.path.isdir', side_effect=lambda path: path == f'{table_dir}/snapshots'):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED
+    # json.dumps keeps insertion order, so this also checks the sort at every level
+    assert json.dumps(collector._data) == json.dumps(expected)
+    # One line per directory: sstables first, then other_files
+    expected_output = "\n".join([
+        f"{legacy_dir}: {json.dumps(expected['sstables'][legacy_dir])}",
+        f"{table_dir}: {json.dumps(expected['sstables'][table_dir])}",
+        f"{snapshot_dir}: {json.dumps(expected['sstables'][snapshot_dir])}",
+        f"{snapshot_dir}: {json.dumps(expected['other_files'][snapshot_dir])}",
+    ])
+    assert_output_gathered(collector.result, OutputEntryType.VALUE, "All 10 files in /var/lib/scylla/data/**/*",
+                           value_content=expected_output)
+    assert [entry.value for entry in collector.result.output] == [expected_output]
+
+
+def test_ScyllaSSTablesCollector_empty_data_dir():
+    collector = ScyllaSSTablesCollector({}, {'scylla_directory_var': '/var/lib/scylla'})
+    with patch.object(glob, 'glob', return_value=[]):
+        collector._collect({})
+
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data == {'sstables': {}, 'other_files': {}}
 
 
 def test_SELinuxCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.SELinuxCollector])
+    doctor = doctor_factory(collectors=[SELinuxCollector])
 
     doctor.run()
 
@@ -2381,7 +3105,7 @@ def test_SELinuxCollector(doctor_factory):
 
 
 def test_SwapCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.SwapCollector])
+    doctor = doctor_factory(collectors=[SwapCollector])
 
     doctor.run()
 
@@ -2392,7 +3116,7 @@ def test_SwapCollector(doctor_factory):
 
 
 def test_TCPConnectionsCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.TCPConnectionsCollector])
+    doctor = doctor_factory(collectors=[TCPConnectionsCollector])
 
     doctor.run()
 
@@ -2402,7 +3126,7 @@ def test_TCPConnectionsCollector(doctor_factory):
 
 
 def test_HypervisorTypeCollector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.HypervisorTypeCollector])
+    doctor = doctor_factory(collectors=[HypervisorTypeCollector])
 
     doctor.run()
 
@@ -2414,7 +3138,7 @@ def test_HypervisorTypeCollector(doctor_factory):
 
 
 def test_NodetoolCFStatsCollector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.NodetoolCFStatsCollector])
+    doctor = doctor_factory(collectors=[NodetoolCFStatsCollector])
 
     doctor.run()
 
@@ -2425,11 +3149,11 @@ def test_NodetoolCFStatsCollector(doctor_factory, await_scylla_start):
 
 
 def test_RaftTopologyRPCStatusCollector(doctor_factory, await_scylla_start):
-    doctor = doctor_factory(collectors=[collectors.RaftTopologyRPCStatusCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.SystemConfigCollector,
-                                        collectors.SystemPeersLocalCollector,
-                                        collectors.ScyllaConfigurationFileCollector])
+    doctor = doctor_factory(collectors=[RaftTopologyRPCStatusCollector,
+                                        CqlshCollector,
+                                        SystemConfigCollector,
+                                        SystemPeersLocalCollector,
+                                        ScyllaConfigurationFileCollector])
 
     doctor.run()
 
@@ -2443,12 +3167,12 @@ def test_RaftTopologyRPCStatusCollector(doctor_factory, await_scylla_start):
 
 
 def test_ScyllaTablesCompressionInfoCollector(doctor_factory, await_scylla_start, setup_views_cdc_keyspace):
-    doctor = doctor_factory(collectors=[collectors.SystemConfigCollector,
-                                        collectors.SystemPeersLocalCollector,
-                                        collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.ScyllaTablesCompressionInfoCollector,
-                                        collectors.ScyllaClusterTablesDescriptionCollector])
+    doctor = doctor_factory(collectors=[SystemConfigCollector,
+                                        SystemPeersLocalCollector,
+                                        ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        ScyllaTablesCompressionInfoCollector,
+                                        ScyllaClusterTablesDescriptionCollector])
 
     doctor.run()
     result = doctor.vitals['ScyllaTablesCompressionInfoCollector']
@@ -2462,12 +3186,12 @@ def test_ScyllaTablesCompressionInfoCollector(doctor_factory, await_scylla_start
 
 
 def test_ScyllaTablesUsedDiskCollector(doctor_factory, await_scylla_start, setup_views_cdc_keyspace):
-    doctor = doctor_factory(collectors=[collectors.SystemConfigCollector,
-                                        collectors.SystemPeersLocalCollector,
-                                        collectors.ScyllaConfigurationFileCollector,
-                                        collectors.CqlshCollector,
-                                        collectors.ScyllaTablesUsedDiskCollector,
-                                        collectors.ScyllaClusterTablesDescriptionCollector])
+    doctor = doctor_factory(collectors=[SystemConfigCollector,
+                                        SystemPeersLocalCollector,
+                                        ScyllaConfigurationFileCollector,
+                                        CqlshCollector,
+                                        ScyllaTablesUsedDiskCollector,
+                                        ScyllaClusterTablesDescriptionCollector])
 
     doctor.run()
     result = doctor.vitals['ScyllaTablesUsedDiskCollector']
@@ -2484,10 +3208,97 @@ def test_ScyllaTablesUsedDiskCollector(doctor_factory, await_scylla_start, setup
 # PerftuneSystemConfigurationCollector unit tests #############################
 ###############################################################################
 
-def _make_perftune_collector(doctor_factory) -> collectors.PerftuneSystemConfigurationCollector:
+def _make_perftune_collector(doctor_factory) -> PerftuneSystemConfigurationCollector:
     """Instantiate a PerftuneSystemConfigurationCollector without running it."""
-    doctor = doctor_factory(collectors=[collectors.PerftuneSystemConfigurationCollector], analyzers=())
+    doctor = doctor_factory(collectors=[PerftuneSystemConfigurationCollector], analyzers=())
     return doctor.collectors['PerftuneSystemConfigurationCollector']
+
+
+_PERFTUNE_NO_DEV_NODE = "ERROR: [Errno 2] No such file or directory: '/dev/vda4'. Your system can't be tuned.\n"
+
+_STORAGE_SYSTEM_CONFIG = {
+    'workdir,W': {'value': ''},
+    'data_file_directories': {'value': ['/var/lib/scylla/data']},
+    'commitlog_directory': {'value': '/var/lib/scylla/commitlog'},
+    'hints_directory': {'value': '/var/lib/scylla/hints'},
+    'view_hints_directory': {'value': '/var/lib/scylla/view_hints'},
+}
+
+
+@pytest.mark.parametrize("in_container,stdout,stderr,expected_status,expected_message", [
+    (True, "", _PERFTUNE_NO_DEV_NODE, CollectorStatus.SKIPPED,
+     "Block device nodes behind the Scylla directories are not visible from this container"),
+    # the same refusal, printed on stdout and without quotes
+    (True, "ERROR: [Errno 2] No such file or directory: /dev/vda4\n", "", CollectorStatus.SKIPPED,
+     "Block device nodes behind the Scylla directories are not visible from this container"),
+    (True, "", "ERROR: Unsupported disk type\n", CollectorStatus.FAILED, "Failed to run"),
+    (False, "", _PERFTUNE_NO_DEV_NODE, CollectorStatus.FAILED, "Failed to run"),
+])
+def test_StorageConfigurationCollector_perftune_refused(doctor_factory, monkeypatch, in_container, stdout, stderr,
+                                                        expected_status, expected_message):
+    """
+    Only a container that cannot see the /dev node behind a directory may skip; any other perftune error, and any
+    error on a host, stays FAILED.
+    """
+    doctor = doctor_factory(collectors=[StorageConfigurationCollector])
+    collector = doctor.collectors['StorageConfigurationCollector']
+
+    def fake_run_command(command, *args, **kwargs):
+        if "perftune.py" in command:
+            return subprocess.CompletedProcess(args=command, returncode=1, stdout=stdout, stderr=stderr)
+        if command == "mount":
+            return subprocess.CompletedProcess(args=command, returncode=0,
+                                               stdout="/dev/vda4 on /var/lib/scylla type ext4 (rw,relatime)\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(Executor, 'run_command', fake_run_command)
+    monkeypatch.setattr('collectors.storage.running_in_container', lambda: in_container)
+
+    collector._collect({'SystemConfigCollector': CollectorResult(CollectorStatus.PASSED, _STORAGE_SYSTEM_CONFIG,
+                                                                 Output(), '')})
+
+    result = collector.result
+    assert result.status == expected_status, result.message
+    assert expected_message in result.message
+    assert (stderr + stdout).strip() in result.message
+    assert result.data == {'data_file_directories': {}}
+
+
+def test_StorageConfigurationCollector_keeps_collected_directories_on_failure(doctor_factory, monkeypatch):
+    """
+    When a later directory fails, the directories already collected stay in the data: the PS vitals summary reads
+    the data directory's size from there regardless of the collector status.
+    """
+    doctor = doctor_factory(collectors=[StorageConfigurationCollector])
+    collector = doctor.collectors['StorageConfigurationCollector']
+
+    def fake_run_command(command, *args, **kwargs):
+        if "perftune.py" in command and "/var/lib/scylla/data " in command:
+            return subprocess.CompletedProcess(args=command, returncode=0, stdout="Setting non-NVMe disks: vdaXXX\n")
+        if "perftune.py" in command:
+            return subprocess.CompletedProcess(args=command, returncode=1, stdout="", stderr=_PERFTUNE_NO_DEV_NODE)
+        if command == "mount":
+            return subprocess.CompletedProcess(args=command, returncode=0,
+                                               stdout="/dev/vda4 on /var/lib/scylla type xfs (rw,noatime)\n")
+        if command.startswith("df -T"):
+            return subprocess.CompletedProcess(args=command, returncode=0, stdout=(
+                "Filesystem Type 1K-blocks Used Available Use% Mounted on\n"
+                "/dev/vda4  xfs  100       10   90        10%  /var/lib/scylla\n"))
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(Executor, 'run_command', fake_run_command)
+    monkeypatch.setattr(Executor, 'read_file_content', lambda path: (_ for _ in ()).throw(OSError(path)))
+    fake_statvfs = os.statvfs_result((4096, 4096, 1000, 900, 900, 0, 0, 0, 0, 255))
+    monkeypatch.setattr(os, 'statvfs', lambda path: fake_statvfs)
+    monkeypatch.setattr('collectors.storage.running_in_container', lambda: True)
+
+    collector._collect({'SystemConfigCollector': CollectorResult(CollectorStatus.PASSED, _STORAGE_SYSTEM_CONFIG,
+                                                                 Output(), '')})
+
+    result = collector.result
+    assert result.status == CollectorStatus.SKIPPED, result.message
+    assert result.data['data_file_directories']['/var/lib/scylla/data']['storage_size_kb'] == 4096 * 1000 / 1024
+    assert result.data['commitlog_directories'] == {}
 
 
 def _make_perftune_vitals(storage_data=None, hypervisor_data=None) -> dict:
@@ -2510,15 +3321,21 @@ def _make_perftune_vitals(storage_data=None, hypervisor_data=None) -> dict:
     }
 
 
-def test_PerftuneSystemConfigurationCollector_missing_perftune_yaml(doctor_factory, monkeypatch):
-    """Collector must FAIL immediately when perftune.yaml is not found."""
+@pytest.mark.parametrize("in_container,expected_status,expected_message", [
+    (False, CollectorStatus.FAILED, "perftune.yaml is not found"),
+    (True, CollectorStatus.SKIPPED, "perftune.yaml is not available from this container"),
+])
+def test_PerftuneSystemConfigurationCollector_missing_perftune_yaml(doctor_factory, monkeypatch, in_container,
+                                                                    expected_status, expected_message):
+    """Collector must FAIL immediately when perftune.yaml is not found on a host, and skip in a container."""
     collector = _make_perftune_collector(doctor_factory)
 
     monkeypatch.setattr(os.path, 'isfile', lambda _: False)
+    monkeypatch.setattr('collectors.tuning.running_in_container', lambda: in_container)
     collector._collect(_make_perftune_vitals())
 
-    assert collector.status == CollectorStatus.FAILED
-    assert "perftune.yaml is not found" in collector.result.message
+    assert collector.status == expected_status, collector.result.message
+    assert expected_message in collector.result.message
 
 
 def test_PerftuneSystemConfigurationCollector_all_files_readable(doctor_factory, monkeypatch):
@@ -2592,20 +3409,49 @@ def test_ProcInterruptsCollector(doctor_factory):
     """
     Verifies that ProcInterruptsCollector collects the content of /proc/interrupts
     """
-    doctor = doctor_factory(collectors=[collectors.ProcInterruptsCollector])
+    doctor = doctor_factory(collectors=[ProcInterruptsCollector])
 
     doctor.run()
 
     result = doctor.vitals['ProcInterruptsCollector']
+    # Container runtimes mask /proc/interrupts (empty when privileged, /dev/null when not).
+    if running_in_container() and result.status == CollectorStatus.SKIPPED:
+        assert "/proc/interrupts is not readable from this container" in result.message
+        return
     assert result.status == CollectorStatus.PASSED, result.message
     assert_output_gathered(result, OutputEntryType.FILE, '/proc/interrupts')
+
+
+_INTERRUPTS = ["           CPU0\n", "  0:         12   IO-APIC   2-edge      timer\n"]
+
+
+@pytest.mark.parametrize("in_container,content,expected_status,expected_message", [
+    (False, _INTERRUPTS, CollectorStatus.PASSED, ""),
+    (True, _INTERRUPTS, CollectorStatus.PASSED, ""),
+    (True, [], CollectorStatus.SKIPPED, "not readable from this container"),
+    (True, FileNotFoundError("/proc/interrupts"), CollectorStatus.SKIPPED, "not readable from this container"),
+    (False, [], CollectorStatus.FAILED, "Cannot read /proc/interrupts"),
+])
+def test_ProcInterruptsCollector_refused(in_container, content, expected_status, expected_message):
+    collector = ProcInterruptsCollector({}, {})
+    side_effect = content if isinstance(content, Exception) else [content]
+
+    with patch('collectors.hardware.running_in_container', return_value=in_container), \
+         patch.object(Executor, 'read_file_content', side_effect=side_effect):
+        collector._collect({})
+
+    result = collector.result
+    assert result.status == expected_status, result.message
+    assert expected_message in result.message
+    if expected_status == CollectorStatus.PASSED:
+        assert_output_gathered(result, OutputEntryType.FILE, '/proc/interrupts')
 
 
 def test_LSPCICollector(doctor_factory, await_scylla_start):
     """
     Verifies that LSPCICollector collects the output of 'lspci -vvv' and it's not empty
     """
-    doctor = doctor_factory(collectors=[collectors.LSPCICollector])
+    doctor = doctor_factory(collectors=[LSPCICollector])
 
     doctor.run()
 
@@ -2618,7 +3464,7 @@ def test_SeastarCPUMapCollector(doctor_factory, await_scylla_start):
     """
     Verifies that SeastarCPUMapCollector collects the output of 'seastar-cpu-map.sh -n scylla' and it's not empty
     """
-    doctor = doctor_factory(collectors=[collectors.SeastarCPUMapCollector])
+    doctor = doctor_factory(collectors=[SeastarCPUMapCollector])
 
     doctor.run()
 
@@ -2638,8 +3484,9 @@ def test_SeastarCPUMapCollector_parses_shard_cpu_map():
         "shard: 0, cpu: 0\n"
         "shard: 1, cpu: 1,17\n"
     )
-    collector = collectors.SeastarCPUMapCollector({}, {'scylla_directory_scripts': '/opt/scylladb/scripts'})
-    with patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=cpu_map_output)):
+    collector = SeastarCPUMapCollector({}, {'scylla_directory_scripts': '/opt/scylladb/scripts'})
+    with patch('collectors_base.shutil.which', return_value='/usr/bin/taskset'), \
+         patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout=cpu_map_output)):
         collector._collect({})
 
     assert collector.status == CollectorStatus.PASSED, collector.message
@@ -2651,8 +3498,9 @@ def test_SeastarCPUMapCollector_failed_without_shard_cpu_map():
     """
     Verifies that the collector fails when no shard to CPU mapping can be parsed, e.g. when Scylla is not running
     """
-    collector = collectors.SeastarCPUMapCollector({}, {'scylla_directory_scripts': '/opt/scylladb/scripts'})
-    with patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout='no scylla process found\n')):
+    collector = SeastarCPUMapCollector({}, {'scylla_directory_scripts': '/opt/scylladb/scripts'})
+    with patch('collectors_base.shutil.which', return_value='/usr/bin/taskset'), \
+         patch.object(Executor, 'run_command', return_value=Mock(returncode=0, stdout='no scylla process found\n')):
         collector._collect({})
 
     assert collector.status == CollectorStatus.FAILED
@@ -2742,8 +3590,8 @@ def test_PerftuneSystemConfigurationCollector_mixed_single_and_multi_value_lines
     assert collector._data['files'][multi_value_file] == multi_value
 
 
-def _make_sd_version_collector(doctor_factory) -> collectors.SDVersionCollector:
-    doctor = doctor_factory(collectors=[collectors.SDVersionCollector], analyzers=())
+def _make_sd_version_collector(doctor_factory) -> SDVersionCollector:
+    doctor = doctor_factory(collectors=[SDVersionCollector], analyzers=())
     return doctor.collectors['SDVersionCollector']
 
 
@@ -2785,7 +3633,7 @@ def test_SDVersionCollector_version_file_missing(doctor_factory, tmp_path, monke
 ###############################################################################
 
 def _make_system_tablets_collector(doctor_factory, config_options=()):
-    doctor = doctor_factory(collectors=[collectors.SystemTabletsCollector], analyzers=(),
+    doctor = doctor_factory(collectors=[SystemTabletsCollector], analyzers=(),
                             config_options=config_options)
     return doctor.collectors['SystemTabletsCollector']
 
@@ -2803,6 +3651,18 @@ def _make_system_tablets_vitals():
 
 
 _SYSTEM_TABLETS_COLUMNS = ['table_id', 'last_token', 'keyspace_name', 'table_name', 'replicas', 'base_table']
+
+
+def _system_tablets_schema_cqlsh(column_names=None):
+    """Return a mock Executor.cqlsh answering the system_schema.columns detection query."""
+    cols = column_names if column_names is not None else _SYSTEM_TABLETS_COLUMNS
+
+    def fake_cqlsh(query, scylla_config, *args, **kwargs):
+        stdout = Mock()
+        stdout.stdout = "column_name\n-----------\n" + "\n".join(cols) + "\n"
+        return stdout
+
+    return fake_cqlsh
 
 
 def test_SystemTabletsCollector_stores_nested_tables(doctor_factory):
@@ -2854,7 +3714,8 @@ def test_SystemTabletsCollector_stores_nested_tables(doctor_factory):
         return ('COPY system.tablets ...', rows)
 
     collector = _make_system_tablets_collector(doctor_factory)
-    with patch.object(Executor, 'read_cql_table', side_effect=fake_read_cql_table):
+    with patch.object(Executor, 'read_cql_table', side_effect=fake_read_cql_table), \
+            patch.object(Executor, 'cqlsh', side_effect=_system_tablets_schema_cqlsh()):
         collector._collect(_make_system_tablets_vitals())
 
     assert seen['table_name'] == 'system.tablets'
@@ -2868,7 +3729,8 @@ def test_SystemTabletsCollector_empty_tablets(doctor_factory):
     Empty system.tablets (no tablet-replicated tables) is a valid PASSED result.
     """
     collector = _make_system_tablets_collector(doctor_factory)
-    with patch.object(Executor, 'read_cql_table', return_value=('COPY system.tablets ...', [])):
+    with patch.object(Executor, 'read_cql_table', return_value=('COPY system.tablets ...', [])), \
+            patch.object(Executor, 'cqlsh', side_effect=_system_tablets_schema_cqlsh()):
         collector._collect(_make_system_tablets_vitals())
 
     assert collector.status == CollectorStatus.PASSED
@@ -2890,7 +3752,8 @@ def test_SystemTabletsCollector_max_rows_forwarded(doctor_factory):
         seen['max_rows'] = max_rows
         return ('COPY system.tablets ...', [])
 
-    with patch.object(Executor, 'read_cql_table', side_effect=fake_read_cql_table):
+    with patch.object(Executor, 'read_cql_table', side_effect=fake_read_cql_table), \
+            patch.object(Executor, 'cqlsh', side_effect=_system_tablets_schema_cqlsh()):
         collector._collect(_make_system_tablets_vitals())
 
     assert seen['max_rows'] == 10
@@ -2906,11 +3769,103 @@ def test_SystemTabletsCollector_cql_failure_sets_failed_status(doctor_factory):
     from utils import CqlFailedException
 
     collector = _make_system_tablets_collector(doctor_factory)
-    with patch.object(Executor, 'read_cql_table', side_effect=CqlFailedException("no tablets table")):
+    with patch.object(Executor, 'read_cql_table', side_effect=CqlFailedException("no tablets table")), \
+            patch.object(Executor, 'cqlsh', side_effect=_system_tablets_schema_cqlsh()):
         collector._collect(_make_system_tablets_vitals())
 
     assert collector.status == CollectorStatus.FAILED
     assert "no tablets table" in collector.result.message
+
+
+def test_SystemTabletsCollector_retries_without_base_table(doctor_factory):
+    """
+    Scylla versions without the system.tablets base_table column (e.g. 2025.1) expose fewer
+    columns via system_schema.columns; the collector reads only the available ownership columns
+    and still PASSES (DOCTOR-120).
+    """
+    rows = [
+        {'table_id': 'aaaa', 'keyspace_name': 'ks_a', 'table_name': 't1', 'last_token': '100',
+         'replicas': '[(aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, 0)]'},
+    ]
+    seen = []
+
+    def fake_read_cql_table(scylla_config, table_name, columns=None, max_rows=-1):
+        seen.append(columns)
+        assert 'base_table' not in columns
+        return ('COPY system.tablets ...', rows)
+
+    collector = _make_system_tablets_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table', side_effect=fake_read_cql_table), \
+            patch.object(Executor, 'cqlsh',
+                         side_effect=_system_tablets_schema_cqlsh(
+                             [c for c in _SYSTEM_TABLETS_COLUMNS if c != 'base_table'])):
+        collector._collect(_make_system_tablets_vitals())
+
+    assert seen == [[c for c in _SYSTEM_TABLETS_COLUMNS if c != 'base_table']]
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data['tables'][0]['base_table'] == ''
+
+
+def test_SystemTabletsCollector_reads_all_available_columns(doctor_factory):
+    """
+    When base_table exists in system.tablets the full ownership column set is read.
+    """
+    rows = [
+        {'table_id': 'aaaa', 'keyspace_name': 'ks_a', 'table_name': 't1', 'last_token': '100',
+         'replicas': '[(aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa, 0)]', 'base_table': 't0'},
+    ]
+    seen = []
+
+    def fake_read_cql_table(scylla_config, table_name, columns=None, max_rows=-1):
+        seen.append(columns)
+        return ('COPY system.tablets ...', rows)
+
+    collector = _make_system_tablets_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table', side_effect=fake_read_cql_table), \
+            patch.object(Executor, 'cqlsh', side_effect=_system_tablets_schema_cqlsh()):
+        collector._collect(_make_system_tablets_vitals())
+
+    assert seen == [_SYSTEM_TABLETS_COLUMNS]
+    assert collector.status == CollectorStatus.PASSED
+    assert collector._data['tables'][0]['base_table'] == 't0'
+
+
+def test_SystemTabletsCollector_unrelated_failure_does_not_retry(doctor_factory):
+    """
+    A read failure (timeout, connection error) must surface as FAILED with the original message;
+    column detection only narrows the projected columns, it never retries a failed read.
+    """
+    from utils import CqlFailedException
+
+    collector = _make_system_tablets_collector(doctor_factory)
+    timeout_msg = "Command: /scylla/share/cassandra/bin/cqlsh localhost -e \"COPY system.tablets " \
+        "(table_id,last_token,keyspace_name,table_name,replicas) TO STDOUT " \
+        "WITH DELIMITER=';' AND HEADER=TRUE\", was attempted with 3 tries, and a timeout of 300 seconds."
+    with patch.object(Executor, 'read_cql_table',
+                      side_effect=CqlFailedException(timeout_msg)) as read, \
+            patch.object(Executor, 'cqlsh',
+                         side_effect=_system_tablets_schema_cqlsh(
+                             [c for c in _SYSTEM_TABLETS_COLUMNS if c != 'base_table'])):
+        collector._collect(_make_system_tablets_vitals())
+
+    assert read.call_count == 1
+    assert collector.status == CollectorStatus.FAILED
+    assert "timeout of 300 seconds" in collector.result.message
+
+
+def test_SystemTabletsCollector_schema_detection_failure_sets_failed_status(doctor_factory):
+    """
+    A failure of the system_schema.columns detection query (transient CQL failure) surfaces as
+    FAILED rather than reading the table with an empty/incorrect column projection.
+    """
+    collector = _make_system_tablets_collector(doctor_factory)
+    with patch.object(Executor, 'read_cql_table') as read, \
+            patch.object(Executor, 'cqlsh', return_value=None):
+        collector._collect(_make_system_tablets_vitals())
+
+    read.assert_not_called()
+    assert collector.status == CollectorStatus.FAILED
+    assert "system_schema.columns" in collector.result.message
 
 
 def test_SystemTabletsCollector_missing_table_sets_skipped_status(doctor_factory):
@@ -2921,7 +3876,8 @@ def test_SystemTabletsCollector_missing_table_sets_skipped_status(doctor_factory
 
     collector = _make_system_tablets_collector(doctor_factory)
     with patch.object(Executor, 'read_cql_table',
-                      side_effect=CqlFailedException("unconfigured table tablets")):
+                      side_effect=CqlFailedException("unconfigured table tablets")), \
+            patch.object(Executor, 'cqlsh', side_effect=_system_tablets_schema_cqlsh()):
         collector._collect(_make_system_tablets_vitals())
 
     assert collector.status == CollectorStatus.SKIPPED
@@ -2937,7 +3893,8 @@ def test_SystemTabletsCollector_masks_all_data_from_drift(doctor_factory):
     ]
 
     collector = _make_system_tablets_collector(doctor_factory)
-    with patch.object(Executor, 'read_cql_table', return_value=('COPY system.tablets ...', rows)):
+    with patch.object(Executor, 'read_cql_table', return_value=('COPY system.tablets ...', rows)), \
+            patch.object(Executor, 'cqlsh', side_effect=_system_tablets_schema_cqlsh()):
         collector._collect(_make_system_tablets_vitals())
 
     assert collector.mask == ['*']
@@ -2953,7 +3910,7 @@ def test_SystemTabletsCollector_masks_all_data_from_drift(doctor_factory):
 ###############################################################################
 
 def _make_large_partitions_collector(doctor_factory, config_options=()):
-    doctor = doctor_factory(collectors=[collectors.LargePartitionsCellsRowsCollector], analyzers=(),
+    doctor = doctor_factory(collectors=[LargePartitionsCellsRowsCollector], analyzers=(),
                             config_options=config_options)
     return doctor.collectors['LargePartitionsCellsRowsCollector']
 
@@ -3080,7 +4037,7 @@ def test_LargePartitionsCellsRowsCollector_masks_all_data_from_drift(doctor_fact
 ###############################################################################
 
 def _make_role_permissions_collector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.RolePermissionsCollector], analyzers=())
+    doctor = doctor_factory(collectors=[RolePermissionsCollector], analyzers=())
     return doctor.collectors['RolePermissionsCollector']
 
 
@@ -3130,12 +4087,12 @@ def test_RolePermissionsCollector_cql_failure_raises(doctor_factory):
 ###############################################################################
 
 def _make_roles_collector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.RolesCollector], analyzers=())
+    doctor = doctor_factory(collectors=[RolesCollector], analyzers=())
     return doctor.collectors['RolesCollector']
 
 
 def _make_default_credentials_collector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.DefaultCredentialsCollector], analyzers=())
+    doctor = doctor_factory(collectors=[DefaultCredentialsCollector], analyzers=())
     return doctor.collectors['DefaultCredentialsCollector']
 
 
@@ -3188,7 +4145,7 @@ def test_RolesCollector_cql_failure_raises(doctor_factory):
 ###############################################################################
 
 def _make_service_levels_collector(doctor_factory):
-    doctor = doctor_factory(collectors=[collectors.ServiceLevelsCollector], analyzers=())
+    doctor = doctor_factory(collectors=[ServiceLevelsCollector], analyzers=())
     return doctor.collectors['ServiceLevelsCollector']
 
 

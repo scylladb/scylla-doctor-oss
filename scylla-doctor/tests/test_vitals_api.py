@@ -19,7 +19,7 @@ import json
 
 import pytest
 
-import collectors
+from collectors.install import SDVersionCollector
 import scylla_doctor
 from analyzers_base import AnalyzerStatus, Analyzer
 from collectors_base import CollectorResult, CollectorStatus, Output
@@ -54,7 +54,7 @@ class _RecordingAnalyzer(Analyzer):
 
 def test_set_vitals_filters_skipped_collectors(doctor_factory):
     """set_vitals must drop vitals of collectors disabled in configuration, like load_vitals."""
-    doctor = doctor_factory(collectors=[collectors.SDVersionCollector], analyzers=(),
+    doctor = doctor_factory(collectors=[SDVersionCollector], analyzers=(),
                             config_options=[("SDVersionCollector", "run", "no")])
 
     doctor.set_vitals({
@@ -77,11 +77,11 @@ def test_set_vitals_matches_load_vitals(doctor_factory, tmp_path):
     vitals_file = tmp_path / "vitals.json"
     vitals_file.write_text(json.dumps(vitals_json))
 
-    loaded = doctor_factory(collectors=[collectors.SDVersionCollector], analyzers=(),
+    loaded = doctor_factory(collectors=[SDVersionCollector], analyzers=(),
                             config_options=[("SDVersionCollector", "run", "no")])
     loaded.load_vitals(str(vitals_file))
 
-    in_memory = doctor_factory(collectors=[collectors.SDVersionCollector], analyzers=(),
+    in_memory = doctor_factory(collectors=[SDVersionCollector], analyzers=(),
                                config_options=[("SDVersionCollector", "run", "no")])
     decoded = {k: CollectorResult.decode(v) for k, v in vitals_json.items()}
     in_memory.set_vitals(decoded)
@@ -146,7 +146,7 @@ def test_analyze_vitals_version_mismatch_exits(doctor_factory, tmp_path, monkeyp
     monkeypatch.setattr(os.path, 'isfile', lambda p: p == str(version_file))
     monkeypatch.setattr(os.path, 'dirname', lambda _: str(tmp_path))
 
-    doctor = doctor_factory(collectors=[collectors.SDVersionCollector], analyzers=())
+    doctor = doctor_factory(collectors=[SDVersionCollector], analyzers=())
 
     with pytest.raises(SystemExit) as exc_info:
         doctor.analyze_vitals({"SDVersionCollector": _result(data={"version": "9.9.9"})})
@@ -161,7 +161,7 @@ def test_analyze_vitals_version_match_ok(doctor_factory, tmp_path, monkeypatch):
     monkeypatch.setattr(os.path, 'isfile', lambda p: p == str(version_file))
     monkeypatch.setattr(os.path, 'dirname', lambda _: str(tmp_path))
 
-    doctor = doctor_factory(collectors=[collectors.SDVersionCollector], analyzers=())
+    doctor = doctor_factory(collectors=[SDVersionCollector], analyzers=())
     # Should not raise/exit
     doctor.analyze_vitals({"SDVersionCollector": _result(data={"version": "7.7.7"})})
 

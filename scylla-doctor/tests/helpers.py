@@ -15,12 +15,16 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with Scylla Doctor.  If not, see <http://www.gnu.org/licenses/>.
 
+import os
 import time
-from typing import Optional, List, Tuple, Dict
+from typing import Any, Optional, List, Tuple, Dict
+
+import yaml
 
 from analyzers_base import AnalyzerStatus, Analyzer
 from collectors_base import Collector, CollectorStatus, CollectorResult, ScyllaRestApiAwareCollector
 from models.output_entry import OutputEntryType
+from utils import Executor
 
 
 def orig_get_url_content(url: str, headers=None, timeout=2, retries=3, retry_interval=2, check=False):
@@ -114,11 +118,37 @@ class DummyRaisesCollector(Collector):
         raise Exception("Something horrible")
 
 
+class DummySkippedInContainerCollector(Collector):
+    name = "DummySkippedInContainerCollector"
+
+    @property
+    def skip_in_container(self):
+        return "it reads host state"
+
+    def _collect(self, vitals):
+        self.status = CollectorStatus.PASSED
+
+
+class DummyMissingCommandCollector(Collector):
+    name = "DummyMissingCommandCollector"
+
+    def _collect(self, vitals):
+        raise FileNotFoundError(2, "No such file or directory", "lscpu")
+
+
+class DummyMissingFileCollector(Collector):
+    name = "DummyMissingFileCollector"
+
+    def _collect(self, vitals):
+        raise FileNotFoundError(2, "No such file or directory", "/etc/scylla/missing.yaml")
+
+
 class DummySkippedCollector(Collector):
     name = "DummySkippedCollector"
 
     def _collect(self, vitals):
         self.status = CollectorStatus.SKIPPED
+        self._message = "Skipped on purpose"
 
 
 class DummyDependsOnSkippedCollector(Collector):
@@ -183,3 +213,31 @@ def assert_output_not_gathered(result: CollectorResult, type: OutputEntryType, n
     for entry in result.output:
         if entry.type == type and name == entry.name:
             assert False, f"{type} {name} found in the output, but it should not be"
+
+
+def live_scylla_cql_config(scylla_yaml_path: str = '/etc/scylla/scylla.yaml') -> Dict[str, Any]:
+    """
+    Build a minimal scylla_config dict for Executor.cqlsh against the node under test.
+
+    Includes client_encryption_options from scylla.yaml when client-to-node SSL is enabled.
+    """
+    config: Dict[str, Any] = {'rpc_address': 'localhost'}
+    yaml_path = scylla_yaml_path
+    if not os.path.isfile(yaml_path):
+        return config
+    with open(yaml_path) as handle:
+        parsed = yaml.safe_load(handle) or {}
+    options = parsed.get('client_encryption_options')
+    if options:
+        config['client_encryption_options'] = options
+    if parsed.get('rpc_address'):
+        config['rpc_address'] = parsed['rpc_address']
+    elif parsed.get('listen_address'):
+        config['rpc_address'] = parsed['listen_address']
+    return config
+
+
+def bind_executor(doctor_env: Any) -> None:
+    """Wire Executor CQL config and paths the same way scylla_doctor.main() does."""
+    Executor.cql_config = doctor_env.get_config_section("CQL")
+    Executor.paths = doctor_env.get_config_section("Paths")

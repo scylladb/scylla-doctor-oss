@@ -15,23 +15,31 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with Scylla Doctor.  If not, see <http://www.gnu.org/licenses/>.
 
+import os
 import shlex
 import subprocess
+import io
 import json
 import pathlib
 import tarfile
 import tempfile
-from unittest.mock import Mock, patch
+from pathlib import Path
+from unittest.mock import MagicMock, Mock, mock_open, patch
 import pytest
 from utils import Executor, CqlFailedException, UrlReadFailedException, RestEndpointReadError, CloudProvider, \
-    SystemConfigurationError
+    CQL_REQUEST_TIMEOUT_SECONDS, CQLSH_CLIENT_TIMEOUT_SECONDS, SystemConfigurationError
 from utils import CloudProviderGCP, CloudProviderAWS, CloudProviderAE, CloudProviderOCI, \
-    RestEndpointOutputFormatError, ServiceManager
+    RestEndpointOutputFormatError, ServiceManager, running_in_container
 from common import Authenticator
+from tests.helpers import live_scylla_cql_config
 
 
 def cqlsh_command():
     return f"{Executor.paths['scylla_directory']}/share/cassandra/bin/cqlsh"
+
+
+# Executor.cqlsh sets cqlsh's client-side timeout a margin above the doctor's CQL read budget on every call.
+CQLSH_REQUEST_TIMEOUT = f"--request-timeout={CQLSH_CLIENT_TIMEOUT_SECONDS}"
 
 
 class TestAuthenticator:
@@ -113,7 +121,7 @@ class TestExecutorCqlsh:
         assert result.returncode == 0
         assert result.stdout == "Test output"
 
-        expected_command = shlex.join([cqlsh_command(), rpc_address, "-e", cql_query])
+        expected_command = shlex.join([cqlsh_command(), rpc_address, CQLSH_REQUEST_TIMEOUT, "-e", cql_query])
 
         mock_run_command.assert_called_once_with(
             expected_command,
@@ -147,7 +155,8 @@ class TestExecutorCqlsh:
 
             # Verify
             assert result is not None
-            expected_command = shlex.join([cqlsh_command(), config['rpc_address'], "-e", cql_query])
+            expected_command = shlex.join([cqlsh_command(), config['rpc_address'], CQLSH_REQUEST_TIMEOUT,
+                                           "-e", cql_query])
             mock_run_command.assert_called_with(
                 expected_command,
                 shell=True,
@@ -185,7 +194,7 @@ class TestExecutorCqlsh:
         assert result is not None
         expected_command = shlex.join([cqlsh_command(), Executor.cql_config['rpc_address'],
                                        Executor.cql_config['native_transport_port'],
-                                       "-e", cql_query, "--ssl"])
+                                       CQLSH_REQUEST_TIMEOUT, "-e", cql_query, "--ssl"])
         mock_run_command.assert_called_with(
             expected_command,
             shell=True,
@@ -221,7 +230,7 @@ class TestExecutorCqlsh:
         assert result is not None
         expected_command = shlex.join([cqlsh_command(), Executor.cql_config['rpc_address'],
                                        Executor.cql_config['native_transport_port'],
-                                       "-e", cql_query, "--ssl"])
+                                       CQLSH_REQUEST_TIMEOUT, "-e", cql_query, "--ssl"])
         mock_run_command.assert_called_with(
             expected_command,
             shell=True,
@@ -258,7 +267,7 @@ class TestExecutorCqlsh:
         assert result is not None
         expected_command = shlex.join([cqlsh_command(), Executor.cql_config['rpc_address'],
                                        Executor.cql_config['native_transport_port'],
-                                       "-e", cql_query])
+                                       CQLSH_REQUEST_TIMEOUT, "-e", cql_query])
         mock_run_command.assert_called_with(
             expected_command,
             shell=True,
@@ -269,15 +278,15 @@ class TestExecutorCqlsh:
     @pytest.mark.parametrize("user,password,expected_command", [
         # Test user with space, and password with shell metacharacters
         ("test user", "pass$word;echo$(id)",
-         lambda: shlex.join([cqlsh_command(), "192.168.1.10", "-e", "SELECT * FROM test",
+         lambda: shlex.join([cqlsh_command(), "192.168.1.10", CQLSH_REQUEST_TIMEOUT, "-e", "SELECT * FROM test",
                              "-u", "test user", "-p", "pass$word;echo$(id)"])),
         # Test user with quote, and password with backslashes
         ("special'_admin", "pass\\word\\123",
-         lambda: shlex.join([cqlsh_command(), "192.168.1.10", "-e", "SELECT * FROM test",
+         lambda: shlex.join([cqlsh_command(), "192.168.1.10", CQLSH_REQUEST_TIMEOUT, "-e", "SELECT * FROM test",
                              "-u", "special'_admin", "-p", "pass\\word\\123"])),
         # Test password with mixed special characters
         ("test", "p@$$w0rd! & 'test' \"value\"",
-         lambda: shlex.join([cqlsh_command(), "192.168.1.10", "-e", "SELECT * FROM test",
+         lambda: shlex.join([cqlsh_command(), "192.168.1.10", CQLSH_REQUEST_TIMEOUT, "-e", "SELECT * FROM test",
                              "-u", "test", "-p", "p@$$w0rd! & 'test' \"value\""])),
     ])
     @patch('utils.Executor.run_command')
@@ -344,7 +353,7 @@ class TestExecutorCqlsh:
         cql_query = "SELECT * FROM test"
         # Build the command as it would be constructed
         command = shlex.join([
-            cqlsh_command(), "192.168.1.10", "-e", cql_query,
+            cqlsh_command(), "192.168.1.10", CQLSH_REQUEST_TIMEOUT, "-e", cql_query,
             "-u", user, "-p", password
         ])
         # Simulate TimeoutExpired for each call
@@ -376,7 +385,7 @@ class TestExecutorCqlsh:
 
         assert result is not None
         expected = shlex.join([
-            cqlsh_command(), "192.168.1.10", "-e", "SELECT now() FROM system.local",
+            cqlsh_command(), "192.168.1.10", CQLSH_REQUEST_TIMEOUT, "-e", "SELECT now() FROM system.local",
             "-u", "cassandra", "-p", "cassandra",
         ])
         mock_run_command.assert_called_once_with(expected, shell=True, timeout=300, check=False)
@@ -400,7 +409,7 @@ class TestExecutorCqlsh:
 
         assert result is not None
         expected = shlex.join([
-            cqlsh_command(), "192.168.1.10", "-e", "SELECT now() FROM system.local",
+            cqlsh_command(), "192.168.1.10", CQLSH_REQUEST_TIMEOUT, "-e", "SELECT now() FROM system.local",
             "-u", "cassandra", "-p", "cassandra",
         ])
         mock_run_command.assert_called_once_with(expected, shell=True, timeout=300, check=False)
@@ -853,6 +862,31 @@ class TestCloudProviderOCI:
             mock_read.assert_called_once()
 
 
+@pytest.mark.parametrize("marker,env,pid1_environ,expected", [
+    ("/.dockerenv", None, None, True),           # Docker
+    ("/run/.containerenv", None, None, True),    # Podman, empty when unprivileged
+    (None, "oci", None, True),                   # no marker file, e.g. containerd; the ScyllaDB image sets it to oci
+    (None, "lxc", None, False),                  # system containers run their own systemd, like a host
+    (None, "systemd-nspawn", None, False),
+    (None, None, b"PATH=/bin\0container=oci\0", True),  # environment reset by sudo, PID 1 still has it
+    (None, None, b"container=lxc\0", False),
+    (None, None, b"PATH=/bin\0", False),
+    (None, None, None, False),                   # /proc/1/environ not readable
+])
+def test_running_in_container(monkeypatch, marker, env, pid1_environ, expected):
+    monkeypatch.setattr(os.path, 'isfile', lambda path: path == marker)
+    if env is None:
+        monkeypatch.delenv("container", raising=False)
+    else:
+        monkeypatch.setenv("container", env)
+    if pid1_environ is None:
+        opener = MagicMock(side_effect=PermissionError("/proc/1/environ"))
+    else:
+        opener = mock_open(read_data=pid1_environ)
+    with patch('builtins.open', opener):
+        assert running_in_container() is expected
+
+
 class TestServiceManager:
     """Test cases for ServiceManager class"""
 
@@ -1111,9 +1145,37 @@ class TestServiceManager:
 
     def test_scylla_server_service_active_false(self, service_manager):
         """Test scylla server service active when none are active"""
-        with patch.object(service_manager, 'service_active', return_value=False):
+        with patch.object(service_manager, 'service_active', return_value=False), \
+                patch('utils.running_in_container', return_value=False):
             result = service_manager.scylla_server_service_active
             assert result is False
+
+    @pytest.mark.parametrize("in_container,process_running,expected", [
+        (True, True, True),    # docker run --entrypoint scylla: no service manager sees scylla
+        (True, False, False),
+        (False, True, False),  # on a host the service manager is the authority
+    ])
+    def test_scylla_server_service_active_process_fallback(self, service_manager, in_container, process_running,
+                                                           expected):
+        with patch.object(service_manager, 'service_active', return_value=False), \
+                patch('utils.running_in_container', return_value=in_container), \
+                patch.object(ServiceManager, 'scylla_process_running', return_value=process_running):
+            assert service_manager.scylla_server_service_active is expected
+
+    @pytest.mark.parametrize("comms,expected", [
+        ({'1': 'scylla\n', '42': 'bash\n'}, True),
+        ({'1': 'supervisord\n', '42': 'bash\n'}, False),
+    ])
+    def test_scylla_process_running(self, comms, expected):
+        def fake_open(path, *args, **kwargs):
+            pid = str(path).split('/')[2]
+            if pid in comms:
+                return io.StringIO(comms[pid])
+            raise FileNotFoundError(path)  # the process exited between listdir and open
+
+        with patch('utils.os.listdir', return_value=[*comms, '7', 'self', 'cpuinfo']), \
+                patch('builtins.open', side_effect=fake_open):
+            assert ServiceManager.scylla_process_running() is expected
 
 
 class TestReadCqlTable:
@@ -1162,6 +1224,14 @@ class TestReadCqlTable:
         assert len(rows) == 1
         assert rows[0] == {'col_a': 'val_a0', 'col_b': 'val_b0'}
 
+    @patch('utils.Executor.cqlsh')
+    def test_invalid_row_message_omits_values(self, mock_cqlsh):
+        mock_cqlsh.return_value = self._make_cqlsh_result("col_a;col_b\nval_a;mock-secret;extra\n")
+        with pytest.raises(ValueError) as excinfo:
+            Executor.read_cql_table({}, "test.table")
+        assert "test.table" in str(excinfo.value)
+        assert "mock-secret" not in str(excinfo.value)
+
 
 class TestGenerateOutputFilename:
     def test_defaults_to_system_temp_dir(self):
@@ -1196,3 +1266,117 @@ class TestRunCommandOutputCompression:
         with tarfile.open(archive, "r:gz") as tar:
             assert tar.getnames() == ["scylla_logs_20250825102108.txt"]
             assert b"hello" in tar.extractfile("scylla_logs_20250825102108.txt").read()
+
+
+class TestReadCqlQuery:
+    """Test cases for Executor.read_cql_query and Executor.read_cql_table_columns"""
+
+    # cqlsh renders a SELECT result as an ASCII table with an "(N rows)" footer.
+    _STDOUT = ("\n"
+               " column_name | kind          \n"
+               "-------------+---------------\n"
+               "  base_table |       regular \n"
+               "  last_token | clustering    \n"
+               "\n"
+               "(2 rows)\n")
+
+    def _make_cqlsh_result(self, stdout: str) -> Mock:
+        result = Mock()
+        result.returncode = 0
+        result.stdout = stdout
+        return result
+
+    @patch('utils.Executor.cqlsh')
+    def test_rows_are_mapped_to_column_names(self, mock_cqlsh):
+        mock_cqlsh.return_value = self._make_cqlsh_result(self._STDOUT)
+        query, rows = Executor.read_cql_query({}, "SELECT column_name, kind FROM system_schema.columns")
+        assert query == ("SELECT column_name, kind FROM system_schema.columns "
+                         f"USING TIMEOUT {CQL_REQUEST_TIMEOUT_SECONDS}s")
+        assert rows == [
+            {'column_name': 'base_table', 'kind': 'regular'},
+            {'column_name': 'last_token', 'kind': 'clustering'},
+        ]
+
+    @patch('utils.Executor.cqlsh')
+    def test_empty_result_returns_no_rows(self, mock_cqlsh):
+        mock_cqlsh.return_value = self._make_cqlsh_result("\n(0 rows)\n")
+        _, rows = Executor.read_cql_query({}, "SELECT column_name FROM system_schema.columns")
+        assert rows == []
+
+    @patch('utils.Executor.cqlsh')
+    def test_invalid_row_message_omits_values(self, mock_cqlsh):
+        mock_cqlsh.return_value = self._make_cqlsh_result(
+            "\n col_a | col_b \n-------+-------\n val_a | mock-secret | extra \n\n(1 rows)\n")
+        with pytest.raises(ValueError) as excinfo:
+            Executor.read_cql_query({}, "SELECT col_a, col_b FROM test.table")
+        assert "mock-secret" not in str(excinfo.value)
+
+    @patch('utils.Executor.cqlsh')
+    def test_failed_command_raises(self, mock_cqlsh):
+        mock_cqlsh.return_value = None
+        with pytest.raises(CqlFailedException):
+            Executor.read_cql_query({}, "SELECT column_name FROM system_schema.columns")
+
+    @patch('utils.Executor.cqlsh')
+    def test_server_side_timeout_is_appended(self, mock_cqlsh):
+        """A SELECT gets `USING TIMEOUT` so a short server-side timeout does not fail it."""
+        mock_cqlsh.return_value = self._make_cqlsh_result("\n(0 rows)\n")
+        query, _ = Executor.read_cql_query({}, "SELECT peer FROM system.cluster_status")
+        assert query == f"SELECT peer FROM system.cluster_status USING TIMEOUT {CQL_REQUEST_TIMEOUT_SECONDS}s"
+        assert mock_cqlsh.call_args[0][0] == query
+
+    @patch('utils.Executor.cqlsh')
+    def test_trailing_semicolon_is_dropped_before_the_timeout(self, mock_cqlsh):
+        mock_cqlsh.return_value = self._make_cqlsh_result("\n(0 rows)\n")
+        query, _ = Executor.read_cql_query({}, "SELECT peer FROM system.cluster_status ; ")
+        assert query == f"SELECT peer FROM system.cluster_status USING TIMEOUT {CQL_REQUEST_TIMEOUT_SECONDS}s"
+
+    @patch('utils.Executor.cqlsh')
+    def test_read_cql_table_columns_queries_schema_and_returns_names(self, mock_cqlsh):
+        mock_cqlsh.return_value = self._make_cqlsh_result(
+            "\n column_name \n-------------\n  base_table \n  last_token \n\n(2 rows)\n")
+        columns = Executor.read_cql_table_columns({}, "system.tablets")
+
+        issued_query = mock_cqlsh.call_args[0][0]
+        assert "keyspace_name='system'" in issued_query
+        assert "table_name='tablets'" in issued_query
+        assert columns == ['base_table', 'last_token']
+
+    @patch('utils.Executor.cqlsh')
+    def test_read_cql_table_columns_of_missing_table_is_empty(self, mock_cqlsh):
+        mock_cqlsh.return_value = self._make_cqlsh_result("\n(0 rows)\n")
+        assert Executor.read_cql_table_columns({}, "system.tablets") == []
+
+
+# Client-node SSL live tests ################################################################################
+
+def test_live_scylla_cql_config_reads_yaml(tmp_path: Path) -> None:
+    yaml_file = tmp_path / "scylla.yaml"
+    yaml_file.write_text(
+        "listen_address: 127.0.0.1\n"
+        "client_encryption_options:\n"
+        "  enabled: true\n"
+        "  certificate: /etc/scylla/ssl/db.crt\n"
+    )
+    config = live_scylla_cql_config(str(yaml_file))
+    assert config["rpc_address"] == "127.0.0.1"
+    assert config["client_encryption_options"]["enabled"] is True
+
+
+def test_Executor_cqlsh_client_node_ssl_live(await_scylla_start) -> None:
+    """
+    When CI (or docker-test SSL=1) enables client-to-node SSL, cqlsh must succeed with --ssl.
+    """
+    Executor.paths = {'scylla_directory': '/opt/scylladb'}
+    Executor.set_cqlsh_ssl_functioning(None)
+    try:
+        config = live_scylla_cql_config()
+        if not Executor.cqlsh_ssl_enabled(config):
+            pytest.skip("client-node SSL is not enabled on this Scylla node")
+
+        result = Executor.cqlsh("SELECT now() FROM system.local", config)
+        assert result is not None
+        assert Executor.cqlsh_ssl_functioning() is True
+        assert os.path.isfile("/etc/scylla/ssl/db.crt")
+    finally:
+        Executor.set_cqlsh_ssl_functioning(None)

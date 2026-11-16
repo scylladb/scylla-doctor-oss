@@ -6,7 +6,7 @@ RUN microdnf -y update
 RUN microdnf -y install python3-pip pciutils
 
 # Install system tools that are very much expected to be found on each Scylla node
-RUN microdnf -y install ethtool iptables iproute net-tools gcc python3-devel which
+RUN microdnf -y install ethtool iptables iproute net-tools gcc python3-devel which openssl
 
 COPY ./tests/requirements.txt /doctor/tests/requirements.txt
 

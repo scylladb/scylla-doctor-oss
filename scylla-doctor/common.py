@@ -55,6 +55,14 @@ def read_config_file(config_file_name: str, allow_no_value=False) -> configparse
         raise Exception("Configuration file seems to be broken") from cpe
 
 
+def scylla_doctor_root() -> str:
+    """
+    Where the 'version' file lives: the source directory of a checkout, or the .pyz archive itself when running
+    from one (every module's __file__ then points inside the archive).
+    """
+    return os.path.dirname(__file__)
+
+
 class AbortedException(Exception):
     pass
 
@@ -384,6 +392,13 @@ class ConfigValuesParser(abc.ABC):
                 return None
 
         return _cast_config_parameter_value(raw, param)
+
+    def _get_config_default(self, name: str) -> Any:
+        """
+        The declared default of a configuration parameter, cast as `_get_config_value` casts it (None when unset).
+        """
+        param = type(self).config_parameters_definitions()[name]
+        return _cast_config_parameter_value(param.default, param) if param.default is not None else None
 
     def _parse_comma_separated_config(self, config_key_name: str) -> Set[str]:
         """

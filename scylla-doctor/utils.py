@@ -49,6 +49,14 @@ from models.output_entry import OutputEntry
 # Encoding
 ENCODING = "UTF-8"
 
+# Budget for one CQL read: the server-side `USING TIMEOUT` of a query. The server default is
+# `range_request_timeout_in_ms` (10 s) or the timeout of the service level attached to the doctor's role, which can
+# be far shorter (DOCTOR-153: 240 ms). The 300 s limit on the whole cqlsh process in Executor.cqlsh is separate.
+CQL_REQUEST_TIMEOUT_SECONDS = 30
+# cqlsh's client-side `--request-timeout` (10 s by default). A margin above the server budget lets the server's
+# read_timeout_exception, which names the timeout that fired, arrive before a generic client OperationTimedOut.
+CQLSH_CLIENT_TIMEOUT_SECONDS = CQL_REQUEST_TIMEOUT_SECONDS + 5
+
 
 ###############################################################################
 # Utils
@@ -962,14 +970,15 @@ class Executor:
     __cqlsh_ssl_functioning = None
 
     @classmethod
-    def set_cqlsh_ssl_functioning(cls, cqlsh_ssl_functioning: bool) -> None:
+    def set_cqlsh_ssl_functioning(cls, cqlsh_ssl_functioning: Optional[bool]) -> None:
         """
         Set the cqlsh SSL functioning state: if Client-Server SSL is enabled in Scylla Configuration but cqlsh is not
         configured to use it, we will try to use cqlsh without SSL.
 
         Note: this method is not expected to be called more than once during the whole Doctor's execution.
+        Pass None to reset the probe state (tests).
 
-        :param cqlsh_ssl_functioning: True if cqlsh SSL is functioning, False otherwise
+        :param cqlsh_ssl_functioning: True if cqlsh SSL is functioning, False otherwise, None to reset
         """
         cls.__cqlsh_ssl_functioning = cqlsh_ssl_functioning
 
@@ -1002,7 +1011,7 @@ class Executor:
         command_args = [f"{Executor.paths['scylla_directory']}/share/cassandra/bin/cqlsh", address]
         if Executor.cql_config.get('native_transport_port'):
             command_args += [Executor.cql_config.get('native_transport_port')]
-        command_args += ["-e", query]
+        command_args += [f"--request-timeout={CQLSH_CLIENT_TIMEOUT_SECONDS}", "-e", query]
         credentials_args = []
 
         # Explicit user/password overrides always attach credentials, even when the
@@ -1073,6 +1082,69 @@ class Executor:
             return do_execute_command(command_args, credentials_args)
 
     @staticmethod
+    def read_cql_query(scylla_config, query: str) -> Tuple[str, List[Dict[str, str]]]:
+        """
+        Run an arbitrary CQL read (e.g. a selective SELECT, which COPY cannot express) and map each
+        result row to a dict of column name -> value, like read_cql_table does for a full table dump.
+
+        cqlsh prints results as an ASCII table: a header row, a '---+---' separator, the value rows,
+        then a blank line and an "(N rows)" footer. Callers should not have to parse that themselves.
+        Cells are returned as cqlsh prints them, so a null cell is the text 'null' (COPY prints '').
+
+        Appends `USING TIMEOUT CQL_REQUEST_TIMEOUT_SECONDS` (see that constant), which COPY cannot carry, so the
+        query must not have its own; a trailing ';' is dropped first so the clause stays part of the statement.
+        Values containing '|' break the row split, so prefer read_cql_table for tables with free-text columns.
+
+        :param scylla_config: Scylla's configuration
+        :param query: CQL query to execute
+        :return: A tuple of the issued query and a list of rows, each a dict of column names to values
+        :raise CqlFailedException: in case the corresponding CQL command fails
+        """
+        query = f"{query.rstrip().rstrip(';').rstrip()} USING TIMEOUT {CQL_REQUEST_TIMEOUT_SECONDS}s"
+        output = Executor.cqlsh(query, scylla_config)
+        if output is None:
+            raise CqlFailedException(f"{query} failed")
+
+        lines = output.stdout.splitlines()
+        separator_index = next((i for i, line in enumerate(lines)
+                                if line.strip() and set(line.strip()) <= set('-+')), None)
+        if separator_index is None or separator_index == 0:
+            # No result table at all (empty result set, or a cqlsh message instead of rows).
+            return query, []
+
+        column_names = [name.strip() for name in lines[separator_index - 1].split('|')]
+        rows = []
+        for line in lines[separator_index + 1:]:
+            if not line.strip():
+                break  # Blank line ends the result table; the "(N rows)" footer follows it.
+            values = [value.strip() for value in line.split('|')]
+            if len(values) != len(column_names):
+                # The row values are not in the message: they may hold credentials.
+                raise ValueError(f"Invalid row: {len(values)} values for columns {column_names}")
+            rows.append(dict(zip(column_names, values)))
+
+        return query, rows
+
+    @staticmethod
+    def read_cql_table_columns(scylla_config, table_name: str) -> List[str]:
+        """
+        Return the column names a table actually has on this node, read from system_schema.columns.
+
+        Lets a caller project only the columns present on the running Scylla version, instead of
+        failing (or blindly retrying) when a column was added in a later version than the node runs.
+
+        :param scylla_config: Scylla's configuration
+        :param table_name: Name of a table, as 'keyspace.table'
+        :return: List of column names of that table (empty if the table does not exist)
+        :raise CqlFailedException: in case the corresponding CQL command fails
+        """
+        keyspace_name, _, bare_table_name = table_name.partition('.')
+        query = (f"SELECT column_name FROM system_schema.columns "
+                 f"WHERE keyspace_name='{keyspace_name}' AND table_name='{bare_table_name}'")
+        _, rows = Executor.read_cql_query(scylla_config, query)
+        return [row['column_name'] for row in rows if row.get('column_name')]
+
+    @staticmethod
     def read_cql_table_command(table_name: str, columns: Optional[List[str]] = None, delimiter: str = ';', ) -> str:
         """
         Returns the command used to read a CQL table.
@@ -1130,8 +1202,9 @@ class Executor:
                 continue
 
             if len(row_values) != len(table_column_names):
-                raise ValueError(f"Invalid row: {row_values} - number of columns {table_column_names} "
-                                 "doesn't match the number of values")
+                # The row values are not in the message: they may hold credentials (e.g. system.config).
+                raise ValueError(f"Invalid row in {table_name}: {len(row_values)} values for columns "
+                                 f"{table_column_names}")
 
             row = dict(zip(table_column_names, row_values))
             table_rows.append(row)
@@ -1320,7 +1393,9 @@ class Executor:
                     except yaml.YAMLError:
                         return None
                 elif file_type in ("", "conf", "cfg", "ini"):
-                    parsed_content = configparser.ConfigParser()
+                    # No interpolation: an environment file has no %(...)s, and a '%' in a value (a password) would
+                    # raise an error quoting the value.
+                    parsed_content = configparser.ConfigParser(interpolation=None)
                     parsed_content.optionxform = lambda option: option
 
                     try:
@@ -1341,9 +1416,7 @@ class Executor:
                                 section_dict_ref[option] = value.replace('"', '')
 
                         return Executor.sort_dictionary(dictionary, deep_sort=deep_sort)
-                    except (configparser.ParsingError,
-                            configparser.DuplicateOptionError,
-                            configparser.DuplicateSectionError):
+                    except configparser.Error:
                         return None
                 else:
                     return None
@@ -1568,6 +1641,28 @@ class InfrastructureProvider:
         return None
 
 
+def running_in_container() -> bool:
+    """
+    Docker and Podman write a marker file. Container managers also export `container` to PID 1 (the systemd
+    convention; the ScyllaDB image sets container=oci), and processes started with exec inherit it.
+    System containers (LXC/LXD, systemd-nspawn) set it too, but run their own systemd, journal and services, so they
+    are treated as hosts.
+    """
+    if any(os.path.isfile(marker) for marker in ("/run/.containerenv", "/run/.dockerenv", "/.dockerenv")):
+        return True
+    container = os.environ.get("container")
+    if container is None:
+        # sudo and other wrappers reset the environment; PID 1 keeps it and its environ is readable as root.
+        try:
+            with open("/proc/1/environ", "rb") as environ:
+                variables = environ.read().split(b"\0")
+        except OSError:
+            variables = []
+        container = next((variable[len(b"container="):].decode(errors="replace") for variable in variables
+                          if variable.startswith(b"container=")), "")
+    return container not in ("", "lxc", "lxc-libvirt", "systemd-nspawn")
+
+
 class ServiceManager:
 
     class Interface(enum.Enum):
@@ -1686,9 +1781,30 @@ class ServiceManager:
             return output is not None and output.returncode == 0 and re.search("RUNNING", output.stdout) is not None
         return False
 
+    @staticmethod
+    def scylla_process_running() -> bool:
+        """
+        :return: True if a `scylla` process is visible in /proc, i.e. in our PID namespace.
+        """
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/comm") as comm:
+                    if comm.read().strip() == "scylla":
+                        return True
+            except OSError:  # the process exited meanwhile, or is not ours to read
+                continue
+        return False
+
     @property
     def scylla_server_service_active(self) -> bool:
         """
         :return: True if scylla server service is active
         """
-        return any([self.service_active(service) for service in self.__scylla_server_service_names])
+        if any([self.service_active(service) for service in self.__scylla_server_service_names]):
+            return True
+        # A container can start scylla without a service manager, e.g. `docker run --entrypoint scylla`, while the
+        # image still ships supervisorctl (which then cannot connect). Inside a container the process shares our PID
+        # namespace, so look for it directly.
+        return running_in_container() and self.scylla_process_running()

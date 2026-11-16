@@ -17,12 +17,12 @@
 
 import io
 import json
-import inspect
 import os.path
 
 import analyzers
 import scylla_doctor
 from analyzers_base import Analyzer
+from tests.helpers import bind_executor
 
 
 def test_smoke(provider_identify_shorten_timeout_options, await_scylla_start):
@@ -30,13 +30,14 @@ def test_smoke(provider_identify_shorten_timeout_options, await_scylla_start):
     Run all available checks together to make sure there are no crashes.
     """
     doctor_env = scylla_doctor.DoctorEnvironment(['--verbose'])
+    bind_executor(doctor_env)
     for option in provider_identify_shorten_timeout_options:
         doctor_env.set_config_parameter(*option)
     doctor = scylla_doctor.Doctor(doctor_env)
 
     # Check that analyzers were successfully loaded
-    analyzer_classes = [cls for _, cls in inspect.getmembers(analyzers, predicate=inspect.isclass)
-                        if not inspect.isabstract(cls) and issubclass(cls, Analyzer)]
+    analyzer_classes = scylla_doctor._classes_in_package(analyzers, Analyzer)
+    assert analyzer_classes
     assert len(doctor.analyzers) == len(analyzer_classes)
 
     # Run checkups
@@ -55,6 +56,7 @@ def test_save_and_load_vitals(provider_identify_shorten_timeout_options):
     Check that after collectors run, vitals can be saved to json, then restored and passed to analyzers.
     """
     doctor_env = scylla_doctor.DoctorEnvironment(["--save-vitals", "--output", "short"])
+    bind_executor(doctor_env)
     for option in provider_identify_shorten_timeout_options:
         doctor_env.set_config_parameter(*option)
     doctor = scylla_doctor.Doctor(doctor_env)
@@ -76,6 +78,7 @@ def test_save_and_load_vitals(provider_identify_shorten_timeout_options):
 
 def test_output_json(provider_identify_shorten_timeout_options, monkeypatch):
     doctor_env = scylla_doctor.DoctorEnvironment(["--output", "json"])
+    bind_executor(doctor_env)
     for option in provider_identify_shorten_timeout_options:
         doctor_env.set_config_parameter(*option)
     doctor = scylla_doctor.Doctor(doctor_env)
